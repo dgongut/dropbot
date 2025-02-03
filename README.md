@@ -61,12 +61,12 @@ services:
       #- DEFAULT_DOWNLOAD_DOCUMENT=/document
       #- DEFAULT_DOWNLOAD_TORRENT=/torrent
     volumes:
-      - /downloads:/ruta/para/descargar/general
-      #- /audio:/ruta/para/descargar/audio
-      #- /video:/ruta/para/descargar/video
-      #- /photo:/ruta/para/descargar/foto
-      #- /document:/ruta/para/descargar/documentos
-      #- /torrent:/ruta/para/descargar/torrent
+      - /ruta/para/descargar/general:/downloads
+      #- /ruta/para/descargar/audio:/audio
+      #- /ruta/para/descargar/video:/video
+      #- /ruta/para/descargar/foto:/photo
+      #- /ruta/para/descargar/documentos:/document
+      #- /ruta/para/descargar/torrent:/torrent
     image: dgongut/dropbot:latest
     container_name: dropbot
     restart: always

@@ -1,0 +1,10 @@
+
+services:
+    dropbot:
+        container_name: dropbot-test
+        env_file:
+          - .env
+        build:
+          context: .
+          dockerfile: ./Dockerfile_local
+        tty: true

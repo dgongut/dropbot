@@ -12,3 +12,4 @@ async def safe_edit_message(message, new_content):
         print(f"Telegram ha impuesto un bloqueo de {e.seconds} segundos.")
         await asyncio.sleep(e.seconds)
     except MessageNotModifiedError:
+        pass

@@ -10,7 +10,7 @@ import re
 import asyncio
 import itertools
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")

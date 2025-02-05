@@ -11,7 +11,7 @@ ENV DEFAULT_DOWNLOAD_VIDEO=abc
 ENV DEFAULT_DOWNLOAD_PHOTO=abc
 ENV DEFAULT_DOWNLOAD_DOCUMENT=abc
 ENV DEFAULT_DOWNLOAD_TORRENT=abc
-ARG VERSION=0.9.1
+ARG VERSION=0.9.2
 
 WORKDIR /app
 RUN wget https://github.com/dgongut/dropbot/archive/refs/tags/v${VERSION}.tar.gz -P /tmp

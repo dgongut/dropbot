@@ -15,7 +15,7 @@ ENV DEFAULT_DOWNLOAD_TORRENT=abc
 WORKDIR /app
 COPY . .
 RUN apk add --no-cache python3 py3-pip
-RUN pip3 install pyrogram==2.0.106 TgCrypto-pyrofork==1.2.7
+RUN pip3 install telethon==1.37
 
 VOLUME /downloads
 

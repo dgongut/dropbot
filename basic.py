@@ -11,5 +11,5 @@ async def safe_edit_message(message, new_content):
     except FloodWaitError as e:
         print(f"Telegram ha impuesto un bloqueo de {e.seconds} segundos.")
         await asyncio.sleep(e.seconds)
-    except MessageNotModifiedError:
+    except Exception:
         pass

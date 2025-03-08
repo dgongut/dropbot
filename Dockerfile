@@ -5,9 +5,11 @@ ARG VERSION=1.0.0
 WORKDIR /app
 RUN wget https://github.com/dgongut/dropbot/archive/refs/tags/v${VERSION}.tar.gz -P /tmp
 RUN tar -xf /tmp/v${VERSION}.tar.gz
-RUN mv dropbot-${VERSION}/* /app
 RUN mv dropbot-${VERSION}/dropbot.py /app
 RUN mv dropbot-${VERSION}/config.py /app
+RUN mv dropbot-${VERSION}/translations.py /app
+RUN mv dropbot-${VERSION}/basic.py /app
+RUN mv dropbot-${VERSION}/debug.py /app
 RUN mv dropbot-${VERSION}/locale /app
 RUN mv dropbot-${VERSION}/requirements.txt /app
 RUN rm /tmp/v${VERSION}.tar.gz

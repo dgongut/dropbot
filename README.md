@@ -52,6 +52,10 @@ services:
       - TELEGRAM_API_HASH=
       - TELEGRAM_API_ID=
       - LANGUAGE=ES
+      #- FILTER_PHOTO=0
+      #- FILTER_AUDIO=0
+      #- FILTER_VIDEO=0
+      #- FILTER_TORRENT=0
     volumes:
       - /ruta/para/descargar/general:/downloads
       #- /ruta/para/descargar/audio:/audio

@@ -38,9 +38,6 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | FILTER_VIDEO                   | ❌           | Especifica si los archivos de video deben almacenarse en una carpeta separada `/video` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_TORRENT                 | ❌           | Especifica si los archivos de torrent deben almacenarse en una carpeta separada `/torrent` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 
-### Anotaciones
-Será necesario mapear un volumen para almacenar lo que el bot escribe en /app/schedule
-
 ### Ejemplo de Docker-Compose para su ejecución normal
 
 ```yaml

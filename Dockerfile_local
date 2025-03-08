@@ -1,21 +1,9 @@
-FROM alpine:3.18.6
-
-ENV TELEGRAM_TOKEN=abc
-ENV TELEGRAM_ADMIN=abc
-ENV TELEGRAM_API_HASH=abc
-ENV TELEGRAM_API_ID=abc
-ENV LANGUAGE=ES
-ENV DEFAULT_DOWNLOAD_PATH=abc
-ENV DEFAULT_DOWNLOAD_AUDIO=abc
-ENV DEFAULT_DOWNLOAD_VIDEO=abc
-ENV DEFAULT_DOWNLOAD_PHOTO=abc
-ENV DEFAULT_DOWNLOAD_DOCUMENT=abc
-ENV DEFAULT_DOWNLOAD_TORRENT=abc
+FROM alpine:3.21.3
 
 WORKDIR /app
 COPY . .
-RUN apk add --no-cache python3 py3-pip
-RUN pip3 install telethon==1.37
+RUN apk add --no-cache python3 py3-pip tzdata
+RUN export PIP_BREAK_SYSTEM_PACKAGES=1; pip3 install --no-cache-dir -Ur /app/requirements.txt
 
 VOLUME /downloads
 

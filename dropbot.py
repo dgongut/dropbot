@@ -1,6 +1,9 @@
 import os
 from telethon import TelegramClient, events, functions, types
-from telethon.tl.types import BotCommand
+from telethon.tl.types import (
+    BotCommand, Document, Photo,
+    DocumentAttributeFilename, DocumentAttributeVideo, DocumentAttributeAudio
+)
 from config import *
 from translations import *
 from debug import *
@@ -8,19 +11,14 @@ from basic import *
 import sys
 import re
 import asyncio
-import itertools
 
-VERSION = "0.9.2"
+VERSION = "1.0.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")
     sys.exit(1)
 
 load_locale(LANGUAGE.lower())
-
-if not DEFAULT_DOWNLOAD_PATH or DEFAULT_DOWNLOAD_PATH == DEFAULT_EMPTY_STR:
-    error(get_text("error_no_default_path"))
-    sys.exit(1)
 
 if DEFAULT_EMPTY_STR == TELEGRAM_TOKEN:
     error(get_text("error_bot_token"))
@@ -35,11 +33,10 @@ if ANONYMOUS_USER_ID == TELEGRAM_ADMIN:
     sys.exit(1)
 
 DOWNLOAD_PATHS = {
-    "audio": DEFAULT_DOWNLOAD_PATH if not DEFAULT_DOWNLOAD_AUDIO or DEFAULT_DOWNLOAD_AUDIO == DEFAULT_EMPTY_STR else DEFAULT_DOWNLOAD_AUDIO,
-    "video": DEFAULT_DOWNLOAD_PATH if not DEFAULT_DOWNLOAD_VIDEO or DEFAULT_DOWNLOAD_VIDEO == DEFAULT_EMPTY_STR else DEFAULT_DOWNLOAD_VIDEO,
-    "photo": DEFAULT_DOWNLOAD_PATH if not DEFAULT_DOWNLOAD_PHOTO or DEFAULT_DOWNLOAD_PHOTO == DEFAULT_EMPTY_STR else DEFAULT_DOWNLOAD_PHOTO,
-    "document": DEFAULT_DOWNLOAD_PATH if not DEFAULT_DOWNLOAD_DOCUMENT or DEFAULT_DOWNLOAD_DOCUMENT == DEFAULT_EMPTY_STR else DEFAULT_DOWNLOAD_DOCUMENT,
-    "torrent": DEFAULT_DOWNLOAD_PATH if not DEFAULT_DOWNLOAD_TORRENT or DEFAULT_DOWNLOAD_TORRENT == DEFAULT_EMPTY_STR else DEFAULT_DOWNLOAD_TORRENT
+    "audio": DOWNLOAD_AUDIO if FILTER_AUDIO else DOWNLOAD_PATH,
+    "video": DOWNLOAD_VIDEO if FILTER_VIDEO else DOWNLOAD_PATH,
+    "photo": DOWNLOAD_PHOTO if FILTER_PHOTO else DOWNLOAD_PATH,
+    "torrent": DOWNLOAD_TORRENT if FILTER_TORRENT else DOWNLOAD_PATH
 }
 
 for path in DOWNLOAD_PATHS.values():
@@ -47,7 +44,6 @@ for path in DOWNLOAD_PATHS.values():
 
 bot = TelegramClient("dropbot", TELEGRAM_API_ID, TELEGRAM_API_HASH).start(bot_token=TELEGRAM_TOKEN)
 progress_trackers = {}
-dot_cycle = itertools.cycle([".", "..", "..."])
 
 def get_download_path(event):
     message = event.message
@@ -62,9 +58,7 @@ def get_download_path(event):
         return DOWNLOAD_PATHS["audio"], AUD_ICO
     elif file_extension in EXTENSIONS_IMAGE or message.photo:
         return DOWNLOAD_PATHS["photo"], IMG_ICO
-    elif file_extension in EXTENSIONS_DOCUMENT or message.document:
-        return DOWNLOAD_PATHS["document"], DOC_ICO
-    return DEFAULT_DOWNLOAD_PATH, DEF_ICO
+    return DOWNLOAD_PATH, DEF_ICO
 
 # Actualiza la función de manejo de archivos para usar create_task en lugar de run
 @bot.on(events.NewMessage(func=lambda e: e.document or e.video or e.audio or e.photo))
@@ -81,37 +75,35 @@ async def download_media(event):
     media = message.document or message.video or message.audio or message.photo
     if not media:
         return
-    
-    file_name = media.file.name if hasattr(media, 'file') else f"file_{media.id}"
+    file_name = get_file_name(media)
     debug(get_text("debug_file_received", file_name))
     download_path, ico = get_download_path(event)
     file_path = os.path.join(download_path, file_name)
     debug(get_text("debug_file_path_selected", file_name, download_path))
     
-    status_message = await event.reply(get_text("starting_download"))
-    await bot.download_media(message, file=file_path, progress_callback=lambda current, total: update_progress(status_message, current, total, ico))
+    status_message = await event.reply(get_text("downloading", ico))
+    await bot.download_media(message, file=file_path)
 
-    await safe_edit_message(status_message, get_text("downloaded", file_path))
+    await safe_edit_message(status_message, get_text("downloaded", ico, file_path))
     debug(get_text("debug_file_downloaded", file_name))
 
-async def update_progress(status_message, current, total, ico):
-    message_id = status_message.id  # Identificar cada mensaje de estado
-    if message_id not in progress_trackers:
-        progress_trackers[message_id] = {
-            "last_percentage": -1,
-            "dot_cycle": itertools.cycle([".", "..", "..."])
-        }
-
-    tracker = progress_trackers[message_id]
-    percentage = round((current / total) * 100, 1)
-
-    if percentage != tracker["last_percentage"]:
-        dots = next(tracker["dot_cycle"])
-        new_content = get_text("downloading", ico, dots, percentage)
-        await safe_edit_message(status_message, new_content)
-        tracker["last_percentage"] = percentage
-
-    await asyncio.sleep(2)
+def get_file_name(media):
+    if isinstance(media, Document):
+        file_name = next(
+            (attr.file_name for attr in media.attributes if isinstance(attr, DocumentAttributeFilename)), 
+            None
+        )
+        if not file_name:
+            if any(isinstance(attr, DocumentAttributeVideo) for attr in media.attributes):
+                return f"video_{media.id}.mp4"
+            if any(isinstance(attr, DocumentAttributeAudio) for attr in media.attributes):
+                return f"audio_{media.id}.mp3"
+            return f"file_{media.id}"
+        return file_name
+    elif isinstance(media, Photo):
+        return f"photo_{media.id}.jpg"
+    else:
+        return f"file_{media.id}"
 
 @bot.on(events.NewMessage(pattern=r"/(start|donate|version)"))
 async def handle_start(event):

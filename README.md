@@ -33,12 +33,10 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | TELEGRAM_API_HASH              | ✅           | Hash de la API de Telegram (obtenido al crear tu aplicación en https://my.telegram.org) |
 | TELEGRAM_API_ID                | ✅           | ID de la API de Telegram (obtenido al crear tu aplicación en https://my.telegram.org)   |
 | LANGUAGE                       | ✅           | Idioma del bot (por defecto "ES" para español o "EN" para inglés)                       |
-| DEFAULT_DOWNLOAD_PATH          | ✅           | Ruta por defecto donde se almacenarán los archivos descargados                          |
-| DEFAULT_DOWNLOAD_AUDIO         | ❌           | Ruta donde se almacenarán los archivos de audio descargados                             |
-| DEFAULT_DOWNLOAD_VIDEO         | ❌           | Ruta donde se almacenarán los archivos de video descargados                             |
-| DEFAULT_DOWNLOAD_PHOTO         | ❌           | Ruta donde se almacenarán las imágenes descargadas                                      |
-| DEFAULT_DOWNLOAD_DOCUMENT      | ❌           | Ruta donde se almacenarán los documentos descargados                                    |
-| DEFAULT_DOWNLOAD_TORRENT       | ❌           | Ruta donde se almacenarán los archivos torrent descargados                              |
+| FILTER_PHOTO                   | ❌           | Especifica si los archivos de imagen deben almacenarse en una carpeta separada `/photo` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)   |
+| FILTER_AUDIO                   | ❌           | Especifica si los archivos de audio deben almacenarse en una carpeta separada `/audio` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
+| FILTER_VIDEO                   | ❌           | Especifica si los archivos de video deben almacenarse en una carpeta separada `/video` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
+| FILTER_TORRENT                 | ❌           | Especifica si los archivos de torrent deben almacenarse en una carpeta separada `/torrent` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 
 ### Anotaciones
 Será necesario mapear un volumen para almacenar lo que el bot escribe en /app/schedule
@@ -54,18 +52,11 @@ services:
       - TELEGRAM_API_HASH=
       - TELEGRAM_API_ID=
       - LANGUAGE=ES
-      - DEFAULT_DOWNLOAD_PATH=/downloads
-      #- DEFAULT_DOWNLOAD_AUDIO=/audio
-      #- DEFAULT_DOWNLOAD_VIDEO=/video
-      #- DEFAULT_DOWNLOAD_PHOTO=/photo
-      #- DEFAULT_DOWNLOAD_DOCUMENT=/document
-      #- DEFAULT_DOWNLOAD_TORRENT=/torrent
     volumes:
       - /ruta/para/descargar/general:/downloads
       #- /ruta/para/descargar/audio:/audio
       #- /ruta/para/descargar/video:/video
       #- /ruta/para/descargar/foto:/photo
-      #- /ruta/para/descargar/documentos:/document
       #- /ruta/para/descargar/torrent:/torrent
     image: dgongut/dropbot:latest
     container_name: dropbot

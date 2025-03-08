@@ -1,25 +1,18 @@
-FROM alpine:3.18.6
+FROM alpine:3.21.3
 
-ENV TELEGRAM_TOKEN=abc
-ENV TELEGRAM_ADMIN=abc
-ENV TELEGRAM_API_HASH=abc
-ENV TELEGRAM_API_ID=abc
-ENV LANGUAGE=ES
-ENV DEFAULT_DOWNLOAD_PATH=abc
-ENV DEFAULT_DOWNLOAD_AUDIO=abc
-ENV DEFAULT_DOWNLOAD_VIDEO=abc
-ENV DEFAULT_DOWNLOAD_PHOTO=abc
-ENV DEFAULT_DOWNLOAD_DOCUMENT=abc
-ENV DEFAULT_DOWNLOAD_TORRENT=abc
-ARG VERSION=0.9.2
+ARG VERSION=1.0.0
 
 WORKDIR /app
 RUN wget https://github.com/dgongut/dropbot/archive/refs/tags/v${VERSION}.tar.gz -P /tmp
 RUN tar -xf /tmp/v${VERSION}.tar.gz
 RUN mv dropbot-${VERSION}/* /app
+RUN mv dropbot-${VERSION}/dropbot.py /app
+RUN mv dropbot-${VERSION}/config.py /app
+RUN mv dropbot-${VERSION}/locale /app
+RUN mv dropbot-${VERSION}/requirements.txt /app
 RUN rm /tmp/v${VERSION}.tar.gz
 RUN rm -rf dropbot-${VERSION}/
-RUN apk add --no-cache python3 py3-pip
-RUN pip3 install telethon==1.37
+RUN apk add --no-cache python3 py3-pip tzdata
+RUN export PIP_BREAK_SYSTEM_PACKAGES=1; pip3 install --no-cache-dir -Ur /app/requirements.txt
 
 ENTRYPOINT ["python3", "dropbot.py"]

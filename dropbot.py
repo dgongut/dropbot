@@ -1,5 +1,5 @@
 import os
-from telethon import TelegramClient, events, functions, types
+from telethon import TelegramClient, events, functions, types, Button
 from telethon.tl.types import (
     BotCommand, Document, Photo,
     DocumentAttributeFilename, DocumentAttributeVideo, DocumentAttributeAudio
@@ -12,7 +12,7 @@ import sys
 import re
 import asyncio
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")
@@ -32,18 +32,24 @@ if ANONYMOUS_USER_ID == TELEGRAM_ADMIN:
     error(get_text("error_bot_telegram_admin_anonymous"))
     sys.exit(1)
 
+if PARALLEL_DOWNLOADS < 1:
+    error(get_text("error_parallel_downloads"))
+    sys.exit(1)
+
 DOWNLOAD_PATHS = {
     "audio": DOWNLOAD_AUDIO if FILTER_AUDIO else DOWNLOAD_PATH,
     "video": DOWNLOAD_VIDEO if FILTER_VIDEO else DOWNLOAD_PATH,
     "photo": DOWNLOAD_PHOTO if FILTER_PHOTO else DOWNLOAD_PATH,
-    "torrent": DOWNLOAD_TORRENT if FILTER_TORRENT else DOWNLOAD_PATH
+    "torrent": DOWNLOAD_TORRENT if FILTER_TORRENT else DOWNLOAD_PATH,
+    "ebook": DOWNLOAD_EBOOK if FILTER_EBOOK else DOWNLOAD_PATH
 }
 
 for path in DOWNLOAD_PATHS.values():
     os.makedirs(path, exist_ok=True)
 
 bot = TelegramClient("dropbot", TELEGRAM_API_ID, TELEGRAM_API_HASH).start(bot_token=TELEGRAM_TOKEN)
-progress_trackers = {}
+active_tasks = {}
+download_semaphore = asyncio.Semaphore(PARALLEL_DOWNLOADS)
 
 def get_download_path(event):
     message = event.message
@@ -52,6 +58,8 @@ def get_download_path(event):
     
     if file_extension in EXTENSIONS_TORRENT:
         return DOWNLOAD_PATHS["torrent"], TOR_ICO
+    elif file_extension in EXTENSIONS_EBOOK:
+        return DOWNLOAD_PATHS["ebook"], BOO_ICO
     elif file_extension in EXTENSIONS_VIDEO or message.video:
         return DOWNLOAD_PATHS["video"], VID_ICO
     elif file_extension in EXTENSIONS_AUDIO or message.audio:
@@ -60,15 +68,19 @@ def get_download_path(event):
         return DOWNLOAD_PATHS["photo"], IMG_ICO
     return DOWNLOAD_PATH, DEF_ICO
 
-# Actualiza la función de manejo de archivos para usar create_task en lugar de run
+
 @bot.on(events.NewMessage(func=lambda e: e.document or e.video or e.audio or e.photo))
 async def handle_files(event):
     if not is_admin(event.sender_id):
         debug(get_text("warning_not_admin", event.sender_id))
         return
     
-    # Usa create_task para ejecutar la función asíncrona en el bucle de eventos principal
-    asyncio.create_task(download_media(event))
+    task = asyncio.create_task(limited_download(event))
+    active_tasks[event.id] = task
+
+async def limited_download(event):
+    async with download_semaphore:
+        await download_media(event)
 
 async def download_media(event):
     message = event.message
@@ -79,13 +91,24 @@ async def download_media(event):
     debug(get_text("debug_file_received", file_name))
     download_path, ico = get_download_path(event)
     file_path = os.path.join(download_path, file_name)
-    debug(get_text("debug_file_path_selected", file_name, download_path))
-    
-    status_message = await event.reply(get_text("downloading", ico))
-    await bot.download_media(message, file=file_path)
 
-    await safe_edit_message(status_message, get_text("downloaded", ico, file_path))
-    debug(get_text("debug_file_downloaded", file_name))
+    status_message = await event.reply(
+        get_text("downloading", ico),
+        buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")]
+    )
+
+    try:
+        await bot.download_media(message, file=file_path)
+        await status_message.delete()
+        await event.reply(get_text("downloaded", ico, file_path))
+        debug(get_text("debug_file_downloaded", file_name))
+    except asyncio.CancelledError:
+        await status_message.edit(get_text("cancelled"), buttons=None)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        debug(get_text("debug_file_cancelled", file_name))
+    finally:
+        active_tasks.pop(event.id, None)
 
 def get_file_name(media):
     if isinstance(media, Document):
@@ -93,6 +116,7 @@ def get_file_name(media):
             (attr.file_name for attr in media.attributes if isinstance(attr, DocumentAttributeFilename)), 
             None
         )
+        file_name = sanitize_filename(file_name) if file_name else None
         if not file_name:
             if any(isinstance(attr, DocumentAttributeVideo) for attr in media.attributes):
                 return f"video_{media.id}.mp4"
@@ -117,6 +141,16 @@ async def handle_start(event):
     elif event.raw_text == "/version":
         response = get_text("version", VERSION)
     await event.reply(response)
+
+@bot.on(events.CallbackQuery(data=lambda data: data.startswith(b"cancel:")))
+async def cancel_download(event):
+    msg_id = int(event.data.decode().split(":")[1])
+    task = active_tasks.get(msg_id)
+    if task and not task.done():
+        task.cancel()
+        await event.answer(get_text("cancelling"))
+    else:
+        await event.answer(get_text("already_cancelled"))
 
 @bot.on(events.NewMessage)
 async def handle_message(event):

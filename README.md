@@ -15,7 +15,7 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 
 - ✅ Detección de archivos de Audio
 - ✅ Detección de archivos de Vídeo
-- ✅ Detección de archivos de Documentos
+- ✅ Detección de archivos de Libros
 - ✅ Detección de archivos de Fotos
 - ✅ Detección de archivos de Torrent
 - ✅ Soporte de idiomas (Spanish, English)
@@ -33,10 +33,12 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | TELEGRAM_API_HASH              | ✅           | Hash de la API de Telegram (obtenido al crear tu aplicación en https://my.telegram.org) |
 | TELEGRAM_API_ID                | ✅           | ID de la API de Telegram (obtenido al crear tu aplicación en https://my.telegram.org)   |
 | LANGUAGE                       | ✅           | Idioma del bot (por defecto "ES" para español o "EN" para inglés)                       |
+| PARALLEL_DOWNLOADS             | ❌           | Especifica el número de descargas paralelas que permite el sistema (por defecto 2)      |
 | FILTER_PHOTO                   | ❌           | Especifica si los archivos de imagen deben almacenarse en una carpeta separada `/photo` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)   |
 | FILTER_AUDIO                   | ❌           | Especifica si los archivos de audio deben almacenarse en una carpeta separada `/audio` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_VIDEO                   | ❌           | Especifica si los archivos de video deben almacenarse en una carpeta separada `/video` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_TORRENT                 | ❌           | Especifica si los archivos de torrent deben almacenarse en una carpeta separada `/torrent` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
+| FILTER_EBOOK                 | ❌           | Especifica si los archivos de libros electrónicos deben almacenarse en una carpeta separada `/ebook` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 
 ### Ejemplo de Docker-Compose para su ejecución normal
 
@@ -53,12 +55,14 @@ services:
       #- FILTER_AUDIO=0
       #- FILTER_VIDEO=0
       #- FILTER_TORRENT=0
+      #- FILTER_EBOOK=0
     volumes:
       - /ruta/para/descargar/general:/downloads
       #- /ruta/para/descargar/audio:/audio
       #- /ruta/para/descargar/video:/video
       #- /ruta/para/descargar/foto:/photo
       #- /ruta/para/descargar/torrent:/torrent
+      #- /ruta/para/descargar/ebook:/ebook
     image: dgongut/dropbot:latest
     container_name: dropbot
     restart: always

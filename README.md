@@ -51,6 +51,7 @@ services:
       - TELEGRAM_API_HASH=
       - TELEGRAM_API_ID=
       - LANGUAGE=ES
+      #- PARALLEL_DOWNLOADS=2
       #- FILTER_PHOTO=0
       #- FILTER_AUDIO=0
       #- FILTER_VIDEO=0

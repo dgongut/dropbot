@@ -1,1 +1,2 @@
-telethon==1.37
+telethon==1.40.0
+yt-dlp==2025.4.30

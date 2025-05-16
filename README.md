@@ -18,6 +18,7 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 - ✅ Detección de archivos de Libros
 - ✅ Detección de archivos de Fotos
 - ✅ Detección de archivos de Torrent
+- ✅ Descarga de YouTube y envío de esos vídeos a Telegram
 - ✅ Soporte de idiomas (Spanish, English)
 
 ¿Lo buscas en [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/dropbot)?

@@ -2,7 +2,7 @@ FROM alpine:3.21.3
 
 WORKDIR /app
 COPY . .
-RUN apk add --no-cache python3 py3-pip tzdata
+RUN apk add --no-cache python3 py3-pip tzdata ffmpeg
 RUN export PIP_BREAK_SYSTEM_PACKAGES=1; pip3 install --no-cache-dir -Ur /app/requirements.txt
 
 VOLUME /downloads

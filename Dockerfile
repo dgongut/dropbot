@@ -14,7 +14,7 @@ RUN mv dropbot-${VERSION}/locale /app
 RUN mv dropbot-${VERSION}/requirements.txt /app
 RUN rm /tmp/v${VERSION}.tar.gz
 RUN rm -rf dropbot-${VERSION}/
-RUN apk add --no-cache python3 py3-pip tzdata
+RUN apk add --no-cache python3 py3-pip tzdata ffmpeg
 RUN export PIP_BREAK_SYSTEM_PACKAGES=1; pip3 install --no-cache-dir -Ur /app/requirements.txt
 
 ENTRYPOINT ["python3", "dropbot.py"]

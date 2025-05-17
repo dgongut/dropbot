@@ -4,7 +4,9 @@ import unicodedata
 import os
 
 def is_admin(id):
-    return id == int(TELEGRAM_ADMIN)
+    admins = TELEGRAM_ADMIN.split(',')
+    if str(id) in admins:
+        return True
 
 def sanitize_filename(filename):
     base, ext = os.path.splitext(filename)

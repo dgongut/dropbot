@@ -1,6 +1,6 @@
 {
     "already_cancelled": "Ya fue cancelada o terminada",
-    "audio": "🎵 Audio",
+    "audio": "$1 Audio",
     "button_cancel": "❌ - Cancelar",
     "button_send": "📤 Enviar a Telegram",
     "button_send_and_delete": "🗑️ Enviar y eliminar",
@@ -36,6 +36,7 @@
     "error_file_does_not_exist_user": "❌ El fichero no se encuentra",
     "error_sending_the_file": "Error enviando el fichero. Error: $1",
     "error_sending_the_file_user": "❌ Error enviando el fichero. El fichero se encuentra en el servidor.",
+    "error_sending_initial_message": "Error enviando el mensaje inicial. Error: $1",
     "error_output_file_not_found": "No se ha encontrado el fichero de salida: $1",
     "error_url": "❌ Por el momento no puedo descargar archivos desde URL",
     "error_yt_failed": "La descarga de YouTube ha fallado. Error: $1",
@@ -47,7 +48,7 @@
     "starting_download": "⏳ Iniciando descarga...",
     "upload_asking": "¿Qué deseas hacer con el fichero?",
     "user_not_admin": "❌ Este bot no te pertenece.\n\nSi quieres descargar ficheros en tu servidor a través de Telegram despliégame en tu servidor.\n\nEcha un vistazo en [DockerHub](https://hub.docker.com/r/dgongut/dropbot) donde encontrarás un docker-compose. \n\n¿Eres curioso? El código se encuentra publicado en [GitHub](https://github.com/dgongut/dropbot).\n\nSi tienes dudas, pregúntame, soy @dgongut",
-    "video": "🎥 Vídeo",
+    "video": "$1 Vídeo",
     "version": "⚙️ Versión: $1\nDesarrollado con ❤️ por @dgongut\n\nSi encuentras cualquier fallo o sugerencia contáctame.\n\nPuedes encontrar todo lo relacionado con este bot en [DockerHub](https://hub.docker.com/r/dgongut/dropbot) o en [GitHub](https://github.com/dgongut/dropbot).",
     "warning_not_admin": "El usuario $1 (@$2) no es un administrador y ha tratado de usar el bot.",
     "welcome_message": "🫡 DropBot a su servicio\n\nEnvíame un fichero y lo descargaré en tu servidor en su carpeta correspondiente.\n\nEnvíame un enlace de YouTube para descargar el vídeo o el audio."

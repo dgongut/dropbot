@@ -12,7 +12,7 @@ import sys
 import asyncio
 import glob
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")
@@ -28,9 +28,9 @@ if DEFAULT_EMPTY_STR == TELEGRAM_ADMIN:
     error(get_text("error_bot_telegram_admin"))
     sys.exit(1)
 
-if ANONYMOUS_USER_ID == TELEGRAM_ADMIN:
-    error(get_text("error_bot_telegram_admin_anonymous"))
-    sys.exit(1)
+if str(ANONYMOUS_USER_ID) in str(TELEGRAM_ADMIN).split(','):
+	error(get_text("error_bot_telegram_admin_anonymous"))
+	sys.exit(1)
 
 if PARALLEL_DOWNLOADS < 1:
     error(get_text("error_parallel_downloads"))
@@ -72,8 +72,7 @@ def get_download_path(event):
 
 @bot.on(events.NewMessage(func=lambda e: e.document or e.video or e.audio or e.photo))
 async def handle_files(event):
-    if not is_admin(event.sender_id):
-        debug(get_text("warning_not_admin", event.sender_id))
+    if await check_admin_and_warn(event):
         return
     
     task = asyncio.create_task(limited_download(event))
@@ -145,6 +144,9 @@ async def handle_start(event):
 
 @bot.on(events.CallbackQuery(data=lambda data: data.startswith(b"cancel:")))
 async def cancel_download(event):
+    if await check_admin_and_warn(event):
+        return
+
     msg_id = int(event.data.decode().split(":")[1])
     task = active_tasks.get(msg_id)
 
@@ -159,14 +161,29 @@ async def cancel_download(event):
 
 @bot.on(events.NewMessage(pattern=r'https?://(?:www\.)?(?:youtube\.com|youtu\.be)/\S+'))
 async def handle_youtube_link(event):
+    if await check_admin_and_warn(event):
+        return
+
     url = event.raw_text.strip()
     buttons = [
-        [Button.inline(get_text("audio"), data=f"yt_audio:{url}"), Button.inline(get_text("video"), data=f"yt_video:{url}")]
+        [Button.inline(get_text("audio", AUD_ICO), data=f"yt_audio:{url}"), Button.inline(get_text("video", VID_ICO), data=f"yt_video:{url}")],
+        [Button.inline(get_text("button_cancel"), data=f"simplecancel")]
     ]
     await event.reply(get_text("dowload_asking"), buttons=buttons)
 
+@bot.on(events.CallbackQuery(pattern=b"simplecancel"))
+async def cancel_simple(event):
+    if await check_admin_and_warn(event):
+        return
+
+    debug(get_text("debug_yt_download_cancelled"))
+    await event.delete()
+
 @bot.on(events.CallbackQuery(pattern=b"yt_(audio|video):(.+)"))
 async def handle_format_selection(event):
+    if await check_admin_and_warn(event):
+        return
+
     await event.answer()
     format_type = event.pattern_match.group(1).decode()
     url = event.pattern_match.group(2).decode()
@@ -176,13 +193,14 @@ async def handle_format_selection(event):
     output_dir = DOWNLOAD_PATHS["audio"] if is_audio else DOWNLOAD_PATHS["video"]
 
     status_message = await event.edit(
-        get_text("downloading", "🎵" if is_audio else "🎥"),
+        get_text("downloading", AUD_ICO if is_audio else VID_ICO),
         buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")]
     )
 
     cmd = [
         "yt-dlp",
         "-f", format_flag,
+        "--restrict-filenames",
         "-o", os.path.join(output_dir, "%(title).200s.%(ext)s"),
         url
     ]
@@ -221,7 +239,7 @@ async def run_yt_dlp(event, cmd, status_message):
                 await handle_success(event, file_path)
             else:
                 debug(get_text("error_output_file_not_found", file_path))
-                icon = "🎵" if file_path.endswith(".mp3") else "🎥"
+                icon = AUD_ICO if file_path.endswith(".mp3") else VID_ICO
                 await event.reply(get_text("downloaded", icon, file_path))
         else:
             error_output = stderr.decode()
@@ -279,6 +297,9 @@ async def handle_success(event, file_path):
 
 @bot.on(events.CallbackQuery(pattern=b"(send|senddelete|nosend):(.+)"))
 async def handle_send_choice(event):
+    if await check_admin_and_warn(event):
+        return
+
     await event.answer()
     action = event.pattern_match.group(1).decode()
     file_id = int(event.pattern_match.group(2).decode())
@@ -321,7 +342,12 @@ def cleanup_partials():
         os.remove(f)
 
 async def send_startup_message():
-    await bot.send_message(int(TELEGRAM_ADMIN), get_text("initial_message", VERSION))
+    admins = TELEGRAM_ADMIN.split(',')
+    for admin in admins:
+        try:
+            await bot.send_message(int(admin), get_text("initial_message", VERSION))
+        except Exception as e:
+            error(get_text("error_sending_initial_message", e))
 
 async def set_commands():
     commands = [
@@ -334,6 +360,14 @@ async def set_commands():
         lang_code=LANGUAGE.lower(),
         commands=commands
     ))
+
+async def check_admin_and_warn(event):
+    if not is_admin(event.sender_id):
+        sender = await event.get_sender()
+        username = sender.username if sender else None
+        warning(get_text("warning_not_admin", event.sender_id, username))
+        return True
+    return False
 
 async def main():
     debug(f"DropBot v{VERSION}")

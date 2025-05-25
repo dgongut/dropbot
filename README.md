@@ -39,7 +39,9 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | FILTER_AUDIO                   | ❌           | Especifica si los archivos de audio deben almacenarse en una carpeta separada `/audio` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_VIDEO                   | ❌           | Especifica si los archivos de video deben almacenarse en una carpeta separada `/video` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_TORRENT                 | ❌           | Especifica si los archivos de torrent deben almacenarse en una carpeta separada `/torrent` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
-| FILTER_EBOOK                 | ❌           | Especifica si los archivos de libros electrónicos deben almacenarse en una carpeta separada `/ebook` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
+| FILTER_EBOOK                   | ❌           | Especifica si los archivos de libros electrónicos deben almacenarse en una carpeta separada `/ebook` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
+| FILTER_YOUTUBE_AUDIO           | ❌           | Especifica si los archivos de audio de youtube deben almacenarse en una carpeta separada `/youtube_audio` en lugar de donde van los audios. 0 = no, 1 = sí (por defecto 0)    |
+| FILTER_YOUTUBE_VIDEO           | ❌           | Especifica si los archivos de vídeo de youtube deben almacenarse en una carpeta separada `/youtube_video` en lugar de donde van los vídeos. 0 = no, 1 = sí (por defecto 0)    |
 
 ### Ejemplo de Docker-Compose para su ejecución normal
 
@@ -58,6 +60,8 @@ services:
       #- FILTER_VIDEO=0
       #- FILTER_TORRENT=0
       #- FILTER_EBOOK=0
+      #- FILTER_YOUTUBE_AUDIO=0
+      #- FILTER_YOUTUBE_VIDEO=0
     volumes:
       - /ruta/para/descargar/general:/downloads
       #- /ruta/para/descargar/audio:/audio
@@ -65,6 +69,8 @@ services:
       #- /ruta/para/descargar/foto:/photo
       #- /ruta/para/descargar/torrent:/torrent
       #- /ruta/para/descargar/ebook:/ebook
+      #- /ruta/para/descargar/audios_de_youtube:/youtube_audio
+      #- /ruta/para/descargar/videos_de_youtube:/youtube_video
     image: dgongut/dropbot:latest
     container_name: dropbot
     restart: always

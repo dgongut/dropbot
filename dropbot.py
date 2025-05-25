@@ -12,7 +12,7 @@ import sys
 import asyncio
 import glob
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")
@@ -41,7 +41,9 @@ DOWNLOAD_PATHS = {
     "video": DOWNLOAD_VIDEO if FILTER_VIDEO else DOWNLOAD_PATH,
     "photo": DOWNLOAD_PHOTO if FILTER_PHOTO else DOWNLOAD_PATH,
     "torrent": DOWNLOAD_TORRENT if FILTER_TORRENT else DOWNLOAD_PATH,
-    "ebook": DOWNLOAD_EBOOK if FILTER_EBOOK else DOWNLOAD_PATH
+    "ebook": DOWNLOAD_EBOOK if FILTER_EBOOK else DOWNLOAD_PATH,
+    "youtube_video": DOWNLOAD_YOUTUBE_VIDEO if FILTER_YOUTUBE_VIDEO else (DOWNLOAD_VIDEO if FILTER_VIDEO else DOWNLOAD_PATH),
+    "youtube_audio": DOWNLOAD_YOUTUBE_AUDIO if FILTER_YOUTUBE_AUDIO else (DOWNLOAD_AUDIO if FILTER_AUDIO else DOWNLOAD_PATH)
 }
 
 for path in DOWNLOAD_PATHS.values():
@@ -190,7 +192,7 @@ async def handle_format_selection(event):
     is_audio = format_type == "audio"
 
     format_flag = "bestaudio" if is_audio else "bv*+ba/best"
-    output_dir = DOWNLOAD_PATHS["audio"] if is_audio else DOWNLOAD_PATHS["video"]
+    output_dir = DOWNLOAD_PATHS["youtube_audio"] if is_audio else DOWNLOAD_PATHS["youtube_video"]
 
     status_message = await event.edit(
         get_text("downloading", AUD_ICO if is_audio else VID_ICO),

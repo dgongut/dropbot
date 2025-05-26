@@ -16,3 +16,16 @@ def sanitize_filename(filename):
     base = base.strip('_') or 'archivo'
     base = base[:255 - len(ext)]
     return base + ext
+
+def clean_youtube_link(url):
+    if 'youtu.be/' in url:
+        video_id = url.split('youtu.be/')[1].split('?')[0]
+        return f'https://www.youtube.com/watch?v={video_id}'
+    
+    elif 'youtube.com/watch' in url:
+        for part in url.split('?')[1].split('&'):
+            if part.startswith('v='):
+                video_id = part.split('=')[1]
+                return f'https://www.youtube.com/watch?v={video_id}'
+
+    return url

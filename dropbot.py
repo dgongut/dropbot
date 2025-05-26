@@ -12,7 +12,7 @@ import sys
 import asyncio
 import glob
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")
@@ -166,7 +166,7 @@ async def handle_youtube_link(event):
     if await check_admin_and_warn(event):
         return
 
-    url = event.raw_text.strip()
+    url = clean_youtube_link(event.raw_text.strip())
     buttons = [
         [Button.inline(get_text("audio", AUD_ICO), data=f"yt_audio:{url}"), Button.inline(get_text("video", VID_ICO), data=f"yt_video:{url}")],
         [Button.inline(get_text("button_cancel"), data=f"simplecancel")]

@@ -24,6 +24,7 @@ EXTENSIONS_EBOOK = {
     ".ibooks", ".pdb", ".prc", ".opf", ".rtf", ".html", ".htm", ".djvu", ".cbz", ".cbr",
     ".cb7", ".xps", ".ps", ".nfo"
 }
+EXTENSIONS_COMPRESSED = ['.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.rar']
 IMG_ICO = "🌅"
 VID_ICO = "📽️"
 AUD_ICO = "🎶"

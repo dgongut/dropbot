@@ -1,6 +1,6 @@
 FROM alpine:3.21.3
 
-ARG VERSION=1.4.1
+ARG VERSION=1.5.0
 
 WORKDIR /app
 RUN wget https://github.com/dgongut/dropbot/archive/refs/tags/v${VERSION}.tar.gz -P /tmp

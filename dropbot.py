@@ -10,9 +10,12 @@ from debug import *
 from basic import *
 import sys
 import asyncio
+import zipfile
+import tarfile
+import shutil
 import glob
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")
@@ -104,6 +107,22 @@ async def download_media(event):
         await status_message.delete()
         await event.reply(get_text("downloaded", ico, file_path))
         debug(get_text("debug_file_downloaded", file_name))
+
+        if is_compressed_file(file_path):
+            if is_split_zip(file_name):
+                warning(get_text("warning_zip_split_not_supported", file_name))
+            elif file_name.lower().endswith(".rar"):
+                warning(get_text("warning_rar_not_supported", file_name)) 
+            else:
+                base_name = os.path.splitext(file_path)[0]
+                extracted_path = os.path.join(download_path, os.path.basename(base_name))
+                os.makedirs(extracted_path, exist_ok=True)
+
+                if extract_file(file_path, extracted_path):
+                    buttons = [Button.inline(get_text("button_keep"), data=f"keep:{file_path}"), Button.inline(get_text("button_delete"), data=f"del:{file_path}")]
+                    await event.reply(get_text("extracted_pending", extracted_path), buttons=buttons)
+                    debug(get_text("debug_file_extracted", file_name))
+
     except asyncio.CancelledError:
         await status_message.edit(get_text("cancelled"), buttons=None)
         if os.path.exists(file_path):
@@ -111,6 +130,28 @@ async def download_media(event):
         debug(get_text("debug_file_cancelled", file_name))
     finally:
         active_tasks.pop(event.id, None)
+
+def extract_file(file_path, extract_to):
+    try:
+        if file_path.endswith('.zip'):
+            with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_to)
+        elif any(file_path.endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz']):
+            with tarfile.open(file_path, 'r:*') as tar_ref:
+                tar_ref.extractall(extract_to)
+        else:
+            return False
+        return True
+
+    except Exception as e:
+        error(get_text("error_file_extracted", file_path, e))
+        if os.path.exists(extract_to):
+            try:
+                shutil.rmtree(extract_to)
+                debug(get_text("debug_deleted_folder", extract_to))
+            except Exception as cleanup_error:
+                error(get_text("error_deleting_folder", extract_to, cleanup_error))
+        return False
 
 def get_file_name(media):
     if isinstance(media, Document):
@@ -180,6 +221,41 @@ async def cancel_simple(event):
 
     debug(get_text("debug_yt_download_cancelled"))
     await event.delete()
+
+@bot.on(events.CallbackQuery(pattern=b"keep:(.+)"))
+async def handle_keep_file(event):
+    if await check_admin_and_warn(event):
+        return
+
+    await event.answer()
+    file_path = event.pattern_match.group(1).decode()
+    await event.edit(get_text("extracted", file_path), buttons=None)
+
+@bot.on(events.CallbackQuery(pattern=b"del:(.+)"))
+async def handle_delete_file(event):
+    if await check_admin_and_warn(event):
+        return
+
+    await event.answer()
+    file_path = event.pattern_match.group(1).decode()
+
+    try:
+        if os.path.isfile(file_path):
+            os.remove(file_path)
+            msg = get_text("extracted_and_deleted", file_path)
+            debug(get_text("debug_deleted_file", file_path))
+        elif os.path.isdir(file_path):
+            msg = get_text("error_trying_to_delete_folder_user", file_path)
+            error(get_text("error_trying_to_delete_folder", file_path))
+        else:
+            msg = get_text("error_file_does_not_exist_user")
+            error(get_text("error_file_does_not_exist", file_path))
+
+        await event.edit(msg, buttons=None)
+
+    except Exception as e:
+        await event.edit(get_text("error_deleting_user", file_path), buttons=None)
+        debug(get_text("error_deleting", file_path, e))
 
 @bot.on(events.CallbackQuery(pattern=b"yt_(audio|video):(.+)"))
 async def handle_format_selection(event):

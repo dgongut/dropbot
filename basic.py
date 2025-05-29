@@ -1,4 +1,4 @@
-from config import TELEGRAM_ADMIN
+from config import TELEGRAM_ADMIN, EXTENSIONS_COMPRESSED
 import re
 import unicodedata
 import os
@@ -29,3 +29,33 @@ def clean_youtube_link(url):
                 return f'https://www.youtube.com/watch?v={video_id}'
 
     return url
+
+def is_compressed_file(file_path):
+    lower = file_path.lower()
+    
+    if any(lower.endswith(ext) for ext in EXTENSIONS_COMPRESSED):
+        return True
+    
+    if re.search(r'\.z\d{2,}$', lower):
+        return True
+    if re.search(r'\.r\d{2,}$', lower):
+        return True
+    if re.search(r'\.part\d+\.rar$', lower):
+        return True
+
+    return False
+
+def is_split_zip(file_name):
+    lower = file_name.lower()
+    base = None
+    if re.match(r'.*\.z\d{2,}$', lower):
+        base = re.sub(r'\.z\d{2,}$', '', file_name)
+    elif lower.endswith('.zip'):
+        base = file_name[:-4]
+    else:
+        return False
+    for i in range(1, 100):
+        part = f"{base}.z{str(i).zfill(2)}"
+        if os.path.exists(part):
+            return True
+    return False

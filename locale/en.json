@@ -45,6 +45,7 @@
     "error_sending_the_file": "Error sending the file. Error: $1",
     "error_sending_the_file_user": "❌ Error sending the file. The file is in the server.",
     "error_file_extracted": "Error extracting the file: $1. Error: $2",
+    "error_file_extracted_user": "❌ An error occurred while extracting the file: $1\n\nThe file is on the server.\n\nFor more information, check the bot log.",
     "error_sending_initial_message": "Error sending the initial message. Error: $1",
     "error_output_file_not_found": "Output file not found: $1",
     "error_trying_to_delete_folder": "An attempt was made to delete the folder and it should not happen: $1",

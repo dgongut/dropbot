@@ -43,6 +43,7 @@
     "error_file_does_not_exist": "El fichero no existe: $1",
     "error_file_does_not_exist_user": "❌ El fichero no se encuentra",
     "error_file_extracted": "Error al descomprimir el fichero: $1. Error: $2",
+    "error_file_extracted_user": "❌ Ha ocurrido un error al descomprimir el fichero: $1\n\nEl fichero se encuentra en el servidor.\n\nPara más información consulta el log del bot.",
     "error_sending_the_file": "Error enviando el fichero. Error: $1",
     "error_sending_the_file_user": "❌ Error enviando el fichero. El fichero se encuentra en el servidor.",
     "error_sending_initial_message": "Error enviando el mensaje inicial. Error: $1",

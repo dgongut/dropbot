@@ -15,7 +15,7 @@ import tarfile
 import shutil
 import glob
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")
@@ -122,6 +122,8 @@ async def download_media(event):
                     buttons = [Button.inline(get_text("button_keep"), data=f"keep:{file_path}"), Button.inline(get_text("button_delete"), data=f"del:{file_path}")]
                     await event.reply(get_text("extracted_pending", extracted_path), buttons=buttons)
                     debug(get_text("debug_file_extracted", file_name))
+                else:
+                    await event.reply(get_text("error_file_extracted_user", file_name))
 
     except asyncio.CancelledError:
         await status_message.edit(get_text("cancelled"), buttons=None)
@@ -133,10 +135,10 @@ async def download_media(event):
 
 def extract_file(file_path, extract_to):
     try:
-        if file_path.endswith('.zip'):
+        if file_path.lower().endswith('.zip'):
             with zipfile.ZipFile(file_path, 'r') as zip_ref:
                 zip_ref.extractall(extract_to)
-        elif any(file_path.endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz']):
+        elif any(file_path.lower().endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz']):
             with tarfile.open(file_path, 'r:*') as tar_ref:
                 tar_ref.extractall(extract_to)
         else:

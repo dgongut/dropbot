@@ -15,7 +15,7 @@ import tarfile
 import shutil
 import glob
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")
@@ -105,7 +105,7 @@ async def download_media(event):
     try:
         await bot.download_media(message, file=file_path)
         await status_message.delete()
-        await event.reply(get_text("downloaded", ico, file_path))
+        await event.reply(get_text("downloaded", ico, get_filename_from_path(file_path)))
         debug(get_text("debug_file_downloaded", file_name))
 
         if is_compressed_file(file_path):
@@ -204,7 +204,7 @@ async def cancel_download(event):
     else:
         await event.answer(get_text("already_cancelled"))
 
-@bot.on(events.NewMessage(pattern=r'https?://(?:www\.)?(?:youtube\.com|youtu\.be)/\S+'))
+@bot.on(events.NewMessage(pattern=r'https?://(?:\w+\.)?(youtube\.com|youtu\.be)/(watch\?v=|shorts/)?[\w\-]+'))
 async def handle_youtube_link(event):
     if await check_admin_and_warn(event):
         return
@@ -320,7 +320,7 @@ async def run_yt_dlp(event, cmd, status_message):
             else:
                 debug(get_text("error_output_file_not_found", file_path))
                 icon = AUD_ICO if file_path.endswith(".mp3") else VID_ICO
-                await event.reply(get_text("downloaded", icon, file_path))
+                await event.reply(get_text("downloaded", icon, get_filename_from_path(file_path)))
         else:
             error_output = stderr.decode()
             debug(get_text("error_yt_failed", error_output))
@@ -357,7 +357,7 @@ async def handle_success(event, file_path):
         debug(get_text("debug_filesize", file_size))
 
         icon = "🎵" if file_path.endswith(".mp3") else "🎥"
-        await event.reply(get_text("downloaded", icon, file_path))
+        await event.reply(get_text("downloaded", icon, get_filename_from_path(file_path)))
 
         if file_size <= 2 * 1024 * 1024 * 1024:
             pending_files[event.id] = file_path
@@ -425,7 +425,7 @@ async def send_startup_message():
     admins = TELEGRAM_ADMIN.split(',')
     for admin in admins:
         try:
-            await bot.send_message(int(admin), get_text("initial_message", VERSION))
+            await bot.send_message(int(admin), markdown=get_text("initial_message", VERSION))
         except Exception as e:
             error(get_text("error_sending_initial_message", e))
 

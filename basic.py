@@ -2,6 +2,7 @@ from config import TELEGRAM_ADMIN, EXTENSIONS_COMPRESSED
 import re
 import unicodedata
 import os
+from pathlib import Path
 
 def is_admin(id):
     admins = TELEGRAM_ADMIN.split(',')
@@ -21,12 +22,18 @@ def clean_youtube_link(url):
     if 'youtu.be/' in url:
         video_id = url.split('youtu.be/')[1].split('?')[0]
         return f'https://www.youtube.com/watch?v={video_id}'
-    
+
     elif 'youtube.com/watch' in url:
-        for part in url.split('?')[1].split('&'):
-            if part.startswith('v='):
-                video_id = part.split('=')[1]
-                return f'https://www.youtube.com/watch?v={video_id}'
+        parts = url.split('?')
+        if len(parts) > 1:
+            for part in parts[1].split('&'):
+                if part.startswith('v='):
+                    video_id = part.split('=')[1]
+                    return f'https://www.youtube.com/watch?v={video_id}'
+
+    elif 'youtube.com/shorts/' in url:
+        video_id = url.split('youtube.com/shorts/')[1].split('?')[0]
+        return f'https://www.youtube.com/watch?v={video_id}'
 
     return url
 
@@ -44,6 +51,9 @@ def is_compressed_file(file_path):
         return True
 
     return False
+
+def get_filename_from_path(path):
+    return Path(path).name
 
 def is_split_zip(file_name):
     lower = file_name.lower()

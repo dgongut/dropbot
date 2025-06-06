@@ -425,7 +425,7 @@ async def send_startup_message():
     admins = TELEGRAM_ADMIN.split(',')
     for admin in admins:
         try:
-            await bot.send_message(int(admin), markdown=get_text("initial_message", VERSION))
+            await bot.send_message(int(admin), get_text("initial_message", VERSION))
         except Exception as e:
             error(get_text("error_sending_initial_message", e))
 

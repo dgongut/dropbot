@@ -23,6 +23,7 @@
     "debug_cleaning_yt_subprocess": "Limpiando subproceso de descarga de YouTube. ID $1",
     "debug_sent": "Fichero enviado a Telegram: $1",
     "debug_sent_and_delete": "Fichero enviado a Telegram y eliminado del servidor: $1",
+    "debug_rar_missing_parts": "Fichero $1 - Faltan partes del RAR",
     "debug_yt_download_cancelled": "Descarga de youtube cancelada",
     "debug_yt_cleaning_partial_files": "Limpiando ficheros parciales de la descarga de YouTube: $1",
     "donate": "Este proyecto es de código abierto y lo realizo en mi tiempo libre. La donación no habilitará ninguna función extra. Es simplemente, una forma ideal de agradecer el trabajo que un proyecto como éste lleva detrás.\nSi deseas hacerlo, [haz click aquí](https://donate.dgongut.com).\nMil gracias ❤️",
@@ -56,10 +57,12 @@
     "extracted": "✅ 🗜️ Fichero extraído: $1\n\nSe conserva el fichero comprimido.",
     "extracted_pending": "✅ 🗜️ Fichero extraído: $1\n\n¿Qué desea hacer con el fichero descargado ahora que ya está descomprimido?",
     "extracted_and_deleted": "✅ 🗜️ Fichero extraído y eliminado del servidor: $1",
+    "extracted_and_deleted_with_parts": "✅ 🗜️ Fichero extraído y todas las partes comprimidas han sido eliminadas",
     "initial_message": "🟢 DropBot activo\n⚙️ v$1",
     "menu_donate": "Dona al desarrollador",
     "menu_start": "Menú principal",
     "menu_version": "Muestra la versión actual",
+    "missing_rar_parts": "⏳ Esperando al resto de partes para descomprimir el fichero RAR",
     "starting_download": "⏳ Iniciando descarga...",
     "upload_asking": "¿Qué deseas hacer con el fichero?",
     "user_not_admin": "❌ Este bot no te pertenece.\n\nSi quieres descargar ficheros en tu servidor a través de Telegram despliégame en tu servidor.\n\nEcha un vistazo en [DockerHub](https://hub.docker.com/r/dgongut/dropbot) donde encontrarás un docker-compose. \n\n¿Eres curioso? El código se encuentra publicado en [GitHub](https://github.com/dgongut/dropbot).\n\nSi tienes dudas, pregúntame, soy @dgongut",
@@ -67,6 +70,5 @@
     "version": "⚙️ Versión: $1\nDesarrollado con ❤️ por @dgongut\n\nSi encuentras cualquier fallo o sugerencia contáctame.\n\nPuedes encontrar todo lo relacionado con este bot en [DockerHub](https://hub.docker.com/r/dgongut/dropbot) o en [GitHub](https://github.com/dgongut/dropbot).",
     "warning_not_admin": "El usuario $1 (@$2) no es un administrador y ha tratado de usar el bot.",
     "warning_zip_split_not_supported": "Fichero $1 - La opción de descomprimir archivos ZIP en partes no está soportada en este momento",
-    "warning_rar_not_supported": "Fichero $1 - La opción de descomprimir archivos RAR no está soportada en este momento",
     "welcome_message": "🫡 DropBot a su servicio\n\nEnvíame un fichero y lo descargaré en tu servidor en su carpeta correspondiente.\n\nEnvíame un enlace de YouTube para descargar el vídeo o el audio."
 }

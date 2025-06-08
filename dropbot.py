@@ -12,10 +12,11 @@ import sys
 import asyncio
 import zipfile
 import tarfile
+import rarfile
 import shutil
 import glob
 
-VERSION = "1.5.2"
+VERSION = "1.6.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")
@@ -111,19 +112,22 @@ async def download_media(event):
         if is_compressed_file(file_path):
             if is_split_zip(file_name):
                 warning(get_text("warning_zip_split_not_supported", file_name))
-            elif file_name.lower().endswith(".rar"):
-                warning(get_text("warning_rar_not_supported", file_name)) 
             else:
                 base_name = os.path.splitext(file_path)[0]
+                if rarfile.is_rarfile(file_path):
+                    base_name = clean_rar_base_name(file_name)
                 extracted_path = os.path.join(download_path, os.path.basename(base_name))
                 os.makedirs(extracted_path, exist_ok=True)
 
-                if extract_file(file_path, extracted_path):
+                extract_result = extract_file(file_path, extracted_path)
+                if extract_result == True:
                     buttons = [Button.inline(get_text("button_keep"), data=f"keep:{file_path}"), Button.inline(get_text("button_delete"), data=f"del:{file_path}")]
                     await event.reply(get_text("extracted_pending", extracted_path), buttons=buttons)
                     debug(get_text("debug_file_extracted", file_name))
-                else:
+                elif extract_result == False:
                     await event.reply(get_text("error_file_extracted_user", file_name))
+                elif extract_result == "missing_parts":
+                    await event.reply(get_text("missing_rar_parts"))
 
     except asyncio.CancelledError:
         await status_message.edit(get_text("cancelled"), buttons=None)
@@ -141,6 +145,20 @@ def extract_file(file_path, extract_to):
         elif any(file_path.lower().endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz']):
             with tarfile.open(file_path, 'r:*') as tar_ref:
                 tar_ref.extractall(extract_to)
+        elif rarfile.is_rarfile(file_path):
+            try:
+                with rarfile.RarFile(file_path) as rar_ref:
+                    rar_ref.extractall(extract_to)
+            except Exception as e:
+                msg = str(e).lower()
+                if ("need to start from first volume" in msg or
+                    "need first volume" in msg or
+                    "missing volume" in msg or
+                    "unexpected end of archive" in msg):
+                    debug(get_text("debug_rar_missing_parts", file_path))
+                    return "missing_parts" 
+                else:
+                    raise
         else:
             return False
         return True
@@ -243,9 +261,42 @@ async def handle_delete_file(event):
 
     try:
         if os.path.isfile(file_path):
-            os.remove(file_path)
-            msg = get_text("extracted_and_deleted", file_path)
-            debug(get_text("debug_deleted_file", file_path))
+            filename = os.path.basename(file_path).lower()
+            dirname = os.path.dirname(file_path)
+            rar_patterns = [
+                r"(.*)\.part\d+\.rar$",
+                r"(.*)\.r\d{2}$",
+                r"(.*)\.rar$"
+            ]
+
+            matched_base = None
+            for pattern in rar_patterns:
+                m = re.match(pattern, filename)
+                if m:
+                    matched_base = m.group(1)
+                    break
+
+            if matched_base:
+                all_parts = []
+                for f in os.listdir(dirname):
+                    f_lower = f.lower()
+                    if (f_lower.startswith(matched_base)
+                        and (f_lower.endswith(".rar") or re.match(r".*\.r\d{2}$", f_lower) or ".part" in f_lower)):
+                        full_path = os.path.join(dirname, f)
+                        if os.path.isfile(full_path):
+                            all_parts.append(full_path)
+
+                for part in all_parts:
+                    try:
+                        os.remove(part)
+                        msg = get_text("extracted_and_deleted_with_parts", file_path)
+                        debug(get_text("debug_deleted_file", part))
+                    except Exception as e:
+                        debug(get_text("error_deleting", file_path, e))
+            else:
+                os.remove(file_path)
+                msg = get_text("extracted_and_deleted", file_path)
+                debug(get_text("debug_deleted_file", file_path))
         elif os.path.isdir(file_path):
             msg = get_text("error_trying_to_delete_folder_user", file_path)
             error(get_text("error_trying_to_delete_folder", file_path))

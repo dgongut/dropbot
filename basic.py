@@ -69,3 +69,9 @@ def is_split_zip(file_name):
         if os.path.exists(part):
             return True
     return False
+
+def clean_rar_base_name(filename):
+    name = filename.lower()
+    name = os.path.splitext(name)[0]
+    name = re.sub(r'(\.part\d+|\.r\d+)$', '', name)
+    return name

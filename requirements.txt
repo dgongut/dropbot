@@ -1,2 +1,3 @@
 telethon==1.40.0
 yt-dlp==2025.5.22
+rarfile==4.2

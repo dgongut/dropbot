@@ -1,3 +1,4 @@
-telethon==1.40.0
-yt-dlp==2025.5.22
+telethon==1.41.2
+yt-dlp==2025.10.22
 rarfile==4.2
+curl-cffi==0.13.0

@@ -1,11 +1,12 @@
 import os
+import warnings
 from telethon import TelegramClient, events, functions, types, Button
 from telethon.tl.types import (
     BotCommand, Document, Photo,
     DocumentAttributeFilename, DocumentAttributeVideo, DocumentAttributeAudio
 )
 from config import *
-from translations import *
+from translations import get_text, load_locale, PARSE_MODE
 from debug import *
 from basic import *
 import sys
@@ -16,7 +17,9 @@ import rarfile
 import shutil
 import glob
 
-VERSION = "1.6.0"
+VERSION = "2.0.0"
+
+warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("LANGUAGE only can be ES/EN")
@@ -46,8 +49,8 @@ DOWNLOAD_PATHS = {
     "photo": DOWNLOAD_PHOTO if FILTER_PHOTO else DOWNLOAD_PATH,
     "torrent": DOWNLOAD_TORRENT if FILTER_TORRENT else DOWNLOAD_PATH,
     "ebook": DOWNLOAD_EBOOK if FILTER_EBOOK else DOWNLOAD_PATH,
-    "youtube_video": DOWNLOAD_YOUTUBE_VIDEO if FILTER_YOUTUBE_VIDEO else (DOWNLOAD_VIDEO if FILTER_VIDEO else DOWNLOAD_PATH),
-    "youtube_audio": DOWNLOAD_YOUTUBE_AUDIO if FILTER_YOUTUBE_AUDIO else (DOWNLOAD_AUDIO if FILTER_AUDIO else DOWNLOAD_PATH)
+    "url_video": DOWNLOAD_URL_VIDEO if FILTER_URL_VIDEO else (DOWNLOAD_VIDEO if FILTER_VIDEO else DOWNLOAD_PATH),
+    "url_audio": DOWNLOAD_URL_AUDIO if FILTER_URL_AUDIO else (DOWNLOAD_AUDIO if FILTER_AUDIO else DOWNLOAD_PATH)
 }
 
 for path in DOWNLOAD_PATHS.values():
@@ -56,6 +59,7 @@ for path in DOWNLOAD_PATHS.values():
 bot = TelegramClient("dropbot", TELEGRAM_API_ID, TELEGRAM_API_HASH).start(bot_token=TELEGRAM_TOKEN)
 active_tasks = {}
 pending_files = {}
+pending_urls = {}
 download_semaphore = asyncio.Semaphore(PARALLEL_DOWNLOADS)
 
 def get_download_path(event):
@@ -100,42 +104,90 @@ async def download_media(event):
 
     status_message = await event.reply(
         get_text("downloading", ico),
-        buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")]
+        buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+        parse_mode=PARSE_MODE
     )
 
-    try:
-        await bot.download_media(message, file=file_path)
-        await status_message.delete()
-        await event.reply(get_text("downloaded", ico, get_filename_from_path(file_path)))
-        debug(get_text("debug_file_downloaded", file_name))
+    # Intentar descargar con reintentos
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        try:
+            await bot.download_media(message, file=file_path)
+            # Descarga exitosa
+            await status_message.delete()
+            await event.reply(get_text("downloaded", ico, get_filename_from_path(file_path)), parse_mode=PARSE_MODE)
+            debug(get_text("debug_file_downloaded", file_name))
 
-        if is_compressed_file(file_path):
-            if is_split_zip(file_name):
-                warning(get_text("warning_zip_split_not_supported", file_name))
+            if is_compressed_file(file_path):
+                if is_split_zip(file_name):
+                    warning(get_text("warning_zip_split_not_supported", file_name))
+                else:
+                    base_name = os.path.splitext(file_path)[0]
+                    if rarfile.is_rarfile(file_path):
+                        base_name = clean_rar_base_name(file_name)
+                    extracted_path = os.path.join(download_path, os.path.basename(base_name))
+                    os.makedirs(extracted_path, exist_ok=True)
+
+                    extract_result = extract_file(file_path, extracted_path)
+                    if extract_result == True:
+                        buttons = [Button.inline(get_text("button_keep"), data=f"keep:{file_path}"), Button.inline(get_text("button_delete"), data=f"del:{file_path}")]
+                        await event.reply(get_text("extracted_pending", extracted_path), buttons=buttons, parse_mode=PARSE_MODE)
+                        debug(get_text("debug_file_extracted", file_name))
+                    elif extract_result == False:
+                        await event.reply(get_text("error_file_extracted_user", file_name), parse_mode=PARSE_MODE)
+                    elif extract_result == "missing_parts":
+                        await event.reply(get_text("missing_rar_parts"), parse_mode=PARSE_MODE)
+
+            # Salir del bucle si la descarga fue exitosa
+            break
+
+        except asyncio.CancelledError:
+            await status_message.edit(get_text("cancelled"), buttons=None, parse_mode=PARSE_MODE)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            debug(get_text("debug_file_cancelled", file_name))
+            raise
+
+        except (TimeoutError, ValueError) as e:
+            error_msg = str(e)
+            if "timeout" in error_msg.lower() or "unsuccessful" in error_msg.lower():
+                # Eliminar archivo parcialmente descargado
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        debug(get_text("debug_deleted_partial_file", file_path))
+                    except Exception as cleanup_error:
+                        error(get_text("error_deleting", file_path, cleanup_error))
+
+                # Si aún quedan intentos, reintentar
+                if attempt < MAX_DOWNLOAD_RETRIES:
+                    debug(get_text("debug_retrying_download", file_name, attempt + 1, MAX_DOWNLOAD_RETRIES, error_msg))
+                    try:
+                        await status_message.edit(
+                            get_text("warning_retrying_download", attempt + 1, MAX_DOWNLOAD_RETRIES),
+                            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                            parse_mode=PARSE_MODE
+                        )
+                    except Exception as msg_error:
+                        error(get_text("error_updating_status_message", msg_error))
+
+                    # Esperar antes de reintentar
+                    await asyncio.sleep(RETRY_DELAY_SECONDS)
+                else:
+                    # Último intento fallido
+                    error(get_text("error_telegram_timeout", file_name, error_msg))
+                    try:
+                        await status_message.edit(
+                            get_text("error_telegram_timeout_user", file_name),
+                            buttons=None,
+                            parse_mode=PARSE_MODE
+                        )
+                    except Exception as msg_error:
+                        error(get_text("error_updating_status_message", msg_error))
             else:
-                base_name = os.path.splitext(file_path)[0]
-                if rarfile.is_rarfile(file_path):
-                    base_name = clean_rar_base_name(file_name)
-                extracted_path = os.path.join(download_path, os.path.basename(base_name))
-                os.makedirs(extracted_path, exist_ok=True)
+                raise
 
-                extract_result = extract_file(file_path, extracted_path)
-                if extract_result == True:
-                    buttons = [Button.inline(get_text("button_keep"), data=f"keep:{file_path}"), Button.inline(get_text("button_delete"), data=f"del:{file_path}")]
-                    await event.reply(get_text("extracted_pending", extracted_path), buttons=buttons)
-                    debug(get_text("debug_file_extracted", file_name))
-                elif extract_result == False:
-                    await event.reply(get_text("error_file_extracted_user", file_name))
-                elif extract_result == "missing_parts":
-                    await event.reply(get_text("missing_rar_parts"))
-
-    except asyncio.CancelledError:
-        await status_message.edit(get_text("cancelled"), buttons=None)
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        debug(get_text("debug_file_cancelled", file_name))
-    finally:
-        active_tasks.pop(event.id, None)
+    # Limpiar tareas activas
+    active_tasks.pop(event.id, None)
 
 def extract_file(file_path, extract_to):
     try:
@@ -203,7 +255,7 @@ async def handle_start(event):
         response = get_text("donate")
     elif event.raw_text == "/version":
         response = get_text("version", VERSION)
-    await event.reply(response)
+    await event.reply(response, parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(data=lambda data: data.startswith(b"cancel:")))
 async def cancel_download(event):
@@ -222,24 +274,110 @@ async def cancel_download(event):
     else:
         await event.answer(get_text("already_cancelled"))
 
-@bot.on(events.NewMessage(pattern=r'https?://(?:\w+\.)?(youtube\.com|youtu\.be)/(watch\?v=|shorts/)?[\w\-]+'))
-async def handle_youtube_link(event):
+async def detect_content_type(url):
+    """Detecta el tipo de contenido sin descargarlo usando yt-dlp --dump-json"""
+    try:
+        cmd = ["yt-dlp", "--dump-json", "--no-warnings", "--skip-download", "--playlist-items", "1", url]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await proc.communicate()
+
+        # Mostrar stderr si hay contenido
+        stderr_output = stderr.decode().strip()
+        if stderr_output:
+            for line in stderr_output.splitlines():
+                debug(f"yt-dlp detect stderr: {line}")
+
+        if proc.returncode == 0:
+            import json
+            lines = stdout.decode().splitlines()
+
+            # Analizar primer item para detectar tipo
+            if lines:
+                data = json.loads(lines[0])
+                vcodec = data.get("vcodec")
+                acodec = data.get("acodec")
+                ext = data.get("ext", "").lower()
+
+                debug(get_text("debug_content_detected", vcodec, acodec, ext))
+
+                # Detectar tipo de contenido
+                if vcodec and vcodec != "none":
+                    return "video"  # Tiene video
+                elif acodec and acodec != "none":
+                    return "audio"  # Solo audio
+                elif ext in ["jpg", "jpeg", "png", "gif", "webp", "bmp"]:
+                    return "image"  # Solo imagen
+            else:
+                debug("yt-dlp detect: No se recibió JSON en stdout")
+        else:
+            debug(f"yt-dlp detect: Falló con código {proc.returncode}")
+
+        return "unknown"
+    except Exception as e:
+        debug(get_text("error_detecting_content_type", e))
+        return "unknown"
+
+@bot.on(events.NewMessage(pattern=r'https?://[^\s]+'))
+async def handle_url_link(event):
     if await check_admin_and_warn(event):
         return
 
-    url = clean_youtube_link(event.raw_text.strip())
-    buttons = [
-        [Button.inline(get_text("audio", AUD_ICO), data=f"yt_audio:{url}"), Button.inline(get_text("video", VID_ICO), data=f"yt_video:{url}")],
-        [Button.inline(get_text("button_cancel"), data=f"simplecancel")]
-    ]
-    await event.reply(get_text("dowload_asking"), buttons=buttons)
+    url = event.raw_text.strip()
+    url_id = str(event.id)
+    pending_urls[url_id] = url
 
-@bot.on(events.CallbackQuery(pattern=b"simplecancel"))
+    # Mostrar mensaje de análisis
+    analyzing_msg = await event.reply(get_text("analyzing_url"), parse_mode=PARSE_MODE)
+
+    # Detectar tipo de contenido
+    content_type = await detect_content_type(url)
+
+    # Crear botones según el tipo de contenido
+    if content_type == "video":
+        # Video: ofrecer Audio o Video
+        buttons = [
+            [Button.inline(get_text("audio", AUD_ICO), data=f"url_audio:{url_id}"), Button.inline(get_text("video", VID_ICO), data=f"url_video:{url_id}")],
+            [Button.inline(get_text("button_cancel"), data=f"simplecancel:{url_id}")]
+        ]
+        message = get_text("dowload_asking")
+    elif content_type == "image":
+        # Imagen: solo descargar
+        buttons = [
+            [Button.inline(get_text("download_button", "📷"), data=f"url_video:{url_id}")],
+            [Button.inline(get_text("button_cancel"), data=f"simplecancel:{url_id}")]
+        ]
+        message = get_text("download_image_asking")
+    elif content_type == "audio":
+        # Audio: solo descargar
+        buttons = [
+            [Button.inline(get_text("download_button", AUD_ICO), data=f"url_audio:{url_id}")],
+            [Button.inline(get_text("button_cancel"), data=f"simplecancel:{url_id}")]
+        ]
+        message = get_text("download_audio_asking")
+    else:
+        # Desconocido: ofrecer solo opción de descargar (sin audio)
+        buttons = [
+            [Button.inline(get_text("download_button", "📥"), data=f"url_video:{url_id}")],
+            [Button.inline(get_text("button_cancel"), data=f"simplecancel:{url_id}")]
+        ]
+        message = get_text("download_unknown_asking")
+
+    await analyzing_msg.edit(message, buttons=buttons, parse_mode=PARSE_MODE)
+
+@bot.on(events.CallbackQuery(pattern=b"simplecancel:(.+)"))
 async def cancel_simple(event):
     if await check_admin_and_warn(event):
         return
 
-    debug(get_text("debug_yt_download_cancelled"))
+    url_id = event.pattern_match.group(1).decode()
+    pending_urls.pop(url_id, None)
+    debug(get_text("debug_url_download_cancelled"))
     await event.delete()
 
 @bot.on(events.CallbackQuery(pattern=b"keep:(.+)"))
@@ -249,7 +387,7 @@ async def handle_keep_file(event):
 
     await event.answer()
     file_path = event.pattern_match.group(1).decode()
-    await event.edit(get_text("extracted", file_path), buttons=None)
+    await event.edit(get_text("extracted", file_path), buttons=None, parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(pattern=b"del:(.+)"))
 async def handle_delete_file(event):
@@ -304,28 +442,36 @@ async def handle_delete_file(event):
             msg = get_text("error_file_does_not_exist_user")
             error(get_text("error_file_does_not_exist", file_path))
 
-        await event.edit(msg, buttons=None)
+        await event.edit(msg, buttons=None, parse_mode=PARSE_MODE)
 
     except Exception as e:
-        await event.edit(get_text("error_deleting_user", file_path), buttons=None)
+        await event.edit(get_text("error_deleting_user", file_path), buttons=None, parse_mode=PARSE_MODE)
         debug(get_text("error_deleting", file_path, e))
 
-@bot.on(events.CallbackQuery(pattern=b"yt_(audio|video):(.+)"))
+@bot.on(events.CallbackQuery(pattern=b"url_(audio|video):(.+)"))
 async def handle_format_selection(event):
     if await check_admin_and_warn(event):
         return
 
     await event.answer()
     format_type = event.pattern_match.group(1).decode()
-    url = event.pattern_match.group(2).decode()
+    url_id = event.pattern_match.group(2).decode()
+
+    url = pending_urls.get(url_id)
+    if not url:
+        await event.edit(get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
+        return
+
+    pending_urls.pop(url_id, None)
     is_audio = format_type == "audio"
 
     format_flag = "bestaudio" if is_audio else "bv*+ba/best"
-    output_dir = DOWNLOAD_PATHS["youtube_audio"] if is_audio else DOWNLOAD_PATHS["youtube_video"]
+    output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
 
     status_message = await event.edit(
         get_text("downloading", AUD_ICO if is_audio else VID_ICO),
-        buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")]
+        buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+        parse_mode=PARSE_MODE
     )
 
     cmd = [
@@ -341,12 +487,12 @@ async def handle_format_selection(event):
     else:
         cmd.extend(["--merge-output-format", "mp4"])
 
-    task = asyncio.create_task(run_yt_dlp(event, cmd, status_message))
+    task = asyncio.create_task(run_url_download(event, cmd, status_message))
     active_tasks[event.id] = task
 
-async def run_yt_dlp(event, cmd, status_message):
+async def run_url_download(event, cmd, status_message):
     try:
-        debug(get_text("debug_creating_yt_subprocess"))
+        debug(get_text("debug_creating_url_subprocess"))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -355,7 +501,13 @@ async def run_yt_dlp(event, cmd, status_message):
         active_tasks[event.id] = proc
 
         stdout, stderr = await proc.communicate()
-        debug(get_text("debug_exiting_yt_subprocess", proc.returncode))
+        debug(get_text("debug_exiting_url_subprocess", proc.returncode))
+
+        # Mostrar stderr si hay contenido (warnings, errores, etc.)
+        stderr_output = stderr.decode().strip()
+        if stderr_output:
+            for line in stderr_output.splitlines():
+                debug(f"yt-dlp stderr: {line}")
 
         if proc.returncode == -15:
             await handle_cancel(status_message)
@@ -364,43 +516,114 @@ async def run_yt_dlp(event, cmd, status_message):
         await status_message.delete()
         if proc.returncode == 0:
             stdout_lines = stdout.decode().splitlines()
-            file_path = extract_file_path(stdout_lines)
+            file_paths = extract_file_paths(stdout_lines)
 
-            if file_path and os.path.exists(file_path):
-                await handle_success(event, file_path)
+            if file_paths:
+                for file_path in file_paths:
+                    if os.path.exists(file_path):
+                        await handle_success(event, file_path)
+                    else:
+                        debug(get_text("error_output_file_not_found", file_path))
             else:
-                debug(get_text("error_output_file_not_found", file_path))
-                icon = AUD_ICO if file_path.endswith(".mp3") else VID_ICO
-                await event.reply(get_text("downloaded", icon, get_filename_from_path(file_path)))
+                debug(get_text("error_no_files_downloaded"))
+                debug(f"Comando ejecutado: {' '.join(cmd)}")
+                debug(f"Stdout completo: {stdout.decode()}")
+                await event.reply(get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
         else:
-            error_output = stderr.decode()
-            debug(get_text("error_yt_failed", error_output))
-            await event.reply(get_text("error_yt_failed_user"))
+            debug(get_text("error_url_failed", stderr_output))
+            await event.reply(get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
 
     except asyncio.CancelledError:
         await handle_cancel(status_message)
         raise
     finally:
-        debug(get_text("debug_cleaning_yt_subprocess", event.id))
+        debug(get_text("debug_cleaning_url_subprocess", event.id))
         active_tasks.pop(event.id, None)
 
-def extract_file_path(stdout_lines):
-    file_path = None
+def extract_file_paths(stdout_lines):
+    """Extrae todas las rutas de archivos descargados (soporta playlists/carruseles)"""
+    file_paths = []
+    current_file = None
+    is_partial = False
+
     for line in stdout_lines:
         debug(f"yt-dlp: {line}")
+
+        # Detectar archivo de destino inicial
         if "[download] Destination: " in line:
             possible_path = line.split("[download] Destination: ")[-1].strip()
             if possible_path:
-                file_path = possible_path
+                current_file = possible_path
+                # Detectar si es un archivo parcial (será mergeado después)
+                is_partial = ".fdash-" in possible_path or ".f" in possible_path.split(".")[-2] if "." in possible_path else False
+
+        # Detectar merge de formatos (este es el archivo final)
         elif "[Merger]" in line and "Merging formats into" in line:
-            file_path = line.split("Merging formats into")[-1].strip().strip('"')
-            debug(get_text("debug_file_path_merged_detected", file_path))
-            break
+            merged_path = line.split("Merging formats into")[-1].strip().strip('"')
+            debug(get_text("debug_file_path_merged_detected", merged_path))
+            current_file = merged_path
+            is_partial = False  # El archivo mergeado es el final
+            # Agregar inmediatamente el archivo mergeado
+            if current_file and current_file not in file_paths:
+                file_paths.append(current_file)
+                debug(get_text("debug_file_added_to_list", current_file))
+
+        # Detectar extracción de audio (este es el archivo final)
         elif "[ExtractAudio]" in line and "Destination:" in line:
-            file_path = line.split("Destination:")[-1].strip()
-            debug(get_text("debug_file_path_audio_detected", file_path))
-            break
-    return file_path
+            audio_path = line.split("Destination:")[-1].strip()
+            debug(get_text("debug_file_path_audio_detected", audio_path))
+            current_file = audio_path
+            is_partial = False  # El audio extraído es el final
+            # Agregar inmediatamente el audio extraído
+            if current_file and current_file not in file_paths:
+                file_paths.append(current_file)
+                debug(get_text("debug_file_added_to_list", current_file))
+
+        # Detectar finalización de descarga (solo agregar si NO es parcial)
+        elif "[download] 100%" in line or "has already been downloaded" in line:
+            if current_file and not is_partial and current_file not in file_paths:
+                file_paths.append(current_file)
+                debug(get_text("debug_file_added_to_list", current_file))
+                current_file = None
+
+    return file_paths
+
+async def get_video_metadata(file_path):
+    """Obtiene metadatos del video usando ffprobe"""
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            file_path
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, _ = await proc.communicate()
+
+        if proc.returncode == 0:
+            import json
+            data = json.loads(stdout.decode())
+
+            # Buscar el stream de video
+            for stream in data.get("streams", []):
+                if stream.get("codec_type") == "video":
+                    duration = int(float(data.get("format", {}).get("duration", 0)))
+                    width = stream.get("width", 0)
+                    height = stream.get("height", 0)
+                    return duration, width, height
+
+        return None, None, None
+    except Exception as e:
+        debug(get_text("error_getting_video_metadata", e))
+        return None, None, None
 
 async def handle_success(event, file_path):
     try:
@@ -408,7 +631,7 @@ async def handle_success(event, file_path):
         debug(get_text("debug_filesize", file_size))
 
         icon = "🎵" if file_path.endswith(".mp3") else "🎥"
-        await event.reply(get_text("downloaded", icon, get_filename_from_path(file_path)))
+        await event.reply(get_text("downloaded", icon, get_filename_from_path(file_path)), parse_mode=PARSE_MODE)
 
         if file_size <= 2 * 1024 * 1024 * 1024:
             pending_files[event.id] = file_path
@@ -419,7 +642,7 @@ async def handle_success(event, file_path):
                 ],
                 [Button.inline(get_text("button_only_in_server"), data=f"nosend:{event.id}")]
             ]
-            await event.reply(get_text("upload_asking"), buttons=buttons)
+            await event.reply(get_text("upload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
         else:
             debug(get_text("debug_filesize_to_high_to_telegram"))
     except Exception as e:
@@ -437,7 +660,7 @@ async def handle_send_choice(event):
     file_path = pending_files.get(file_id)
 
     if not os.path.exists(file_path):
-        await event.edit(get_text("error_file_does_not_exist_user"))
+        await event.edit(get_text("error_file_does_not_exist_user"), parse_mode=PARSE_MODE)
         error(get_text("error_file_does_not_exist", file_path))
         return
 
@@ -445,38 +668,61 @@ async def handle_send_choice(event):
         try:
             sending_msg = await event.edit(
                 get_text("sending", os.path.basename(file_path)),
-                parse_mode="markdown"
+                parse_mode=PARSE_MODE
             )
-            message = await bot.send_file(event.chat_id, file_path, caption=os.path.basename(file_path))
+
+            # Detectar si es un video y obtener metadatos
+            is_video = file_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'))
+            attributes = None
+
+            if is_video:
+                duration, width, height = await get_video_metadata(file_path)
+                if duration and width and height:
+                    from telethon.tl.types import DocumentAttributeVideo
+                    attributes = [DocumentAttributeVideo(
+                        duration=duration,
+                        w=width,
+                        h=height,
+                        supports_streaming=True
+                    )]
+                    debug(get_text("debug_video_metadata", duration, width, height))
+
+            message = await bot.send_file(
+                event.chat_id,
+                file_path,
+                caption=os.path.basename(file_path),
+                attributes=attributes,
+                supports_streaming=True if is_video else None
+            )
             debug(get_text("debug_sent", file_path))
             await sending_msg.delete()
 
             if action == "senddelete":
                 os.remove(file_path)
                 debug(get_text("debug_sent_and_delete", file_path))
-                await event.respond(get_text("deleted_from_server"), reply_to=message.id)
+                await event.respond(get_text("deleted_from_server"), reply_to=message.id, parse_mode=PARSE_MODE)
         except Exception as e:
-            await event.reply(get_text("error_sending_the_file_user"))
+            await event.reply(get_text("error_sending_the_file_user"), parse_mode=PARSE_MODE)
             debug(get_text("error_sending_the_file", e))
     else:
         await event.delete()
 
 async def handle_cancel(status_message):
-    await status_message.edit(get_text("cancelled"), buttons=None)
-    debug(get_text("debug_yt_download_cancelled"))
+    await status_message.edit(get_text("cancelled"), buttons=None, parse_mode=PARSE_MODE)
+    debug(get_text("debug_url_download_cancelled"))
     cleanup_partials()
 
 def cleanup_partials():
-    pattern = os.path.join(DOWNLOAD_PATHS["video"], "*.part*")
+    pattern = os.path.join(DOWNLOAD_PATHS["url_video"], "*.part*")
     for f in glob.glob(pattern):
-        debug(get_text("debug_yt_cleaning_partial_files", f))
+        debug(get_text("debug_url_cleaning_partial_files", f))
         os.remove(f)
 
 async def send_startup_message():
     admins = TELEGRAM_ADMIN.split(',')
     for admin in admins:
         try:
-            await bot.send_message(int(admin), get_text("initial_message", VERSION))
+            await bot.send_message(int(admin), get_text("initial_message", VERSION), parse_mode=PARSE_MODE)
         except Exception as e:
             error(get_text("error_sending_initial_message", e))
 

@@ -24,3 +24,6 @@ def get_text(key, *args):
 		translated_text = translated_text.replace(placeholder, str(arg))
 
 	return translated_text
+
+# Constante para el parse_mode por defecto
+PARSE_MODE = "markdown"

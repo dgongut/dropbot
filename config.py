@@ -4,6 +4,8 @@ import re
 # Constants
 ANONYMOUS_USER_ID = "1087968824"
 DEFAULT_EMPTY_STR = "abc"
+MAX_DOWNLOAD_RETRIES = 3
+RETRY_DELAY_SECONDS = 5
 URL_PATTERN = re.compile(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+")
 EXTENSIONS_VIDEO = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".mpeg", ".3gp", ".mts",
@@ -34,8 +36,6 @@ DEF_ICO = "📥"
 DOWNLOAD_PATH = "/downloads"
 DOWNLOAD_AUDIO = "/audio"
 DOWNLOAD_VIDEO = "/video"
-DOWNLOAD_YOUTUBE_VIDEO = "/youtube_video"
-DOWNLOAD_YOUTUBE_AUDIO = "/youtube_audio"
 DOWNLOAD_PHOTO = "/photo"
 DOWNLOAD_TORRENT = "/torrent"
 DOWNLOAD_EBOOK = "/ebook"
@@ -50,6 +50,11 @@ FILTER_AUDIO = bool(int(os.environ.get("FILTER_AUDIO", 0)))
 FILTER_VIDEO = bool(int(os.environ.get("FILTER_VIDEO", 0)))
 FILTER_TORRENT = bool(int(os.environ.get("FILTER_TORRENT", 0)))
 FILTER_EBOOK = bool(int(os.environ.get("FILTER_EBOOK", 0)))
-FILTER_YOUTUBE_VIDEO = bool(int(os.environ.get("FILTER_YOUTUBE_VIDEO", 0)))
-FILTER_YOUTUBE_AUDIO = bool(int(os.environ.get("FILTER_YOUTUBE_AUDIO", 0)))
 PARALLEL_DOWNLOADS = int(os.environ.get("PARALLEL_DOWNLOADS", 2))
+
+# Rutas y filtros para descargas desde URLs (YouTube, Instagram, TikTok, etc.)
+# Mantiene retrocompatibilidad con nombres antiguos DOWNLOAD_YOUTUBE_* y FILTER_YOUTUBE_*
+DOWNLOAD_URL_VIDEO = os.environ.get("DOWNLOAD_URL_VIDEO", os.environ.get("DOWNLOAD_YOUTUBE_VIDEO", "/url_video"))
+DOWNLOAD_URL_AUDIO = os.environ.get("DOWNLOAD_URL_AUDIO", os.environ.get("DOWNLOAD_YOUTUBE_AUDIO", "/url_audio"))
+FILTER_URL_VIDEO = bool(int(os.environ.get("FILTER_URL_VIDEO", os.environ.get("FILTER_YOUTUBE_VIDEO", 0))))
+FILTER_URL_AUDIO = bool(int(os.environ.get("FILTER_URL_AUDIO", os.environ.get("FILTER_YOUTUBE_AUDIO", 0))))

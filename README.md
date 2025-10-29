@@ -18,8 +18,9 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 - ✅ Detección de archivos de Libros
 - ✅ Detección de archivos de Fotos
 - ✅ Detección de archivos de Torrent
-- ✅ Descarga de YouTube y envío de esos vídeos a Telegram
-- ✅ Descomprime automáticamente ficheros zip y tar (y sus variantes)
+- ✅ Descarga desde URLs (YouTube, Instagram, TikTok, Twitter, y 1800+ sitios más)
+- ✅ Detección automática de tipo de contenido (video, audio, imagen)
+- ✅ Descomprime automáticamente ficheros zip, tar y rar (y sus variantes)
 - ✅ Soporte de idiomas (Spanish, English)
 
 ¿Lo buscas en [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/dropbot)?
@@ -41,8 +42,8 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | FILTER_VIDEO                   | ❌           | Especifica si los archivos de video deben almacenarse en una carpeta separada `/video` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_TORRENT                 | ❌           | Especifica si los archivos de torrent deben almacenarse en una carpeta separada `/torrent` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_EBOOK                   | ❌           | Especifica si los archivos de libros electrónicos deben almacenarse en una carpeta separada `/ebook` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
-| FILTER_YOUTUBE_AUDIO           | ❌           | Especifica si los archivos de audio de youtube deben almacenarse en una carpeta separada `/youtube_audio` en lugar de donde van los audios. 0 = no, 1 = sí (por defecto 0)    |
-| FILTER_YOUTUBE_VIDEO           | ❌           | Especifica si los archivos de vídeo de youtube deben almacenarse en una carpeta separada `/youtube_video` en lugar de donde van los vídeos. 0 = no, 1 = sí (por defecto 0)    |
+| FILTER_URL_VIDEO               | ❌           | Especifica si los archivos de vídeo descargados desde URLs deben almacenarse en una carpeta separada `/url_video` en lugar de donde van los vídeos. 0 = no, 1 = sí (por defecto 0). **Nota:** Mantiene retrocompatibilidad con `FILTER_YOUTUBE_VIDEO`    |
+| FILTER_URL_AUDIO               | ❌           | Especifica si los archivos de audio descargados desde URLs deben almacenarse en una carpeta separada `/url_audio` en lugar de donde van los audios. 0 = no, 1 = sí (por defecto 0). **Nota:** Mantiene retrocompatibilidad con `FILTER_YOUTUBE_AUDIO`    |
 
 ### Ejemplo de Docker-Compose para su ejecución normal
 
@@ -61,8 +62,8 @@ services:
       #- FILTER_VIDEO=0
       #- FILTER_TORRENT=0
       #- FILTER_EBOOK=0
-      #- FILTER_YOUTUBE_AUDIO=0
-      #- FILTER_YOUTUBE_VIDEO=0
+      #- FILTER_URL_VIDEO=0
+      #- FILTER_URL_AUDIO=0
     volumes:
       - /ruta/para/descargar/general:/downloads
       #- /ruta/para/descargar/audio:/audio
@@ -70,8 +71,8 @@ services:
       #- /ruta/para/descargar/foto:/photo
       #- /ruta/para/descargar/torrent:/torrent
       #- /ruta/para/descargar/ebook:/ebook
-      #- /ruta/para/descargar/audios_de_youtube:/youtube_audio
-      #- /ruta/para/descargar/videos_de_youtube:/youtube_video
+      #- /ruta/para/descargar/videos_desde_urls:/url_video
+      #- /ruta/para/descargar/audios_desde_urls:/url_audio
     image: dgongut/dropbot:latest
     container_name: dropbot
     restart: always

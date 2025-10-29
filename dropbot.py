@@ -1,4 +1,5 @@
 import os
+import re
 import warnings
 from telethon import TelegramClient, events, functions, types, Button
 from telethon.tl.types import (
@@ -58,6 +59,12 @@ for path in DOWNLOAD_PATHS.values():
 
 bot = TelegramClient("dropbot", TELEGRAM_API_ID, TELEGRAM_API_HASH).start(bot_token=TELEGRAM_TOKEN)
 active_tasks = {}
+
+# Intervalo de actualización de progreso adaptativo
+# Evita anti-spam cuando hay múltiples descargas paralelas
+# Fórmula: max(3, PARALLEL_DOWNLOADS * 1) segundos
+# Ejemplos: 2 descargas = 3s, 5 descargas = 5s, 10 descargas = 10s
+PROGRESS_UPDATE_INTERVAL = max(3, PARALLEL_DOWNLOADS * 1)
 pending_files = {}
 pending_urls = {}
 download_semaphore = asyncio.Semaphore(PARALLEL_DOWNLOADS)
@@ -92,6 +99,149 @@ async def limited_download(event):
     async with download_semaphore:
         await download_media(event)
 
+def create_upload_progress_callback(status_message, file_name):
+    """
+    Crea un callback de progreso para envíos a Telegram.
+    Actualiza el mensaje cada PROGRESS_UPDATE_INTERVAL segundos para evitar anti-spam.
+    """
+    last_update_time = [0]  # Lista para poder modificar en closure
+
+    async def progress_callback(current, total):
+        try:
+            current_time = asyncio.get_event_loop().time()
+            if current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL:
+                last_update_time[0] = current_time
+
+                # Calcular progreso
+                percent = (current / total) * 100
+
+                # Convertir bytes a formato legible
+                def format_bytes(bytes_val):
+                    for unit in ['B', 'KB', 'MB', 'GB']:
+                        if bytes_val < 1024.0:
+                            return f"{bytes_val:.1f}{unit}"
+                        bytes_val /= 1024.0
+                    return f"{bytes_val:.1f}TB"
+
+                size_current = format_bytes(current)
+                size_total = format_bytes(total)
+
+                # Calcular velocidad (aproximada basada en el intervalo)
+                if last_update_time[0] > 0:
+                    bytes_diff = current - getattr(progress_callback, 'last_current', 0)
+                    time_diff = current_time - getattr(progress_callback, 'last_time', current_time)
+                    if time_diff > 0:
+                        speed = format_bytes(bytes_diff / time_diff) + "/s"
+                    else:
+                        speed = "N/A"
+                else:
+                    speed = "N/A"
+
+                progress_callback.last_current = current
+                progress_callback.last_time = current_time
+
+                # Calcular ETA
+                if hasattr(progress_callback, 'last_current') and speed != "N/A":
+                    remaining_bytes = total - current
+                    if bytes_diff > 0 and time_diff > 0:
+                        eta_seconds = int(remaining_bytes / (bytes_diff / time_diff))
+                        eta_minutes = eta_seconds // 60
+                        eta_secs = eta_seconds % 60
+                        eta = f"{eta_minutes:02d}:{eta_secs:02d}"
+                    else:
+                        eta = "N/A"
+                else:
+                    eta = "N/A"
+
+                # Crear barra de progreso visual
+                bar_length = 10
+                filled = int(percent / 10)
+                bar = "█" * filled + "░" * (bar_length - filled)
+
+                message = get_text("uploading_progress", bar, f"{percent:.1f}", f"{size_current}/{size_total}", speed, eta, file_name)
+
+                await status_message.edit(
+                    message,
+                    parse_mode=PARSE_MODE
+                )
+        except Exception as e:
+            # Ignorar errores de actualización (FloodWaitError, etc.)
+            debug(f"Error actualizando progreso de envío: {e}")
+
+    return progress_callback
+
+def create_progress_callback(status_message, event, file_name):
+    """
+    Crea un callback de progreso para descargas desde Telegram.
+    Actualiza el mensaje cada PROGRESS_UPDATE_INTERVAL segundos para evitar anti-spam.
+    """
+    last_update_time = [0]  # Lista para poder modificar en closure
+
+    async def progress_callback(current, total):
+        try:
+            current_time = asyncio.get_event_loop().time()
+            if current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL:
+                last_update_time[0] = current_time
+
+                # Calcular progreso
+                percent = (current / total) * 100
+
+                # Convertir bytes a formato legible
+                def format_bytes(bytes_val):
+                    for unit in ['B', 'KB', 'MB', 'GB']:
+                        if bytes_val < 1024.0:
+                            return f"{bytes_val:.1f}{unit}"
+                        bytes_val /= 1024.0
+                    return f"{bytes_val:.1f}TB"
+
+                size_current = format_bytes(current)
+                size_total = format_bytes(total)
+
+                # Calcular velocidad (aproximada basada en el intervalo)
+                if last_update_time[0] > 0:
+                    bytes_diff = current - getattr(progress_callback, 'last_current', 0)
+                    time_diff = current_time - getattr(progress_callback, 'last_time', current_time)
+                    if time_diff > 0:
+                        speed = format_bytes(bytes_diff / time_diff) + "/s"
+                    else:
+                        speed = "N/A"
+                else:
+                    speed = "N/A"
+
+                progress_callback.last_current = current
+                progress_callback.last_time = current_time
+
+                # Calcular ETA
+                if hasattr(progress_callback, 'last_current') and speed != "N/A":
+                    remaining_bytes = total - current
+                    if bytes_diff > 0 and time_diff > 0:
+                        eta_seconds = int(remaining_bytes / (bytes_diff / time_diff))
+                        eta_minutes = eta_seconds // 60
+                        eta_secs = eta_seconds % 60
+                        eta = f"{eta_minutes:02d}:{eta_secs:02d}"
+                    else:
+                        eta = "N/A"
+                else:
+                    eta = "N/A"
+
+                # Crear barra de progreso visual
+                bar_length = 10
+                filled = int(percent / 10)
+                bar = "█" * filled + "░" * (bar_length - filled)
+
+                message = get_text("downloading_progress", bar, f"{percent:.1f}", f"{size_current}/{size_total}", speed, eta, file_name)
+
+                await status_message.edit(
+                    message,
+                    buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                    parse_mode=PARSE_MODE
+                )
+        except Exception as e:
+            # Ignorar errores de actualización (FloodWaitError, etc.)
+            debug(f"Error actualizando progreso de Telegram: {e}")
+
+    return progress_callback
+
 async def download_media(event):
     message = event.message
     media = message.document or message.video or message.audio or message.photo
@@ -108,10 +258,13 @@ async def download_media(event):
         parse_mode=PARSE_MODE
     )
 
+    # Crear callback de progreso
+    progress_callback = create_progress_callback(status_message, event, file_name)
+
     # Intentar descargar con reintentos
     for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
         try:
-            await bot.download_media(message, file=file_path)
+            await bot.download_media(message, file=file_path, progress_callback=progress_callback)
             # Descarga exitosa
             await status_message.delete()
             await event.reply(get_text("downloaded", ico, get_filename_from_path(file_path)), parse_mode=PARSE_MODE)
@@ -478,6 +631,7 @@ async def handle_format_selection(event):
         "yt-dlp",
         "-f", format_flag,
         "--restrict-filenames",
+        "--newline",  # Cada línea de progreso completa (para parsear en tiempo real)
         "-o", os.path.join(output_dir, "%(title).200s.%(ext)s"),
         url
     ]
@@ -490,6 +644,56 @@ async def handle_format_selection(event):
     task = asyncio.create_task(run_url_download(event, cmd, status_message))
     active_tasks[event.id] = task
 
+def parse_progress(line):
+    """
+    Parsea líneas de progreso de yt-dlp.
+    Formato: [download]  45.2% of 123.45MiB at 1.23MiB/s ETA 00:30
+    Retorna: {"percent": "45.2", "size": "123.45MiB", "speed": "1.23MiB/s", "eta": "00:30"}
+    """
+    try:
+        # Patrón para capturar: porcentaje, tamaño, velocidad, ETA
+        pattern = r'\[download\]\s+(\d+\.?\d*)%\s+of\s+([\d\.]+\w+)(?:\s+at\s+([\d\.]+\w+/s))?(?:\s+ETA\s+([\d:]+))?'
+        match = re.search(pattern, line)
+
+        if match:
+            return {
+                "percent": match.group(1),
+                "size": match.group(2),
+                "speed": match.group(3) if match.group(3) else "N/A",
+                "eta": match.group(4) if match.group(4) else "N/A"
+            }
+    except Exception as e:
+        debug(f"Error parseando progreso: {e}")
+    return None
+
+async def update_progress_message(status_message, progress_info, event, file_name=None):
+    """Actualiza el mensaje de Telegram con el progreso de descarga"""
+    try:
+        percent = progress_info["percent"]
+        size = progress_info["size"]
+        speed = progress_info["speed"]
+        eta = progress_info["eta"]
+
+        # Crear barra de progreso visual
+        bar_length = 10
+        filled = int(float(percent) / 10)
+        bar = "█" * filled + "░" * (bar_length - filled)
+
+        # Si no hay nombre de archivo, intentar extraerlo del progreso o usar placeholder
+        if not file_name:
+            file_name = progress_info.get("filename", "...")
+
+        message = get_text("downloading_progress", bar, percent, size, speed, eta, file_name)
+
+        await status_message.edit(
+            message,
+            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+            parse_mode=PARSE_MODE
+        )
+    except Exception as e:
+        # Ignorar errores de actualización (puede ser FloodWaitError)
+        debug(f"Error actualizando progreso: {e}")
+
 async def run_url_download(event, cmd, status_message):
     try:
         debug(get_text("debug_creating_url_subprocess"))
@@ -500,14 +704,56 @@ async def run_url_download(event, cmd, status_message):
         )
         active_tasks[event.id] = proc
 
-        stdout, stderr = await proc.communicate()
-        debug(get_text("debug_exiting_url_subprocess", proc.returncode))
+        # Variables para control de progreso
+        stdout_lines = []
+        last_update_time = 0
+        update_interval = PROGRESS_UPDATE_INTERVAL  # Intervalo dinámico basado en PARALLEL_DOWNLOADS
+        current_filename = None  # Almacenar el nombre del archivo actual
 
-        # Mostrar stderr si hay contenido (warnings, errores, etc.)
-        stderr_output = stderr.decode().strip()
-        if stderr_output:
-            for line in stderr_output.splitlines():
-                debug(f"yt-dlp stderr: {line}")
+        # Leer stdout línea por línea en tiempo real
+        async def read_stdout():
+            nonlocal last_update_time, current_filename
+            async for line in proc.stdout:
+                line_str = line.decode().strip()
+                stdout_lines.append(line_str)
+                debug(f"yt-dlp: {line_str}")
+
+                # Detectar nombre del archivo: [download] Destination: /path/to/file.mp4
+                if "[download] Destination:" in line_str:
+                    # Extraer el path completo y obtener solo el nombre del archivo
+                    path_start = line_str.find("Destination:") + len("Destination:")
+                    full_path = line_str[path_start:].strip()
+                    current_filename = os.path.basename(full_path)
+                    debug(f"Nombre de archivo detectado: {current_filename}")
+
+                # Detectar líneas de progreso: [download]  45.2% of 123.45MiB at 1.23MiB/s ETA 00:30
+                if "[download]" in line_str and "%" in line_str:
+                    current_time = asyncio.get_event_loop().time()
+                    if current_time - last_update_time >= update_interval:
+                        last_update_time = current_time
+                        # Parsear y actualizar mensaje
+                        progress_info = parse_progress(line_str)
+                        if progress_info:
+                            await update_progress_message(status_message, progress_info, event, current_filename)
+
+        # Leer stderr en paralelo
+        async def read_stderr():
+            stderr_lines = []
+            async for line in proc.stderr:
+                line_str = line.decode().strip()
+                stderr_lines.append(line_str)
+                if line_str:
+                    debug(f"yt-dlp stderr: {line_str}")
+            return stderr_lines
+
+        # Ejecutar lectura de stdout y stderr en paralelo
+        stderr_task = asyncio.create_task(read_stderr())
+        await read_stdout()
+        stderr_lines = await stderr_task
+
+        # Esperar a que termine el proceso
+        await proc.wait()
+        debug(get_text("debug_exiting_url_subprocess", proc.returncode))
 
         if proc.returncode == -15:
             await handle_cancel(status_message)
@@ -515,7 +761,6 @@ async def run_url_download(event, cmd, status_message):
 
         await status_message.delete()
         if proc.returncode == 0:
-            stdout_lines = stdout.decode().splitlines()
             file_paths = extract_file_paths(stdout_lines)
 
             if file_paths:
@@ -527,9 +772,10 @@ async def run_url_download(event, cmd, status_message):
             else:
                 debug(get_text("error_no_files_downloaded"))
                 debug(f"Comando ejecutado: {' '.join(cmd)}")
-                debug(f"Stdout completo: {stdout.decode()}")
+                debug(f"Stdout completo: {chr(10).join(stdout_lines)}")
                 await event.reply(get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
         else:
+            stderr_output = "\n".join(stderr_lines)
             debug(get_text("error_url_failed", stderr_output))
             await event.reply(get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
 
@@ -687,12 +933,16 @@ async def handle_send_choice(event):
                     )]
                     debug(get_text("debug_video_metadata", duration, width, height))
 
+            # Crear callback de progreso para el envío
+            upload_progress = create_upload_progress_callback(sending_msg, os.path.basename(file_path))
+
             message = await bot.send_file(
                 event.chat_id,
                 file_path,
                 caption=os.path.basename(file_path),
                 attributes=attributes,
-                supports_streaming=True if is_video else None
+                supports_streaming=True if is_video else None,
+                progress_callback=upload_progress
             )
             debug(get_text("debug_sent", file_path))
             await sending_msg.delete()

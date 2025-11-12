@@ -1,7 +1,6 @@
 # dropbot
 [![](https://badgen.net/badge/icon/github?icon=github&label)](https://github.com/dgongut/dropbot)
 [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/dropbot)
-[![](https://badgen.net/badge/icon/telegram?icon=telegram&label)](https://t.me/dockercontrollerbotnews)
 [![Docker Pulls](https://badgen.net/docker/pulls/dgongut/dropbot?icon=docker&label=pulls)](https://hub.docker.com/r/dgongut/dropbot/)
 [![Docker Stars](https://badgen.net/docker/stars/dgongut/dropbot?icon=docker&label=stars)](https://hub.docker.com/r/dgongut/dropbot/)
 [![Docker Image Size](https://badgen.net/docker/size/dgongut/dropbot?icon=docker&label=image%20size)](https://hub.docker.com/r/dgongut/dropbot/)
@@ -44,6 +43,7 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | FILTER_EBOOK                   | ❌           | Especifica si los archivos de libros electrónicos deben almacenarse en una carpeta separada `/ebook` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_URL_VIDEO               | ❌           | Especifica si los archivos de vídeo descargados desde URLs deben almacenarse en una carpeta separada `/url_video` en lugar de donde van los vídeos. 0 = no, 1 = sí (por defecto 0). **Nota:** Mantiene retrocompatibilidad con `FILTER_YOUTUBE_VIDEO`    |
 | FILTER_URL_AUDIO               | ❌           | Especifica si los archivos de audio descargados desde URLs deben almacenarse en una carpeta separada `/url_audio` en lugar de donde van los audios. 0 = no, 1 = sí (por defecto 0). **Nota:** Mantiene retrocompatibilidad con `FILTER_YOUTUBE_AUDIO`    |
+| AUTO_DOWNLOAD_FORMAT           | ❌           | Descarga automática de URLs sin preguntar. Valores: `ASK` (preguntar, por defecto), `VIDEO` (descargar siempre como video), `AUDIO` (descargar siempre como audio)    |
 
 ### Ejemplo de Docker-Compose para su ejecución normal
 
@@ -64,6 +64,7 @@ services:
       #- FILTER_EBOOK=0
       #- FILTER_URL_VIDEO=0
       #- FILTER_URL_AUDIO=0
+      #- AUTO_DOWNLOAD_FORMAT=ASK
     volumes:
       - /ruta/para/descargar/general:/downloads
       #- /ruta/para/descargar/audio:/audio

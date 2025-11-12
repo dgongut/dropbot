@@ -4,6 +4,7 @@ import re
 # Constants
 ANONYMOUS_USER_ID = "1087968824"
 DEFAULT_EMPTY_STR = "abc"
+DONORS_URL = "https://donate.dgongut.com/donors.json"
 MAX_DOWNLOAD_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
 URL_PATTERN = re.compile(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+")
@@ -22,9 +23,10 @@ EXTENSIONS_IMAGE = {
 }
 EXTENSIONS_TORRENT = {".torrent"}
 EXTENSIONS_EBOOK = {
-    ".epub", ".mobi", ".azw", ".azw3", ".azw4", ".pdf", ".docx", ".txt", ".fb2", ".lit",
-    ".ibooks", ".pdb", ".prc", ".opf", ".rtf", ".html", ".htm", ".djvu", ".cbz", ".cbr",
-    ".cb7", ".xps", ".ps", ".nfo"
+    ".azw", ".azw3", ".azw4", ".cbz", ".cbr", ".cb7", ".cbt", ".cba", ".cbdf",
+    ".djvu", ".docx", ".epub", ".fb2", ".htm", ".html", ".ibooks", ".lit",
+    ".md", ".mobi", ".nfo", ".odt", ".opf", ".pdf", ".pdb", ".prc",
+    ".ps", ".rtf", ".txt", ".xps"
 }
 EXTENSIONS_COMPRESSED = ['.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.rar']
 IMG_ICO = "🌅"
@@ -58,3 +60,12 @@ DOWNLOAD_URL_VIDEO = os.environ.get("DOWNLOAD_URL_VIDEO", os.environ.get("DOWNLO
 DOWNLOAD_URL_AUDIO = os.environ.get("DOWNLOAD_URL_AUDIO", os.environ.get("DOWNLOAD_YOUTUBE_AUDIO", "/url_audio"))
 FILTER_URL_VIDEO = bool(int(os.environ.get("FILTER_URL_VIDEO", os.environ.get("FILTER_YOUTUBE_VIDEO", 0))))
 FILTER_URL_AUDIO = bool(int(os.environ.get("FILTER_URL_AUDIO", os.environ.get("FILTER_YOUTUBE_AUDIO", 0))))
+
+# Descarga automática de URLs sin preguntar
+# Valores posibles: "ASK" (preguntar), "VIDEO" (descargar video automáticamente), "AUDIO" (descargar audio automáticamente)
+AUTO_DOWNLOAD_FORMAT = os.environ.get("AUTO_DOWNLOAD_FORMAT", "ASK").upper()
+
+# Configuración interna de la cola de mensajes para evitar FloodWaitError
+# Valores conservadores para evitar problemas con la API de Telegram
+MESSAGE_QUEUE_DELAY = 0.5  # Delay entre mensajes en segundos
+MESSAGE_QUEUE_MAX_RETRIES = 5  # Número máximo de reintentos

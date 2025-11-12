@@ -10,6 +10,7 @@ from config import *
 from translations import get_text, load_locale, PARSE_MODE
 from debug import *
 from basic import *
+from message_queue import TelegramMessageQueue
 import sys
 import asyncio
 import zipfile
@@ -17,8 +18,9 @@ import tarfile
 import rarfile
 import shutil
 import glob
+import requests
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -69,6 +71,82 @@ pending_files = {}
 pending_urls = {}
 download_semaphore = asyncio.Semaphore(PARALLEL_DOWNLOADS)
 
+# Inicializar cola de mensajes para evitar FloodWaitError
+# delay_between_messages: tiempo entre mensajes (configurable, default: 0.5s)
+# max_retries: número de reintentos en caso de error (configurable, default: 5)
+message_queue = TelegramMessageQueue(
+    delay_between_messages=MESSAGE_QUEUE_DELAY,
+    max_retries=MESSAGE_QUEUE_MAX_RETRIES
+)
+
+# Funciones wrapper para usar la cola de mensajes
+async def safe_edit(message, *args, wait_for_result=False, **kwargs):
+    """Edita un mensaje usando la cola para evitar rate limiting"""
+    return await message_queue.add_message(message.edit, *args, wait_for_result=wait_for_result, **kwargs)
+
+async def safe_reply(event, *args, wait_for_result=False, **kwargs):
+    """Responde a un evento usando la cola para evitar rate limiting"""
+    return await message_queue.add_message(event.reply, *args, wait_for_result=wait_for_result, **kwargs)
+
+async def safe_respond(event, *args, wait_for_result=False, **kwargs):
+    """Responde a un evento usando event.respond y la cola para evitar rate limiting"""
+    return await message_queue.add_message(event.respond, *args, wait_for_result=wait_for_result, **kwargs)
+
+async def safe_answer(event, *args, wait_for_result=False, **kwargs):
+    """Responde a un callback query usando event.answer y la cola para evitar rate limiting"""
+    return await message_queue.add_message(event.answer, *args, wait_for_result=wait_for_result, **kwargs)
+
+async def safe_delete(message, *args, wait_for_result=False, **kwargs):
+    """Elimina un mensaje usando la cola para evitar rate limiting"""
+    return await message_queue.add_message(message.delete, *args, wait_for_result=wait_for_result, **kwargs)
+
+async def safe_send_message(chat_id, *args, wait_for_result=False, **kwargs):
+    """Envía un mensaje usando la cola para evitar rate limiting"""
+    return await message_queue.add_message(bot.send_message, chat_id, *args, wait_for_result=wait_for_result, **kwargs)
+
+async def safe_send_file(chat_id, *args, wait_for_result=False, **kwargs):
+    """Envía un archivo usando la cola para evitar rate limiting"""
+    return await message_queue.add_message(bot.send_file, chat_id, *args, wait_for_result=wait_for_result, **kwargs)
+
+async def get_array_donors_online():
+    """Obtiene la lista de donantes desde el servidor"""
+    headers = {
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+    }
+
+    try:
+        response = requests.get(DONORS_URL, headers=headers, timeout=10)
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                if isinstance(data, list):
+                    data.sort()
+                    return data
+                else:
+                    error(get_text("error_getting_donors_with_error", f"data is not a list [{str(data)}]"))
+                    return []
+            except ValueError:
+                error(get_text("error_getting_donors_with_error", f"data is not a json [{response.text}]"))
+                return []
+        else:
+            error(get_text("error_getting_donors_with_error", f"error code [{response.status_code}]"))
+            return []
+    except Exception as e:
+        error(get_text("error_getting_donors_with_error", str(e)))
+        return []
+
+async def print_donors(event):
+    """Muestra la lista de donantes"""
+    donors = await get_array_donors_online()
+    if donors:
+        result = ""
+        for donor in donors:
+            result += f"· {donor}\n"
+        await safe_reply(event, get_text("donors_list", result), parse_mode="HTML")
+    else:
+        await safe_reply(event, get_text("error_getting_donors"), parse_mode=PARSE_MODE)
+
 def get_download_path(event):
     message = event.message
     file_name = message.file.name if message.file else None
@@ -107,6 +185,9 @@ def create_upload_progress_callback(status_message, file_name):
     last_update_time = [0]  # Lista para poder modificar en closure
 
     async def progress_callback(current, total):
+        # Si no hay mensaje de estado, no hacer nada
+        if status_message is None:
+            return
         try:
             current_time = asyncio.get_event_loop().time()
             if current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL:
@@ -160,10 +241,12 @@ def create_upload_progress_callback(status_message, file_name):
 
                 message = get_text("uploading_progress", bar, f"{percent:.1f}", f"{size_current}/{size_total}", speed, eta, file_name)
 
-                await status_message.edit(
-                    message,
-                    parse_mode=PARSE_MODE
-                )
+                # Usar edición directa sin cola para actualizaciones de progreso (más rápido)
+                try:
+                    await status_message.edit(message, parse_mode=PARSE_MODE)
+                except Exception as edit_error:
+                    # Ignorar errores de edición (FloodWaitError, mensaje no modificado, etc.)
+                    debug(f"Error editando mensaje de progreso: {edit_error}")
         except Exception as e:
             # Ignorar errores de actualización (FloodWaitError, etc.)
             debug(f"Error actualizando progreso de envío: {e}")
@@ -178,6 +261,10 @@ def create_progress_callback(status_message, event, file_name):
     last_update_time = [0]  # Lista para poder modificar en closure
 
     async def progress_callback(current, total):
+        # Si no hay mensaje de estado, no hacer nada
+        if status_message is None:
+            return
+
         try:
             current_time = asyncio.get_event_loop().time()
             if current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL:
@@ -231,11 +318,16 @@ def create_progress_callback(status_message, event, file_name):
 
                 message = get_text("downloading_progress", bar, f"{percent:.1f}", f"{size_current}/{size_total}", speed, eta, file_name)
 
-                await status_message.edit(
-                    message,
-                    buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-                    parse_mode=PARSE_MODE
-                )
+                # Usar edición directa sin cola para actualizaciones de progreso (más rápido)
+                try:
+                    await status_message.edit(
+                        message,
+                        buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                        parse_mode=PARSE_MODE
+                    )
+                except Exception as edit_error:
+                    # Ignorar errores de edición (FloodWaitError, mensaje no modificado, etc.)
+                    debug(f"Error editando mensaje de progreso: {edit_error}")
         except Exception as e:
             # Ignorar errores de actualización (FloodWaitError, etc.)
             debug(f"Error actualizando progreso de Telegram: {e}")
@@ -252,22 +344,30 @@ async def download_media(event):
     download_path, ico = get_download_path(event)
     file_path = os.path.join(download_path, file_name)
 
-    status_message = await event.reply(
+    status_message = await safe_reply(
+        event,
         get_text("downloading", ico),
         buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-        parse_mode=PARSE_MODE
+        parse_mode=PARSE_MODE,
+        wait_for_result=True
     )
 
-    # Crear callback de progreso
-    progress_callback = create_progress_callback(status_message, event, file_name)
+    # Si no se pudo crear el mensaje de estado (timeout en cola), continuar sin él
+    if status_message is None:
+        warning(f"No se pudo crear mensaje de estado para {file_name} - continuando sin actualización de progreso")
+        progress_callback = None
+    else:
+        # Crear callback de progreso
+        progress_callback = create_progress_callback(status_message, event, file_name)
 
     # Intentar descargar con reintentos
     for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
         try:
             await bot.download_media(message, file=file_path, progress_callback=progress_callback)
             # Descarga exitosa
-            await status_message.delete()
-            await event.reply(get_text("downloaded", ico, get_filename_from_path(file_path)), parse_mode=PARSE_MODE)
+            if status_message:
+                await safe_delete(status_message)
+            await safe_reply(event, get_text("downloaded", ico, get_filename_from_path(file_path)), parse_mode=PARSE_MODE)
             debug(get_text("debug_file_downloaded", file_name))
 
             if is_compressed_file(file_path):
@@ -283,26 +383,40 @@ async def download_media(event):
                     extract_result = extract_file(file_path, extracted_path)
                     if extract_result == True:
                         buttons = [Button.inline(get_text("button_keep"), data=f"keep:{file_path}"), Button.inline(get_text("button_delete"), data=f"del:{file_path}")]
-                        await event.reply(get_text("extracted_pending", extracted_path), buttons=buttons, parse_mode=PARSE_MODE)
+                        await safe_reply(event, get_text("extracted_pending", extracted_path), buttons=buttons, parse_mode=PARSE_MODE)
                         debug(get_text("debug_file_extracted", file_name))
                     elif extract_result == False:
-                        await event.reply(get_text("error_file_extracted_user", file_name), parse_mode=PARSE_MODE)
+                        await safe_reply(event, get_text("error_file_extracted_user", file_name), parse_mode=PARSE_MODE)
                     elif extract_result == "missing_parts":
-                        await event.reply(get_text("missing_rar_parts"), parse_mode=PARSE_MODE)
+                        await safe_reply(event, get_text("missing_rar_parts"), parse_mode=PARSE_MODE)
 
             # Salir del bucle si la descarga fue exitosa
             break
 
         except asyncio.CancelledError:
-            await status_message.edit(get_text("cancelled"), buttons=None, parse_mode=PARSE_MODE)
+            if status_message:
+                await safe_edit(status_message, get_text("cancelled"), buttons=None, parse_mode=PARSE_MODE)
             if os.path.exists(file_path):
                 os.remove(file_path)
             debug(get_text("debug_file_cancelled", file_name))
             raise
 
-        except (TimeoutError, ValueError) as e:
+        except Exception as e:
             error_msg = str(e)
-            if "timeout" in error_msg.lower() or "unsuccessful" in error_msg.lower():
+
+            # Errores que deben reintentar: TimeoutError, ValueError, errores de red, errores internos de Telegram
+            should_retry = (
+                isinstance(e, (TimeoutError, ValueError)) or
+                "timeout" in error_msg.lower() or
+                "unsuccessful" in error_msg.lower() or
+                "internal" in error_msg.lower() or
+                "getfilerequest" in error_msg.lower() or
+                "too slow" in error_msg.lower() or
+                "connection" in error_msg.lower() or
+                "network" in error_msg.lower()
+            )
+
+            if should_retry:
                 # Eliminar archivo parcialmente descargado
                 if os.path.exists(file_path):
                     try:
@@ -314,28 +428,32 @@ async def download_media(event):
                 # Si aún quedan intentos, reintentar
                 if attempt < MAX_DOWNLOAD_RETRIES:
                     debug(get_text("debug_retrying_download", file_name, attempt + 1, MAX_DOWNLOAD_RETRIES, error_msg))
-                    try:
-                        await status_message.edit(
-                            get_text("warning_retrying_download", attempt + 1, MAX_DOWNLOAD_RETRIES),
-                            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-                            parse_mode=PARSE_MODE
-                        )
-                    except Exception as msg_error:
-                        error(get_text("error_updating_status_message", msg_error))
+                    if status_message:
+                        try:
+                            await safe_edit(
+                                status_message,
+                                get_text("warning_retrying_download", attempt + 1, MAX_DOWNLOAD_RETRIES),
+                                buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                                parse_mode=PARSE_MODE
+                            )
+                        except Exception as msg_error:
+                            error(get_text("error_updating_status_message", msg_error))
 
                     # Esperar antes de reintentar
                     await asyncio.sleep(RETRY_DELAY_SECONDS)
                 else:
                     # Último intento fallido
                     error(get_text("error_telegram_timeout", file_name, error_msg))
-                    try:
-                        await status_message.edit(
-                            get_text("error_telegram_timeout_user", file_name),
-                            buttons=None,
-                            parse_mode=PARSE_MODE
-                        )
-                    except Exception as msg_error:
-                        error(get_text("error_updating_status_message", msg_error))
+                    if status_message:
+                        try:
+                            await safe_edit(
+                                status_message,
+                                get_text("error_telegram_timeout_user", file_name),
+                                buttons=None,
+                                parse_mode=PARSE_MODE
+                            )
+                        except Exception as msg_error:
+                            error(get_text("error_updating_status_message", msg_error))
             else:
                 raise
 
@@ -397,18 +515,23 @@ def get_file_name(media):
     else:
         return f"file_{media.id}"
 
-@bot.on(events.NewMessage(pattern=r"/(start|donate|version)"))
+@bot.on(events.NewMessage(pattern=r"/(start|donate|version|donors)"))
 async def handle_start(event):
     if not is_admin(event.sender_id):
         debug(get_text("warning_not_admin", event.sender_id))
         response = get_text("user_not_admin")
+        await safe_reply(event, response, parse_mode=PARSE_MODE)
     elif event.raw_text == "/start":
         response = get_text("welcome_message")
+        await safe_reply(event, response, parse_mode=PARSE_MODE)
     elif event.raw_text == "/donate":
         response = get_text("donate")
+        await safe_reply(event, response, parse_mode=PARSE_MODE)
     elif event.raw_text == "/version":
         response = get_text("version", VERSION)
-    await event.reply(response, parse_mode=PARSE_MODE)
+        await safe_reply(event, response, parse_mode=PARSE_MODE)
+    elif event.raw_text == "/donors":
+        await print_donors(event)
 
 @bot.on(events.CallbackQuery(data=lambda data: data.startswith(b"cancel:")))
 async def cancel_download(event):
@@ -420,12 +543,13 @@ async def cancel_download(event):
 
     if isinstance(task, asyncio.subprocess.Process):
         task.terminate()
-        await event.answer(get_text("cancelling"))
+        await safe_answer(event, get_text("cancelling"))
     elif isinstance(task, asyncio.Task) and not task.done():
         task.cancel()
-        await event.answer(get_text("cancelling"))
+        await safe_answer(event, get_text("cancelling"))
     else:
-        await event.answer(get_text("already_cancelled"))
+        # Ya fue cancelada o terminada, borrar el mensaje
+        await safe_delete(event)
 
 async def detect_content_type(url):
     """Detecta el tipo de contenido sin descargarlo usando yt-dlp --dump-json"""
@@ -486,10 +610,58 @@ async def handle_url_link(event):
     pending_urls[url_id] = url
 
     # Mostrar mensaje de análisis
-    analyzing_msg = await event.reply(get_text("analyzing_url"), parse_mode=PARSE_MODE)
+    analyzing_msg = await safe_reply(event, get_text("analyzing_url"), wait_for_result=True, parse_mode=PARSE_MODE)
+
+    # Si no se pudo crear el mensaje (timeout en cola), enviar uno nuevo sin esperar
+    if analyzing_msg is None:
+        analyzing_msg = await safe_reply(event, get_text("analyzing_url"), wait_for_result=False, parse_mode=PARSE_MODE)
 
     # Detectar tipo de contenido
     content_type = await detect_content_type(url)
+
+    # Si AUTO_DOWNLOAD_FORMAT está configurado, descargar automáticamente sin preguntar
+    if AUTO_DOWNLOAD_FORMAT in ["VIDEO", "AUDIO"]:
+        pending_urls.pop(url_id, None)
+        is_audio = AUTO_DOWNLOAD_FORMAT == "AUDIO"
+
+        format_flag = "bestaudio" if is_audio else "bv*+ba/best"
+        output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
+
+        # Editar mensaje de análisis o crear uno nuevo si no existe
+        if analyzing_msg:
+            status_message = await safe_edit(
+                analyzing_msg,
+                get_text("downloading", AUD_ICO if is_audio else VID_ICO),
+                buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                parse_mode=PARSE_MODE,
+                wait_for_result=True
+            )
+        else:
+            status_message = await safe_reply(
+                event,
+                get_text("downloading", AUD_ICO if is_audio else VID_ICO),
+                buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                parse_mode=PARSE_MODE,
+                wait_for_result=False
+            )
+
+        cmd = [
+            "yt-dlp",
+            "-f", format_flag,
+            "--restrict-filenames",
+            "--newline",
+            "-o", os.path.join(output_dir, "%(title).200s.%(ext)s"),
+            url
+        ]
+
+        if is_audio:
+            cmd.extend(["--extract-audio", "--audio-format", "mp3"])
+        else:
+            cmd.extend(["--merge-output-format", "mp4"])
+
+        task = asyncio.create_task(run_url_download(event, cmd, status_message))
+        active_tasks[event.id] = task
+        return
 
     # Crear botones según el tipo de contenido
     if content_type == "video":
@@ -521,7 +693,11 @@ async def handle_url_link(event):
         ]
         message = get_text("download_unknown_asking")
 
-    await analyzing_msg.edit(message, buttons=buttons, parse_mode=PARSE_MODE)
+    # Editar mensaje de análisis o enviar uno nuevo si no existe
+    if analyzing_msg:
+        await safe_edit(analyzing_msg, message, buttons=buttons, parse_mode=PARSE_MODE)
+    else:
+        await safe_reply(event, message, buttons=buttons, parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(pattern=b"simplecancel:(.+)"))
 async def cancel_simple(event):
@@ -531,23 +707,23 @@ async def cancel_simple(event):
     url_id = event.pattern_match.group(1).decode()
     pending_urls.pop(url_id, None)
     debug(get_text("debug_url_download_cancelled"))
-    await event.delete()
+    await safe_delete(event)
 
 @bot.on(events.CallbackQuery(pattern=b"keep:(.+)"))
 async def handle_keep_file(event):
     if await check_admin_and_warn(event):
         return
 
-    await event.answer()
+    await safe_answer(event)
     file_path = event.pattern_match.group(1).decode()
-    await event.edit(get_text("extracted", file_path), buttons=None, parse_mode=PARSE_MODE)
+    await safe_edit(event, get_text("extracted", file_path), buttons=None, parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(pattern=b"del:(.+)"))
 async def handle_delete_file(event):
     if await check_admin_and_warn(event):
         return
 
-    await event.answer()
+    await safe_answer(event)
     file_path = event.pattern_match.group(1).decode()
 
     try:
@@ -595,10 +771,10 @@ async def handle_delete_file(event):
             msg = get_text("error_file_does_not_exist_user")
             error(get_text("error_file_does_not_exist", file_path))
 
-        await event.edit(msg, buttons=None, parse_mode=PARSE_MODE)
+        await safe_edit(event, msg, buttons=None, parse_mode=PARSE_MODE)
 
     except Exception as e:
-        await event.edit(get_text("error_deleting_user", file_path), buttons=None, parse_mode=PARSE_MODE)
+        await safe_edit(event, get_text("error_deleting_user", file_path), buttons=None, parse_mode=PARSE_MODE)
         debug(get_text("error_deleting", file_path, e))
 
 @bot.on(events.CallbackQuery(pattern=b"url_(audio|video):(.+)"))
@@ -606,13 +782,13 @@ async def handle_format_selection(event):
     if await check_admin_and_warn(event):
         return
 
-    await event.answer()
+    await safe_answer(event)
     format_type = event.pattern_match.group(1).decode()
     url_id = event.pattern_match.group(2).decode()
 
     url = pending_urls.get(url_id)
     if not url:
-        await event.edit(get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
+        await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
         return
 
     pending_urls.pop(url_id, None)
@@ -621,11 +797,23 @@ async def handle_format_selection(event):
     format_flag = "bestaudio" if is_audio else "bv*+ba/best"
     output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
 
-    status_message = await event.edit(
+    status_message = await safe_edit(
+        event,
         get_text("downloading", AUD_ICO if is_audio else VID_ICO),
         buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-        parse_mode=PARSE_MODE
+        parse_mode=PARSE_MODE,
+        wait_for_result=True
     )
+
+    # Si no se pudo editar el mensaje (timeout en cola), crear uno nuevo
+    if status_message is None:
+        status_message = await safe_reply(
+            event,
+            get_text("downloading", AUD_ICO if is_audio else VID_ICO),
+            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+            parse_mode=PARSE_MODE,
+            wait_for_result=False
+        )
 
     cmd = [
         "yt-dlp",
@@ -668,6 +856,10 @@ def parse_progress(line):
 
 async def update_progress_message(status_message, progress_info, event, file_name=None):
     """Actualiza el mensaje de Telegram con el progreso de descarga"""
+    # Si no hay mensaje de estado, no hacer nada
+    if status_message is None:
+        return
+
     try:
         percent = progress_info["percent"]
         size = progress_info["size"]
@@ -685,11 +877,16 @@ async def update_progress_message(status_message, progress_info, event, file_nam
 
         message = get_text("downloading_progress", bar, percent, size, speed, eta, file_name)
 
-        await status_message.edit(
-            message,
-            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-            parse_mode=PARSE_MODE
-        )
+        # Usar edición directa sin cola para actualizaciones de progreso (más rápido)
+        try:
+            await status_message.edit(
+                message,
+                buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                parse_mode=PARSE_MODE
+            )
+        except Exception as edit_error:
+            # Ignorar errores de edición (FloodWaitError, mensaje no modificado, etc.)
+            debug(f"Error editando mensaje de progreso: {edit_error}")
     except Exception as e:
         # Ignorar errores de actualización (puede ser FloodWaitError)
         debug(f"Error actualizando progreso: {e}")
@@ -759,7 +956,8 @@ async def run_url_download(event, cmd, status_message):
             await handle_cancel(status_message)
             return
 
-        await status_message.delete()
+        if status_message:
+            await safe_delete(status_message)
         if proc.returncode == 0:
             file_paths = extract_file_paths(stdout_lines)
 
@@ -773,11 +971,11 @@ async def run_url_download(event, cmd, status_message):
                 debug(get_text("error_no_files_downloaded"))
                 debug(f"Comando ejecutado: {' '.join(cmd)}")
                 debug(f"Stdout completo: {chr(10).join(stdout_lines)}")
-                await event.reply(get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
+                await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
         else:
             stderr_output = "\n".join(stderr_lines)
             debug(get_text("error_url_failed", stderr_output))
-            await event.reply(get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
+            await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
 
     except asyncio.CancelledError:
         await handle_cancel(status_message)
@@ -877,7 +1075,7 @@ async def handle_success(event, file_path):
         debug(get_text("debug_filesize", file_size))
 
         icon = "🎵" if file_path.endswith(".mp3") else "🎥"
-        await event.reply(get_text("downloaded", icon, get_filename_from_path(file_path)), parse_mode=PARSE_MODE)
+        await safe_reply(event, get_text("downloaded", icon, get_filename_from_path(file_path)), parse_mode=PARSE_MODE)
 
         if file_size <= 2 * 1024 * 1024 * 1024:
             pending_files[event.id] = file_path
@@ -888,7 +1086,7 @@ async def handle_success(event, file_path):
                 ],
                 [Button.inline(get_text("button_only_in_server"), data=f"nosend:{event.id}")]
             ]
-            await event.reply(get_text("upload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
+            await safe_reply(event, get_text("upload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
         else:
             debug(get_text("debug_filesize_to_high_to_telegram"))
     except Exception as e:
@@ -900,22 +1098,33 @@ async def handle_send_choice(event):
     if await check_admin_and_warn(event):
         return
 
-    await event.answer()
+    await safe_answer(event)
     action = event.pattern_match.group(1).decode()
     file_id = int(event.pattern_match.group(2).decode())
     file_path = pending_files.get(file_id)
 
     if not os.path.exists(file_path):
-        await event.edit(get_text("error_file_does_not_exist_user"), parse_mode=PARSE_MODE)
+        await safe_edit(event, get_text("error_file_does_not_exist_user"), parse_mode=PARSE_MODE)
         error(get_text("error_file_does_not_exist", file_path))
         return
 
     if action in ("send", "senddelete"):
         try:
-            sending_msg = await event.edit(
+            sending_msg = await safe_edit(
+                event,
                 get_text("sending", os.path.basename(file_path)),
-                parse_mode=PARSE_MODE
+                parse_mode=PARSE_MODE,
+                wait_for_result=True
             )
+
+            # Si no se pudo editar el mensaje (timeout en cola), crear uno nuevo
+            if sending_msg is None:
+                sending_msg = await safe_reply(
+                    event,
+                    get_text("sending", os.path.basename(file_path)),
+                    parse_mode=PARSE_MODE,
+                    wait_for_result=False
+                )
 
             # Detectar si es un video y obtener metadatos
             is_video = file_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'))
@@ -936,29 +1145,32 @@ async def handle_send_choice(event):
             # Crear callback de progreso para el envío
             upload_progress = create_upload_progress_callback(sending_msg, os.path.basename(file_path))
 
-            message = await bot.send_file(
+            message = await safe_send_file(
                 event.chat_id,
                 file_path,
                 caption=os.path.basename(file_path),
                 attributes=attributes,
                 supports_streaming=True if is_video else None,
-                progress_callback=upload_progress
+                progress_callback=upload_progress,
+                wait_for_result=True
             )
             debug(get_text("debug_sent", file_path))
-            await sending_msg.delete()
+            if sending_msg:
+                await safe_delete(sending_msg)
 
             if action == "senddelete":
                 os.remove(file_path)
                 debug(get_text("debug_sent_and_delete", file_path))
-                await event.respond(get_text("deleted_from_server"), reply_to=message.id, parse_mode=PARSE_MODE)
+                await safe_respond(event, get_text("deleted_from_server"), reply_to=message.id, parse_mode=PARSE_MODE)
         except Exception as e:
-            await event.reply(get_text("error_sending_the_file_user"), parse_mode=PARSE_MODE)
+            await safe_reply(event, get_text("error_sending_the_file_user"), parse_mode=PARSE_MODE)
             debug(get_text("error_sending_the_file", e))
     else:
-        await event.delete()
+        await safe_delete(event)
 
 async def handle_cancel(status_message):
-    await status_message.edit(get_text("cancelled"), buttons=None, parse_mode=PARSE_MODE)
+    if status_message:
+        await safe_edit(status_message, get_text("cancelled"), buttons=None, parse_mode=PARSE_MODE)
     debug(get_text("debug_url_download_cancelled"))
     cleanup_partials()
 
@@ -972,7 +1184,7 @@ async def send_startup_message():
     admins = TELEGRAM_ADMIN.split(',')
     for admin in admins:
         try:
-            await bot.send_message(int(admin), get_text("initial_message", VERSION), parse_mode=PARSE_MODE)
+            await safe_send_message(int(admin), get_text("initial_message", VERSION), parse_mode=PARSE_MODE)
         except Exception as e:
             error(get_text("error_sending_initial_message", e))
 
@@ -981,6 +1193,7 @@ async def set_commands():
         BotCommand("start", get_text("menu_start")),
         BotCommand("version", get_text("menu_version")),
         BotCommand("donate", get_text("menu_donate")),
+        BotCommand("donors", get_text("menu_donors")),
     ]
     await bot(functions.bots.SetBotCommandsRequest(
         scope=types.BotCommandScopeDefault(),
@@ -999,9 +1212,13 @@ async def check_admin_and_warn(event):
 async def main():
     debug(f"DropBot v{VERSION}")
     await bot.start()
+    await message_queue.start()  # Iniciar la cola de mensajes
     await set_commands()
     await send_startup_message()
-    await bot.run_until_disconnected()
+    try:
+        await bot.run_until_disconnected()
+    finally:
+        await message_queue.shutdown()  # Detener la cola al finalizar
 
 if __name__ == "__main__":
     bot.loop.run_until_complete(main())

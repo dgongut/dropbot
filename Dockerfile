@@ -10,6 +10,7 @@ RUN mv dropbot-${VERSION}/config.py /app
 RUN mv dropbot-${VERSION}/translations.py /app
 RUN mv dropbot-${VERSION}/basic.py /app
 RUN mv dropbot-${VERSION}/debug.py /app
+RUN mv dropbot-${VERSION}/message_queue.py /app
 RUN mv dropbot-${VERSION}/locale /app
 RUN mv dropbot-${VERSION}/requirements.txt /app
 RUN rm /tmp/v${VERSION}.tar.gz

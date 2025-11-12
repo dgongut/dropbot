@@ -20,7 +20,7 @@ import shutil
 import glob
 import requests
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -657,7 +657,14 @@ async def handle_url_link(event):
         if is_audio:
             cmd.extend(["--extract-audio", "--audio-format", "mp3"])
         else:
-            cmd.extend(["--merge-output-format", "mp4"])
+            # Forzar codecs compatibles con iOS (H.264 + AAC) y optimizar para streaming
+            # -movflags +faststart: mueve el moov atom al inicio para streaming
+            # -c:v libx264: codec de video H.264 (compatible con iOS)
+            # -c:a aac: codec de audio AAC (compatible con iOS)
+            cmd.extend([
+                "--merge-output-format", "mp4",
+                "--postprocessor-args", "-c:v libx264 -c:a aac -movflags +faststart"
+            ])
 
         task = asyncio.create_task(run_url_download(event, cmd, status_message))
         active_tasks[event.id] = task
@@ -827,7 +834,14 @@ async def handle_format_selection(event):
     if is_audio:
         cmd.extend(["--extract-audio", "--audio-format", "mp3"])
     else:
-        cmd.extend(["--merge-output-format", "mp4"])
+        # Forzar codecs compatibles con iOS (H.264 + AAC) y optimizar para streaming
+        # -movflags +faststart: mueve el moov atom al inicio para streaming
+        # -c:v libx264: codec de video H.264 (compatible con iOS)
+        # -c:a aac: codec de audio AAC (compatible con iOS)
+        cmd.extend([
+            "--merge-output-format", "mp4",
+            "--postprocessor-args", "-c:v libx264 -c:a aac -movflags +faststart"
+        ])
 
     task = asyncio.create_task(run_url_download(event, cmd, status_message))
     active_tasks[event.id] = task

@@ -19,8 +19,9 @@ import rarfile
 import shutil
 import glob
 import requests
+import time
 
-VERSION = "2.1.1"
+VERSION = "3.0.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -31,19 +32,19 @@ if LANGUAGE.lower() not in ("es", "en"):
 load_locale(LANGUAGE.lower())
 
 if DEFAULT_EMPTY_STR == TELEGRAM_TOKEN:
-    error(get_text("error_bot_token"))
+    error("Bot token needs to be configured with the TELEGRAM_TOKEN variable")
     sys.exit(1)
 
 if DEFAULT_EMPTY_STR == TELEGRAM_ADMIN:
-    error(get_text("error_bot_telegram_admin"))
+    error("The chatId of the user who will interact with the bot needs to be configured with the TELEGRAM_ADMIN variable")
     sys.exit(1)
 
 if str(ANONYMOUS_USER_ID) in str(TELEGRAM_ADMIN).split(','):
-	error(get_text("error_bot_telegram_admin_anonymous"))
+	error("You cannot be anonymous to control the bot. In the TELEGRAM_ADMIN variable, you must put your user id.")
 	sys.exit(1)
 
 if PARALLEL_DOWNLOADS < 1:
-    error(get_text("error_parallel_downloads"))
+    error("The minimum number of parallel downloads is 1. An incorrect number has been configured in the PARALLEL_DOWNLOADS variable")
     sys.exit(1)
 
 DOWNLOAD_PATHS = {
@@ -59,14 +60,38 @@ DOWNLOAD_PATHS = {
 for path in DOWNLOAD_PATHS.values():
     os.makedirs(path, exist_ok=True)
 
+# Carpeta temporal para archivos de conversión, descargas, thumbnails, etc.
+TEMP_DIR = "/tmp/dropbot_conversions"
+
+# Limpiar TODA la carpeta temporal al arrancar (eliminar archivos huérfanos de sesiones anteriores)
+debug(f"[STARTUP] Cleaning temporary directory: {TEMP_DIR}...")
+try:
+    if os.path.exists(TEMP_DIR):
+        # Eliminar toda la carpeta y su contenido
+        shutil.rmtree(TEMP_DIR)
+        debug(f"[STARTUP] Removed temporary directory and all contents")
+
+    # Recrear la carpeta vacía
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    debug(f"[STARTUP] ✅ Temporary directory cleaned and recreated")
+except Exception as e:
+    debug(f"[STARTUP] Could not clean temporary directory: {e}")
+    # Si falla, al menos intentar crear la carpeta
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
 bot = TelegramClient("dropbot", TELEGRAM_API_ID, TELEGRAM_API_HASH).start(bot_token=TELEGRAM_TOKEN)
 active_tasks = {}
+cancelled_conversions = set()  # Para rastrear conversiones canceladas por el usuario
+pending_file_actions = {}  # Para almacenar archivos pendientes de renombrar/eliminar
+pending_renames = {}  # Para almacenar archivos esperando nuevo nombre (lista por usuario)
+list_messages = {}  # Para rastrear mensajes de /list y /manage que deben borrarse juntos: {user_id: [msg1, msg2, ...]}
 
 # Intervalo de actualización de progreso adaptativo
 # Evita anti-spam cuando hay múltiples descargas paralelas
-# Fórmula: max(3, PARALLEL_DOWNLOADS * 1) segundos
-# Ejemplos: 2 descargas = 3s, 5 descargas = 5s, 10 descargas = 10s
-PROGRESS_UPDATE_INTERVAL = max(3, PARALLEL_DOWNLOADS * 1)
+# Telegram permite ~20 mensajes/minuto (1 cada 3s), usamos 2s para estar seguros
+# Fórmula: max(2, PARALLEL_DOWNLOADS * 0.4) segundos
+# Ejemplos: 2 descargas = 2s, 5 descargas = 2s, 10 descargas = 4s
+PROGRESS_UPDATE_INTERVAL = max(2, PARALLEL_DOWNLOADS * 0.4)
 pending_files = {}
 pending_urls = {}
 download_semaphore = asyncio.Semaphore(PARALLEL_DOWNLOADS)
@@ -124,34 +149,225 @@ async def get_array_donors_online():
                     data.sort()
                     return data
                 else:
-                    error(get_text("error_getting_donors_with_error", f"data is not a list [{str(data)}]"))
+                    error(f"Error getting donors list: data is not a list [{str(data)}]")
                     return []
             except ValueError:
-                error(get_text("error_getting_donors_with_error", f"data is not a json [{response.text}]"))
+                error(f"Error getting donors list: data is not a json [{response.text}]")
                 return []
         else:
-            error(get_text("error_getting_donors_with_error", f"error code [{response.status_code}]"))
+            error(f"Error getting donors list: error code [{response.status_code}]")
             return []
     except Exception as e:
-        error(get_text("error_getting_donors_with_error", str(e)))
+        error(f"Error getting donors list: {str(e)}")
         return []
 
-async def print_donors(event):
+async def print_donors(chat_id):
     """Muestra la lista de donantes"""
     donors = await get_array_donors_online()
     if donors:
         result = ""
         for donor in donors:
             result += f"· {donor}\n"
-        await safe_reply(event, get_text("donors_list", result), parse_mode="HTML")
+        await safe_send_message(chat_id, get_text("donors_list", result), parse_mode="HTML")
     else:
-        await safe_reply(event, get_text("error_getting_donors"), parse_mode=PARSE_MODE)
+        await safe_send_message(chat_id, get_text("error_getting_donors"), parse_mode=PARSE_MODE)
+
+async def handle_list_files(event):
+    """Lista los archivos descargados en el servidor"""
+    try:
+        # Parsear el comando para obtener la categoría
+        command_parts = event.raw_text.split()
+        category = command_parts[1] if len(command_parts) > 1 else "all"
+
+        # Mapear categorías a directorios
+        category_map = {
+            "all": list(DOWNLOAD_PATHS.values()),
+            "video": [DOWNLOAD_PATHS["video"], DOWNLOAD_PATHS["url_video"]],
+            "audio": [DOWNLOAD_PATHS["audio"], DOWNLOAD_PATHS["url_audio"]],
+            "photo": [DOWNLOAD_PATHS["photo"]],
+            "torrent": [DOWNLOAD_PATHS["torrent"]],
+            "ebook": [DOWNLOAD_PATHS["ebook"]]
+        }
+
+        directories = category_map.get(category, list(DOWNLOAD_PATHS.values()))
+
+        # Eliminar directorios duplicados (cuando los filtros están desactivados, todos apuntan a /downloads)
+        directories = list(set(directories))
+
+        # Recopilar archivos
+        files_info = []
+        total_size = 0
+        seen_files = set()  # Para evitar duplicados por ruta completa
+
+        for directory in directories:
+            if not os.path.exists(directory):
+                continue
+
+            for filename in os.listdir(directory):
+                file_path = os.path.join(directory, filename)
+
+                # Ignorar archivos temporales y ocultos
+                if filename.startswith('.') or '_thumb.jpg' in filename:
+                    continue
+
+                # Evitar duplicados usando la ruta completa
+                if file_path in seen_files:
+                    continue
+                seen_files.add(file_path)
+
+                try:
+                    is_directory = os.path.isdir(file_path)
+
+                    if is_directory:
+                        # Es una carpeta
+                        file_size = get_directory_size(file_path)
+                        icon = "📁"
+                        item_type = "folder"
+                    else:
+                        # Es un archivo
+                        file_size = os.path.getsize(file_path)
+                        file_ext = os.path.splitext(filename)[1].lower()
+
+                        # Determinar icono según extensión
+                        if file_ext in EXTENSIONS_VIDEO:
+                            icon = "🎥"
+                        elif file_ext in EXTENSIONS_AUDIO:
+                            icon = "🎵"
+                        elif file_ext in EXTENSIONS_IMAGE:
+                            icon = "🖼️"
+                        else:
+                            icon = "📄"
+                        item_type = "file"
+
+                    files_info.append({
+                        "name": filename,
+                        "size": file_size,
+                        "size_formatted": format_file_size(file_size),
+                        "icon": icon,
+                        "path": file_path,
+                        "type": item_type
+                    })
+                    total_size += file_size
+                except Exception as e:
+                    debug(f"Error procesando {filename}: {e}")
+
+        # Ordenar por tamaño (más grandes primero)
+        files_info.sort(key=lambda x: x["size"], reverse=True)
+
+        if not files_info:
+            await safe_reply(event, get_text("list_empty"), parse_mode=PARSE_MODE)
+            return
+
+        # Construir mensajes (partiendo si es necesario)
+        # Límite de Telegram: 4096 caracteres, dejamos margen de seguridad
+        MAX_MESSAGE_LENGTH = 3800
+
+        total_size_formatted = format_file_size(total_size)
+        header = f"📂 **Archivos en el servidor**\n\n"
+
+        # Contar archivos y carpetas
+        file_count = sum(1 for item in files_info if item["type"] == "file")
+        folder_count = sum(1 for item in files_info if item["type"] == "folder")
+
+        if folder_count > 0:
+            footer = f"\n\n**Total:** {file_count} archivos, {folder_count} carpetas | **Espacio:** {total_size_formatted}"
+        else:
+            footer = f"\n\n**Total:** {file_count} archivos | **Espacio:** {total_size_formatted}"
+
+        messages = []
+        current_message = ""
+        current_count = 0
+
+        for i, file_info in enumerate(files_info, 1):
+            # Truncar nombre si es muy largo
+            name = file_info["name"]
+            display_name = name
+            if len(name) > 40:
+                display_name = name[:37] + "..."
+
+            # Crear entrada de archivo o carpeta (sin mostrar la ruta)
+            file_entry = f"{i}. {file_info['icon']} `{display_name}`\n   💾 {file_info['size_formatted']}"
+
+            # Calcular longitud del mensaje con header y footer
+            test_message = header + current_message + "\n\n" + file_entry + footer
+
+            if len(test_message) > MAX_MESSAGE_LENGTH and current_message:
+                # Guardar mensaje actual y empezar uno nuevo
+                final_message = header + current_message + footer
+                messages.append(final_message)
+                current_message = file_entry
+                current_count = 0
+            else:
+                # Agregar al mensaje actual
+                if current_message:
+                    current_message += "\n\n" + file_entry
+                else:
+                    current_message = file_entry
+                current_count += 1
+
+        # Agregar el último mensaje
+        if current_message:
+            final_message = header + current_message + footer
+            messages.append(final_message)
+
+        # Crear botones de categorías (excluyendo la categoría actual)
+        category_buttons = get_category_buttons(exclude_category=category)
+
+        # Enviar mensaje principal con lista de archivos
+        for idx, msg in enumerate(messages, 1):
+            if len(messages) > 1:
+                # Si hay múltiples mensajes, agregar indicador de página
+                msg = msg.replace("📂 **Archivos en el servidor**", f"📂 **Archivos en el servidor** (Parte {idx}/{len(messages)})")
+
+            # Solo agregar botones de categorías al último mensaje
+            buttons = category_buttons if idx == len(messages) else None
+            await safe_reply(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+
+    except Exception as e:
+        error(f"Error listando archivos: {e}")
+        await safe_reply(event, get_text("error_list_files"), parse_mode=PARSE_MODE)
+
+def get_directory_size(directory):
+    """Calcula el tamaño total de una carpeta recursivamente"""
+    total_size = 0
+    try:
+        for dirpath, _, filenames in os.walk(directory):
+            for filename in filenames:
+                filepath = os.path.join(dirpath, filename)
+                if os.path.exists(filepath):
+                    total_size += os.path.getsize(filepath)
+    except Exception as e:
+        debug(f"Error calculando tamaño de carpeta {directory}: {e}")
+    return total_size
+
+def get_unique_filename(directory, filename):
+    """
+    Genera un nombre de archivo único en el directorio especificado.
+    Si el archivo existe, agrega un sufijo (1), (2), etc.
+    """
+    file_path = os.path.join(directory, filename)
+
+    # Si no existe, retornar el nombre original
+    if not os.path.exists(file_path):
+        return filename
+
+    # Separar nombre base y extensión
+    base_name, extension = os.path.splitext(filename)
+    counter = 1
+
+    # Buscar un nombre único
+    while True:
+        new_filename = f"{base_name} ({counter}){extension}"
+        new_path = os.path.join(directory, new_filename)
+        if not os.path.exists(new_path):
+            return new_filename
+        counter += 1
 
 def get_download_path(event):
     message = event.message
     file_name = message.file.name if message.file else None
     file_extension = os.path.splitext(file_name)[1].lower() if file_name else ""
-    
+
     if file_extension in EXTENSIONS_TORRENT:
         return DOWNLOAD_PATHS["torrent"], TOR_ICO
     elif file_extension in EXTENSIONS_EBOOK:
@@ -183,10 +399,11 @@ def create_upload_progress_callback(status_message, file_name):
     Actualiza el mensaje cada PROGRESS_UPDATE_INTERVAL segundos para evitar anti-spam.
     """
     last_update_time = [0]  # Lista para poder modificar en closure
+    message_deleted = [False]  # Flag para detectar si el mensaje fue eliminado
 
     async def progress_callback(current, total):
-        # Si no hay mensaje de estado, no hacer nada
-        if status_message is None:
+        # Si no hay mensaje de estado o fue eliminado, no hacer nada
+        if status_message is None or message_deleted[0]:
             return
         try:
             current_time = asyncio.get_event_loop().time()
@@ -245,8 +462,14 @@ def create_upload_progress_callback(status_message, file_name):
                 try:
                     await status_message.edit(message, parse_mode=PARSE_MODE)
                 except Exception as edit_error:
-                    # Ignorar errores de edición (FloodWaitError, mensaje no modificado, etc.)
-                    debug(f"Error editando mensaje de progreso: {edit_error}")
+                    # Si el mensaje fue eliminado o es inválido, marcar como eliminado y dejar de intentar
+                    error_msg = str(edit_error)
+                    if "message ID is invalid" in error_msg or "MESSAGE_ID_INVALID" in error_msg:
+                        debug(f"[UPLOAD PROGRESS] Message was deleted, stopping progress updates")
+                        message_deleted[0] = True
+                    else:
+                        # Otros errores (FloodWaitError, mensaje no modificado, etc.) - solo log
+                        debug(f"Error editando mensaje de progreso: {edit_error}")
         except Exception as e:
             # Ignorar errores de actualización (FloodWaitError, etc.)
             debug(f"Error actualizando progreso de envío: {e}")
@@ -259,10 +482,11 @@ def create_progress_callback(status_message, event, file_name):
     Actualiza el mensaje cada PROGRESS_UPDATE_INTERVAL segundos para evitar anti-spam.
     """
     last_update_time = [0]  # Lista para poder modificar en closure
+    message_deleted = [False]  # Flag para detectar si el mensaje fue eliminado
 
     async def progress_callback(current, total):
-        # Si no hay mensaje de estado, no hacer nada
-        if status_message is None:
+        # Si no hay mensaje de estado o fue eliminado, no hacer nada
+        if status_message is None or message_deleted[0]:
             return
 
         try:
@@ -326,8 +550,14 @@ def create_progress_callback(status_message, event, file_name):
                         parse_mode=PARSE_MODE
                     )
                 except Exception as edit_error:
-                    # Ignorar errores de edición (FloodWaitError, mensaje no modificado, etc.)
-                    debug(f"Error editando mensaje de progreso: {edit_error}")
+                    # Si el mensaje fue eliminado o es inválido, marcar como eliminado y dejar de intentar
+                    error_msg = str(edit_error)
+                    if "message ID is invalid" in error_msg or "MESSAGE_ID_INVALID" in error_msg:
+                        debug(f"[DOWNLOAD PROGRESS] Message was deleted, stopping progress updates")
+                        message_deleted[0] = True
+                    else:
+                        # Otros errores (FloodWaitError, mensaje no modificado, etc.) - solo log
+                        debug(f"Error editando mensaje de progreso: {edit_error}")
         except Exception as e:
             # Ignorar errores de actualización (FloodWaitError, etc.)
             debug(f"Error actualizando progreso de Telegram: {e}")
@@ -340,9 +570,21 @@ async def download_media(event):
     if not media:
         return
     file_name = get_file_name(media)
-    debug(get_text("debug_file_received", file_name))
+    debug(f"File {file_name} - Received, starting download")
     download_path, ico = get_download_path(event)
-    file_path = os.path.join(download_path, file_name)
+
+    # Generar nombre único si el archivo ya existe
+    unique_file_name = get_unique_filename(download_path, file_name)
+    if unique_file_name != file_name:
+        debug(f"Archivo duplicado detectado. Renombrando: {file_name} -> {unique_file_name}")
+
+    # Descargar primero a /tmp para que no aparezca en /list mientras se descarga
+    timestamp_ms = int(time.time() * 1000)
+    temp_file_path = os.path.join(TEMP_DIR, f"{unique_file_name}_{timestamp_ms}_download")
+    final_file_path = os.path.join(download_path, unique_file_name)
+
+    debug(f"[DOWNLOAD] Temporary path: {temp_file_path}")
+    debug(f"[DOWNLOAD] Final path: {final_file_path}")
 
     status_message = await safe_reply(
         event,
@@ -363,28 +605,37 @@ async def download_media(event):
     # Intentar descargar con reintentos
     for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
         try:
-            await bot.download_media(message, file=file_path, progress_callback=progress_callback)
+            # Descargar a archivo temporal
+            await bot.download_media(message, file=temp_file_path, progress_callback=progress_callback)
+
+            # Mover archivo de /tmp a carpeta final
+            debug(f"[DOWNLOAD] Moving file from temp to final location...")
+            shutil.move(temp_file_path, final_file_path)
+            debug(f"[DOWNLOAD] ✅ File moved to: {final_file_path}")
+
             # Descarga exitosa
             if status_message:
                 await safe_delete(status_message)
-            await safe_reply(event, get_text("downloaded", ico, get_filename_from_path(file_path)), parse_mode=PARSE_MODE)
-            debug(get_text("debug_file_downloaded", file_name))
 
-            if is_compressed_file(file_path):
+            # Mostrar información detallada del archivo descargado (sin botones de acción)
+            await handle_success(event, final_file_path, show_action_buttons=False)
+            debug(f"File {file_name} - Downloaded")
+
+            if is_compressed_file(final_file_path):
                 if is_split_zip(file_name):
-                    warning(get_text("warning_zip_split_not_supported", file_name))
+                    warning(f"File {file_name} - ZIP split extraction not supported at this moment")
                 else:
-                    base_name = os.path.splitext(file_path)[0]
-                    if rarfile.is_rarfile(file_path):
+                    base_name = os.path.splitext(final_file_path)[0]
+                    if rarfile.is_rarfile(final_file_path):
                         base_name = clean_rar_base_name(file_name)
                     extracted_path = os.path.join(download_path, os.path.basename(base_name))
                     os.makedirs(extracted_path, exist_ok=True)
 
-                    extract_result = extract_file(file_path, extracted_path)
+                    extract_result = extract_file(final_file_path, extracted_path)
                     if extract_result == True:
-                        buttons = [Button.inline(get_text("button_keep"), data=f"keep:{file_path}"), Button.inline(get_text("button_delete"), data=f"del:{file_path}")]
+                        buttons = [Button.inline(get_text("button_keep"), data=f"keep:{final_file_path}"), Button.inline(get_text("button_delete"), data=f"del:{final_file_path}")]
                         await safe_reply(event, get_text("extracted_pending", extracted_path), buttons=buttons, parse_mode=PARSE_MODE)
-                        debug(get_text("debug_file_extracted", file_name))
+                        debug(f"File {file_name} - Extracted")
                     elif extract_result == False:
                         await safe_reply(event, get_text("error_file_extracted_user", file_name), parse_mode=PARSE_MODE)
                     elif extract_result == "missing_parts":
@@ -396,9 +647,15 @@ async def download_media(event):
         except asyncio.CancelledError:
             if status_message:
                 await safe_edit(status_message, get_text("cancelled"), buttons=None, parse_mode=PARSE_MODE)
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            debug(get_text("debug_file_cancelled", file_name))
+            # Limpiar archivo temporal si existe
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+                debug(f"[DOWNLOAD] Temporary file deleted after cancellation: {temp_file_path}")
+            # Limpiar archivo final si se movió
+            if os.path.exists(final_file_path):
+                os.remove(final_file_path)
+                debug(f"[DOWNLOAD] Final file deleted after cancellation: {final_file_path}")
+            debug(f"File {file_name} - Cancelled")
             raise
 
         except Exception as e:
@@ -417,17 +674,17 @@ async def download_media(event):
             )
 
             if should_retry:
-                # Eliminar archivo parcialmente descargado
-                if os.path.exists(file_path):
+                # Eliminar archivo parcialmente descargado (temporal)
+                if os.path.exists(temp_file_path):
                     try:
-                        os.remove(file_path)
-                        debug(get_text("debug_deleted_partial_file", file_path))
+                        os.remove(temp_file_path)
+                        debug(f"[DOWNLOAD] Partial temp file deleted after error: {temp_file_path}")
                     except Exception as cleanup_error:
-                        error(get_text("error_deleting", file_path, cleanup_error))
+                        error(f"Error deleting {temp_file_path}: {cleanup_error}")
 
                 # Si aún quedan intentos, reintentar
                 if attempt < MAX_DOWNLOAD_RETRIES:
-                    debug(get_text("debug_retrying_download", file_name, attempt + 1, MAX_DOWNLOAD_RETRIES, error_msg))
+                    debug(f"Retrying download of {file_name} (attempt {attempt + 1} of {MAX_DOWNLOAD_RETRIES}) after error: {error_msg}")
                     if status_message:
                         try:
                             await safe_edit(
@@ -437,13 +694,13 @@ async def download_media(event):
                                 parse_mode=PARSE_MODE
                             )
                         except Exception as msg_error:
-                            error(get_text("error_updating_status_message", msg_error))
+                            error(f"Error updating status message: {msg_error}")
 
                     # Esperar antes de reintentar
                     await asyncio.sleep(RETRY_DELAY_SECONDS)
                 else:
                     # Último intento fallido
-                    error(get_text("error_telegram_timeout", file_name, error_msg))
+                    error(f"Telegram timeout while downloading {file_name}: {error_msg}")
                     if status_message:
                         try:
                             await safe_edit(
@@ -453,7 +710,7 @@ async def download_media(event):
                                 parse_mode=PARSE_MODE
                             )
                         except Exception as msg_error:
-                            error(get_text("error_updating_status_message", msg_error))
+                            error(f"Error updating status message: {msg_error}")
             else:
                 raise
 
@@ -478,7 +735,7 @@ def extract_file(file_path, extract_to):
                     "need first volume" in msg or
                     "missing volume" in msg or
                     "unexpected end of archive" in msg):
-                    debug(get_text("debug_rar_missing_parts", file_path))
+                    debug(f"File {file_path} - Missing RAR parts")
                     return "missing_parts" 
                 else:
                     raise
@@ -487,13 +744,13 @@ def extract_file(file_path, extract_to):
         return True
 
     except Exception as e:
-        error(get_text("error_file_extracted", file_path, e))
+        error(f"Error extracting file {file_path}: {e}")
         if os.path.exists(extract_to):
             try:
                 shutil.rmtree(extract_to)
-                debug(get_text("debug_deleted_folder", extract_to))
+                debug(f"Deleted folder: {extract_to}")
             except Exception as cleanup_error:
-                error(get_text("error_deleting_folder", extract_to, cleanup_error))
+                error(f"Error deleting folder {extract_to}: {cleanup_error}")
         return False
 
 def get_file_name(media):
@@ -515,23 +772,108 @@ def get_file_name(media):
     else:
         return f"file_{media.id}"
 
-@bot.on(events.NewMessage(pattern=r"/(start|donate|version|donors)"))
+def get_available_categories():
+    """Retorna las categorías disponibles según los filtros activos"""
+    categories = []
+
+    # Siempre está disponible la carpeta principal
+    categories.append(("all", "📦 Todos"))
+
+    # Agregar categorías según filtros activos
+    if FILTER_VIDEO or FILTER_URL_VIDEO:
+        categories.append(("video", "🎥 Videos"))
+    if FILTER_AUDIO or FILTER_URL_AUDIO:
+        categories.append(("audio", "🎵 Audios"))
+    if FILTER_PHOTO:
+        categories.append(("photo", "🖼️ Fotos"))
+    if FILTER_TORRENT:
+        categories.append(("torrent", "🧲 Torrents"))
+    if FILTER_EBOOK:
+        categories.append(("ebook", "📚 Ebooks"))
+
+    return categories
+
+def get_category_buttons(exclude_category=None):
+    """Retorna los botones de categorías, opcionalmente excluyendo una categoría"""
+    categories = get_available_categories()
+
+    buttons = []
+    row = []
+    for cat_id, cat_name in categories:
+        # Excluir la categoría actual si se especifica
+        if exclude_category and cat_id == exclude_category:
+            continue
+
+        row.append(Button.inline(cat_name, data=f"listcat:{cat_id}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+
+    # Agregar última fila si quedaron botones
+    if row:
+        buttons.append(row)
+
+    # Agregar botón de cerrar en fila separada
+    buttons.append([Button.inline("❌ Cerrar", data="close")])
+
+    return buttons
+
+@bot.on(events.NewMessage(pattern=r"/(start|donate|version|donors|list|manage)"))
 async def handle_start(event):
+    # Borrar el comando del usuario para mantener el chat limpio
+    try:
+        await event.delete()
+    except:
+        pass
+
     if not is_admin(event.sender_id):
-        debug(get_text("warning_not_admin", event.sender_id))
+        debug(f"User {event.sender_id} is not an admin and tried to use the bot")
         response = get_text("user_not_admin")
-        await safe_reply(event, response, parse_mode=PARSE_MODE)
+        await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE)
     elif event.raw_text == "/start":
         response = get_text("welcome_message")
-        await safe_reply(event, response, parse_mode=PARSE_MODE)
+        await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE)
     elif event.raw_text == "/donate":
         response = get_text("donate")
-        await safe_reply(event, response, parse_mode=PARSE_MODE)
+        await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE)
     elif event.raw_text == "/version":
         response = get_text("version", VERSION)
-        await safe_reply(event, response, parse_mode=PARSE_MODE)
+        await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE)
     elif event.raw_text == "/donors":
-        await print_donors(event)
+        await print_donors(event.chat_id)
+    elif event.raw_text == "/list":
+
+        # Mostrar menú de categorías
+        buttons = get_category_buttons()
+        msg = "📂 **Listar archivos del servidor**\n\nSelecciona qué categoría deseas listar:"
+        await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE)
+    elif event.raw_text == "/manage":
+        # Borrar el comando del usuario
+        try:
+            await event.delete()
+        except:
+            pass
+
+        # Mostrar menú de categorías para gestionar
+        # Crear botones de categorías pero con callback "managecat:" en lugar de "listcat:"
+        categories = get_available_categories()
+        buttons = []
+        row = []
+        for cat_id, cat_name in categories:
+            row.append(Button.inline(cat_name, data=f"managecat:{cat_id}"))
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+
+        # Agregar última fila si quedaron botones
+        if row:
+            buttons.append(row)
+
+        # Agregar botón de cerrar
+        buttons.append([Button.inline("❌ Cerrar", data="close")])
+
+        msg = "🔧 **Gestionar archivos del servidor**\n\nSelecciona la categoría de archivos que deseas gestionar:"
+        await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(data=lambda data: data.startswith(b"cancel:")))
 async def cancel_download(event):
@@ -581,7 +923,7 @@ async def detect_content_type(url):
                 acodec = data.get("acodec")
                 ext = data.get("ext", "").lower()
 
-                debug(get_text("debug_content_detected", vcodec, acodec, ext))
+                debug(f"Content type detected - vcodec: {vcodec}, acodec: {acodec}, ext: {ext}")
 
                 # Detectar tipo de contenido
                 if vcodec and vcodec != "none":
@@ -597,7 +939,7 @@ async def detect_content_type(url):
 
         return "unknown"
     except Exception as e:
-        debug(get_text("error_detecting_content_type", e))
+        debug(f"Error detecting content type: {e}")
         return "unknown"
 
 @bot.on(events.NewMessage(pattern=r'https?://[^\s]+'))
@@ -625,7 +967,7 @@ async def handle_url_link(event):
         is_audio = AUTO_DOWNLOAD_FORMAT == "AUDIO"
 
         format_flag = "bestaudio" if is_audio else "bv*+ba/best"
-        output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
+        final_output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
 
         # Editar mensaje de análisis o crear uno nuevo si no existe
         if analyzing_msg:
@@ -645,28 +987,24 @@ async def handle_url_link(event):
                 wait_for_result=False
             )
 
+        # Usar timestamp para evitar sobrescribir archivos durante la descarga
+        timestamp = int(time.time() * 1000)  # Timestamp en milisegundos
+        temp_template = f"%(title).200s_temp{timestamp}.%(ext)s"
+
         cmd = [
             "yt-dlp",
             "-f", format_flag,
             "--restrict-filenames",
             "--newline",
-            "-o", os.path.join(output_dir, "%(title).200s.%(ext)s"),
+            "--progress",  # Forzar mostrar progreso
+            "-o", os.path.join(TEMP_DIR, temp_template),  # Descargar a /tmp
             url
         ]
 
         if is_audio:
             cmd.extend(["--extract-audio", "--audio-format", "mp3"])
-        else:
-            # Forzar codecs compatibles con iOS (H.264 + AAC) y optimizar para streaming
-            # -movflags +faststart: mueve el moov atom al inicio para streaming
-            # -c:v libx264: codec de video H.264 (compatible con iOS)
-            # -c:a aac: codec de audio AAC (compatible con iOS)
-            cmd.extend([
-                "--merge-output-format", "mp4",
-                "--postprocessor-args", "-c:v libx264 -c:a aac -movflags +faststart"
-            ])
 
-        task = asyncio.create_task(run_url_download(event, cmd, status_message))
+        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir))
         active_tasks[event.id] = task
         return
 
@@ -713,8 +1051,58 @@ async def cancel_simple(event):
 
     url_id = event.pattern_match.group(1).decode()
     pending_urls.pop(url_id, None)
-    debug(get_text("debug_url_download_cancelled"))
+    debug("URL download cancelled")
     await safe_delete(event)
+
+@bot.on(events.CallbackQuery(pattern=b"cancelconv:(.+)"))
+async def handle_cancel_conversion(event):
+    """Cancela una conversión de video en progreso"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    conversion_id = event.pattern_match.group(1).decode()
+
+    debug(f"[CANCEL] User requested to cancel conversion: {conversion_id}")
+
+    # Marcar la conversión como cancelada ANTES de terminar el proceso
+    cancelled_conversions.add(conversion_id)
+    debug(f"[CANCEL] Conversion marked as cancelled: {conversion_id}")
+
+    # Buscar el proceso de conversión
+    proc = active_tasks.get(conversion_id)
+    if proc:
+        try:
+            debug(f"[CANCEL] Process found (PID: {proc.pid}), terminating...")
+            # Matar el proceso de ffmpeg
+            proc.terminate()
+            debug(f"[CANCEL] ✅ SIGTERM signal sent to process {proc.pid}")
+
+            # Actualizar mensaje
+            await safe_edit(
+                event,
+                get_text("conversion_cancelled"),
+                parse_mode=PARSE_MODE
+            )
+
+            # Limpiar el proceso de active_tasks
+            active_tasks.pop(conversion_id, None)
+            debug(f"[CANCEL] Process removed from active_tasks")
+        except Exception as e:
+            error(f"[CANCELAR] ❌ Error cancelando conversión {conversion_id}: {e}")
+            await safe_edit(
+                event,
+                get_text("conversion_cancel_error"),
+                parse_mode=PARSE_MODE
+            )
+    else:
+        # La conversión ya terminó o no existe
+        debug(f"[CANCEL] ⚠️ Process not found in active_tasks (already finished or does not exist)")
+        await safe_edit(
+            event,
+            get_text("conversion_not_found"),
+            parse_mode=PARSE_MODE
+        )
 
 @bot.on(events.CallbackQuery(pattern=b"keep:(.+)"))
 async def handle_keep_file(event):
@@ -764,25 +1152,25 @@ async def handle_delete_file(event):
                     try:
                         os.remove(part)
                         msg = get_text("extracted_and_deleted_with_parts", file_path)
-                        debug(get_text("debug_deleted_file", part))
+                        debug(f"File {part} - Deleted")
                     except Exception as e:
-                        debug(get_text("error_deleting", file_path, e))
+                        error(f"Error deleting {file_path}: {e}")
             else:
                 os.remove(file_path)
                 msg = get_text("extracted_and_deleted", file_path)
-                debug(get_text("debug_deleted_file", file_path))
+                debug(f"File {file_path} - Deleted")
         elif os.path.isdir(file_path):
             msg = get_text("error_trying_to_delete_folder_user", file_path)
-            error(get_text("error_trying_to_delete_folder", file_path))
+            error(f"An attempt was made to delete the folder and it should not happen: {file_path}")
         else:
             msg = get_text("error_file_does_not_exist_user")
-            error(get_text("error_file_does_not_exist", file_path))
+            error(f"The file does not exist. Path: {file_path}")
 
         await safe_edit(event, msg, buttons=None, parse_mode=PARSE_MODE)
 
     except Exception as e:
         await safe_edit(event, get_text("error_deleting_user", file_path), buttons=None, parse_mode=PARSE_MODE)
-        debug(get_text("error_deleting", file_path, e))
+        error(f"Error deleting {file_path}: {e}")
 
 @bot.on(events.CallbackQuery(pattern=b"url_(audio|video):(.+)"))
 async def handle_format_selection(event):
@@ -802,7 +1190,7 @@ async def handle_format_selection(event):
     is_audio = format_type == "audio"
 
     format_flag = "bestaudio" if is_audio else "bv*+ba/best"
-    output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
+    final_output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
 
     status_message = await safe_edit(
         event,
@@ -822,39 +1210,37 @@ async def handle_format_selection(event):
             wait_for_result=False
         )
 
+    # Usar timestamp para evitar sobrescribir archivos durante la descarga
+    timestamp = int(time.time() * 1000)  # Timestamp en milisegundos
+    temp_template = f"%(title).200s_temp{timestamp}.%(ext)s"
+
     cmd = [
         "yt-dlp",
         "-f", format_flag,
         "--restrict-filenames",
         "--newline",  # Cada línea de progreso completa (para parsear en tiempo real)
-        "-o", os.path.join(output_dir, "%(title).200s.%(ext)s"),
+        "--progress",  # Forzar mostrar progreso
+        "-o", os.path.join(TEMP_DIR, temp_template),  # Descargar a /tmp
         url
     ]
 
     if is_audio:
         cmd.extend(["--extract-audio", "--audio-format", "mp3"])
-    else:
-        # Forzar codecs compatibles con iOS (H.264 + AAC) y optimizar para streaming
-        # -movflags +faststart: mueve el moov atom al inicio para streaming
-        # -c:v libx264: codec de video H.264 (compatible con iOS)
-        # -c:a aac: codec de audio AAC (compatible con iOS)
-        cmd.extend([
-            "--merge-output-format", "mp4",
-            "--postprocessor-args", "-c:v libx264 -c:a aac -movflags +faststart"
-        ])
 
-    task = asyncio.create_task(run_url_download(event, cmd, status_message))
+    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir))
     active_tasks[event.id] = task
 
 def parse_progress(line):
     """
     Parsea líneas de progreso de yt-dlp.
     Formato: [download]  45.2% of 123.45MiB at 1.23MiB/s ETA 00:30
+    O con tamaño aproximado: [download]  13.7% of ~   4.89GiB at   62.33MiB/s ETA 01:10 (frag 42/306)
     Retorna: {"percent": "45.2", "size": "123.45MiB", "speed": "1.23MiB/s", "eta": "00:30"}
     """
     try:
-        # Patrón para capturar: porcentaje, tamaño, velocidad, ETA
-        pattern = r'\[download\]\s+(\d+\.?\d*)%\s+of\s+([\d\.]+\w+)(?:\s+at\s+([\d\.]+\w+/s))?(?:\s+ETA\s+([\d:]+))?'
+        # Patrón para capturar: porcentaje, tamaño (con ~ opcional), velocidad, ETA
+        # El \s* permite espacios extra, el ~? permite el símbolo de aproximado
+        pattern = r'\[download\]\s+(\d+\.?\d*)%\s+of\s+~?\s*([\d\.]+\w+)(?:\s+at\s+([\d\.]+\w+/s))?(?:\s+ETA\s+([\d:]+))?'
         match = re.search(pattern, line)
 
         if match:
@@ -905,9 +1291,10 @@ async def update_progress_message(status_message, progress_info, event, file_nam
         # Ignorar errores de actualización (puede ser FloodWaitError)
         debug(f"Error actualizando progreso: {e}")
 
-async def run_url_download(event, cmd, status_message):
+async def run_url_download(event, cmd, status_message, final_output_dir):
     try:
-        debug(get_text("debug_creating_url_subprocess"))
+        debug("Creating URL download subprocess...")
+        debug(f"[URL DOWNLOAD] Final output directory: {final_output_dir}")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -940,12 +1327,17 @@ async def run_url_download(event, cmd, status_message):
                 # Detectar líneas de progreso: [download]  45.2% of 123.45MiB at 1.23MiB/s ETA 00:30
                 if "[download]" in line_str and "%" in line_str:
                     current_time = asyncio.get_event_loop().time()
-                    if current_time - last_update_time >= update_interval:
+                    time_diff = current_time - last_update_time
+                    debug(f"Progreso detectado. Tiempo desde última actualización: {time_diff:.2f}s (intervalo: {update_interval}s)")
+                    if time_diff >= update_interval:
                         last_update_time = current_time
                         # Parsear y actualizar mensaje
                         progress_info = parse_progress(line_str)
                         if progress_info:
+                            debug(f"Actualizando mensaje de progreso: {progress_info}")
                             await update_progress_message(status_message, progress_info, event, current_filename)
+                        else:
+                            debug(f"No se pudo parsear el progreso de: {line_str}")
 
         # Leer stderr en paralelo
         async def read_stderr():
@@ -964,7 +1356,7 @@ async def run_url_download(event, cmd, status_message):
 
         # Esperar a que termine el proceso
         await proc.wait()
-        debug(get_text("debug_exiting_url_subprocess", proc.returncode))
+        debug(f"Exiting URL download subprocess. Code {proc.returncode}")
 
         if proc.returncode == -15:
             await handle_cancel(status_message)
@@ -973,29 +1365,40 @@ async def run_url_download(event, cmd, status_message):
         if status_message:
             await safe_delete(status_message)
         if proc.returncode == 0:
-            file_paths = extract_file_paths(stdout_lines)
+            temp_file_paths = extract_file_paths(stdout_lines)
 
-            if file_paths:
-                for file_path in file_paths:
-                    if os.path.exists(file_path):
-                        await handle_success(event, file_path)
+            if temp_file_paths:
+                for temp_file_path in temp_file_paths:
+                    if os.path.exists(temp_file_path):
+                        # Mover archivo de /tmp a carpeta final
+                        filename = os.path.basename(temp_file_path)
+                        final_file_path = os.path.join(final_output_dir, filename)
+
+                        debug(f"[URL DOWNLOAD] Moving file from temp to final location...")
+                        debug(f"[URL DOWNLOAD] Temp: {temp_file_path}")
+                        debug(f"[URL DOWNLOAD] Final: {final_file_path}")
+
+                        shutil.move(temp_file_path, final_file_path)
+                        debug(f"[URL DOWNLOAD] ✅ File moved to: {final_file_path}")
+
+                        await handle_success(event, final_file_path)
                     else:
-                        debug(get_text("error_output_file_not_found", file_path))
+                        debug(f"Output file not found: {temp_file_path}")
             else:
-                debug(get_text("error_no_files_downloaded"))
+                debug("No downloaded files found in yt-dlp output")
                 debug(f"Comando ejecutado: {' '.join(cmd)}")
                 debug(f"Stdout completo: {chr(10).join(stdout_lines)}")
                 await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
         else:
             stderr_output = "\n".join(stderr_lines)
-            debug(get_text("error_url_failed", stderr_output))
+            debug(f"URL download failed. Error: {stderr_output}")
             await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
 
     except asyncio.CancelledError:
         await handle_cancel(status_message)
         raise
     finally:
-        debug(get_text("debug_cleaning_url_subprocess", event.id))
+        debug(f"Cleaning URL download subprocess. ID {event.id}")
         active_tasks.pop(event.id, None)
 
 def extract_file_paths(stdout_lines):
@@ -1018,37 +1421,68 @@ def extract_file_paths(stdout_lines):
         # Detectar merge de formatos (este es el archivo final)
         elif "[Merger]" in line and "Merging formats into" in line:
             merged_path = line.split("Merging formats into")[-1].strip().strip('"')
-            debug(get_text("debug_file_path_merged_detected", merged_path))
+            debug(f"Detected merged output file: {merged_path}")
             current_file = merged_path
             is_partial = False  # El archivo mergeado es el final
             # Agregar inmediatamente el archivo mergeado
             if current_file and current_file not in file_paths:
                 file_paths.append(current_file)
-                debug(get_text("debug_file_added_to_list", current_file))
+                debug(f"File added to download list: {current_file}")
 
         # Detectar extracción de audio (este es el archivo final)
         elif "[ExtractAudio]" in line and "Destination:" in line:
             audio_path = line.split("Destination:")[-1].strip()
-            debug(get_text("debug_file_path_audio_detected", audio_path))
+            debug(f"Detected audio output file: {audio_path}")
             current_file = audio_path
             is_partial = False  # El audio extraído es el final
             # Agregar inmediatamente el audio extraído
             if current_file and current_file not in file_paths:
                 file_paths.append(current_file)
-                debug(get_text("debug_file_added_to_list", current_file))
+                debug(f"File added to download list: {current_file}")
 
         # Detectar finalización de descarga (solo agregar si NO es parcial)
         elif "[download] 100%" in line or "has already been downloaded" in line:
             if current_file and not is_partial and current_file not in file_paths:
                 file_paths.append(current_file)
-                debug(get_text("debug_file_added_to_list", current_file))
+                debug(f"File added to download list: {current_file}")
                 current_file = None
 
-    return file_paths
+    # Limpiar nombres temporales y manejar duplicados
+    final_paths = []
+    for file_path in file_paths:
+        if not os.path.exists(file_path):
+            final_paths.append(file_path)
+            continue
+
+        directory = os.path.dirname(file_path)
+        filename = os.path.basename(file_path)
+
+        # Eliminar el timestamp temporal del nombre: "video_temp1234567890.mp4" -> "video.mp4"
+        clean_filename = re.sub(r'_temp\d+\.', '.', filename)
+
+        # Buscar nombre único en el directorio
+        unique_filename = get_unique_filename(directory, clean_filename)
+        unique_path = os.path.join(directory, unique_filename)
+
+        # Renombrar el archivo temporal al nombre final
+        try:
+            os.rename(file_path, unique_path)
+            if unique_filename != clean_filename:
+                debug(f"Archivo renombrado (duplicado): {clean_filename} -> {unique_filename}")
+            else:
+                debug(f"Archivo renombrado: {filename} -> {unique_filename}")
+            final_paths.append(unique_path)
+        except Exception as e:
+            error(f"Error renombrando archivo: {e}")
+            final_paths.append(file_path)
+
+    return final_paths
 
 async def get_video_metadata(file_path):
     """Obtiene metadatos del video usando ffprobe"""
     try:
+        debug(f"[METADATA] Getting metadata from: {file_path}")
+
         cmd = [
             "ffprobe",
             "-v", "quiet",
@@ -1058,13 +1492,15 @@ async def get_video_metadata(file_path):
             file_path
         ]
 
+        debug(f"[METADATA] Running ffprobe...")
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
 
-        stdout, _ = await proc.communicate()
+        stdout, stderr = await proc.communicate()
 
         if proc.returncode == 0:
             import json
@@ -1076,36 +1512,1336 @@ async def get_video_metadata(file_path):
                     duration = int(float(data.get("format", {}).get("duration", 0)))
                     width = stream.get("width", 0)
                     height = stream.get("height", 0)
+                    debug(f"[METADATA] ✅ Metadata obtained: {duration}s, {width}x{height}")
                     return duration, width, height
 
+            debug(f"[METADATA] ⚠️ Video stream not found")
+        else:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            debug(f"[METADATA] ❌ Error running ffprobe (code {proc.returncode}): {error_msg[:200]}")
+
         return None, None, None
     except Exception as e:
-        debug(get_text("error_getting_video_metadata", e))
+        debug(f"[METADATA] ❌ Exception getting video metadata: {e}")
         return None, None, None
 
-async def handle_success(event, file_path):
+async def get_file_info(file_path):
+    """
+    Obtiene información detallada de un archivo (tamaño, duración, resolución, formato).
+    Retorna un diccionario con la información.
+    """
+    try:
+        import json
+
+        file_size = os.path.getsize(file_path)
+        file_ext = os.path.splitext(file_path)[1].lower()
+
+        info = {
+            "size": file_size,
+            "size_formatted": format_file_size(file_size),
+            "extension": file_ext,
+            "type": None,
+            "duration": None,
+            "duration_formatted": None,
+            "resolution": None,
+            "codec_video": None,
+            "codec_audio": None,
+            "bitrate": None
+        }
+
+        # Detectar tipo de archivo
+        if file_ext in EXTENSIONS_VIDEO:
+            info["type"] = "video"
+        elif file_ext in EXTENSIONS_AUDIO:
+            info["type"] = "audio"
+        elif file_ext in EXTENSIONS_IMAGE:
+            info["type"] = "image"
+        else:
+            info["type"] = "document"
+
+        # Obtener metadatos con ffprobe para video/audio
+        if info["type"] in ("video", "audio"):
+            cmd = [
+                "ffprobe",
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
+                file_path
+            ]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, _ = await proc.communicate()
+
+            if proc.returncode == 0:
+                data = json.loads(stdout.decode())
+                format_data = data.get("format", {})
+
+                # Duración
+                duration = float(format_data.get("duration", 0))
+                if duration > 0:
+                    info["duration"] = int(duration)
+                    info["duration_formatted"] = format_duration(int(duration))
+
+                # Bitrate
+                bitrate = int(format_data.get("bit_rate", 0))
+                if bitrate > 0:
+                    info["bitrate"] = f"{bitrate // 1000} kbps"
+
+                # Streams
+                for stream in data.get("streams", []):
+                    if stream.get("codec_type") == "video" and not info["codec_video"]:
+                        info["codec_video"] = stream.get("codec_name", "").upper()
+                        width = stream.get("width")
+                        height = stream.get("height")
+                        if width and height:
+                            info["resolution"] = f"{width}x{height}"
+                    elif stream.get("codec_type") == "audio" and not info["codec_audio"]:
+                        info["codec_audio"] = stream.get("codec_name", "").upper()
+
+        return info
+    except Exception as e:
+        debug(f"Error obteniendo información del archivo: {e}")
+        return {
+            "size": os.path.getsize(file_path) if os.path.exists(file_path) else 0,
+            "size_formatted": format_file_size(os.path.getsize(file_path)) if os.path.exists(file_path) else "0 B",
+            "extension": os.path.splitext(file_path)[1].lower(),
+            "type": "document"
+        }
+
+def format_file_size(size_bytes):
+    """Formatea el tamaño del archivo en formato legible"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} PB"
+
+def format_duration(seconds):
+    """Formatea la duración en formato HH:MM:SS o MM:SS"""
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    else:
+        return f"{minutes:02d}:{secs:02d}"
+
+async def generate_video_thumbnail(video_path, output_path=None, timestamp="00:00:03"):
+    """
+    Genera una miniatura de un video en el segundo especificado.
+    Retorna la ruta del thumbnail generado o None si falla.
+    """
+    try:
+        debug(f"[THUMBNAIL] Generating thumbnail for: {video_path}")
+
+        if output_path is None:
+            # Generar thumbnail en /tmp
+            video_filename = os.path.basename(video_path)
+            base_name = os.path.splitext(video_filename)[0]
+            timestamp_ms = int(time.time() * 1000)
+            output_path = os.path.join(TEMP_DIR, f"{base_name}_{timestamp_ms}_thumb.jpg")
+
+        debug(f"[THUMBNAIL] Output path: {output_path}")
+        debug(f"[THUMBNAIL] Timestamp: {timestamp}")
+
+        cmd = [
+            "ffmpeg",
+            "-i", video_path,
+            "-ss", timestamp,  # Segundo del video para capturar
+            "-vframes", "1",   # Solo 1 frame
+            "-vf", "scale=320:-1",  # Escalar a 320px de ancho manteniendo aspecto
+            "-y",  # Sobrescribir sin preguntar
+            output_path
+        ]
+
+        debug(f"[THUMBNAIL] Running ffmpeg command...")
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        _, stderr = await proc.communicate()
+
+        if proc.returncode == 0 and os.path.exists(output_path):
+            thumb_size = os.path.getsize(output_path)
+            debug(f"[THUMBNAIL] ✅ Thumbnail generated successfully: {output_path} ({thumb_size} bytes)")
+            return output_path
+        else:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            debug(f"[THUMBNAIL] ❌ Error generating thumbnail (code {proc.returncode}): {error_msg[:200]}")
+            return None
+    except Exception as e:
+        debug(f"[THUMBNAIL] ❌ Exception generating thumbnail: {e}")
+        return None
+
+async def convert_video_to_telegram_compatible(input_path, status_message=None):
+    """
+    Convierte un video a formato compatible con Telegram (MP4 con H.264 + AAC).
+    Retorna la ruta del archivo convertido (temporal en /tmp) o el original si falla.
+    IMPORTANTE: El archivo convertido debe ser eliminado después de enviarlo.
+    """
+    try:
+        debug(f"[CONVERSION] Starting video conversion: {input_path}")
+
+        # Generar nombre de archivo temporal en /tmp para la conversión
+        input_filename = os.path.basename(input_path)
+        base_name = os.path.splitext(input_filename)[0]
+        # Usar timestamp para evitar colisiones
+        timestamp = int(time.time() * 1000)
+        output_path = os.path.join(TEMP_DIR, f"{base_name}_{timestamp}_telegram.mp4")
+
+        debug(f"[CONVERSION] Output file: {output_path}")
+
+        # Obtener duración del video para calcular progreso
+        duration_seconds = 0
+        try:
+            debug(f"[CONVERSION] Getting video metadata...")
+            duration, _, _ = await get_video_metadata(input_path)
+            duration_seconds = duration if duration else 0
+            debug(f"[CONVERSION] Video duration: {duration_seconds}s")
+        except Exception as e:
+            debug(f"[CONVERSION] Could not get video duration: {e}")
+
+        # Generar ID único para esta conversión
+        conversion_id = f"conv_{abs(hash(input_path)) % 1000000}"
+        debug(f"[CONVERSION] Conversion ID: {conversion_id}")
+
+        if status_message:
+            debug(f"[CONVERSION] Updating status message with cancel button")
+            await safe_edit(
+                status_message,
+                get_text("converting_video_progress"),
+                buttons=[Button.inline(get_text("button_cancel_conversion"), data=f"cancelconv:{conversion_id}")],
+                parse_mode=PARSE_MODE
+            )
+
+        cmd = [
+            "ffmpeg",
+            "-i", input_path,
+            "-c:v", "libx264",  # Codec de video H.264 (compatible con Telegram)
+            "-c:a", "aac",      # Codec de audio AAC (compatible con Telegram)
+            "-movflags", "+faststart",  # Optimizar para streaming
+            "-progress", "pipe:1",  # Reportar progreso a stdout
+            "-y",  # Sobrescribir sin preguntar
+            output_path
+        ]
+
+        debug(f"[CONVERSIÓN] Ejecutando comando ffmpeg: {' '.join(cmd[:3])}...")
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        debug(f"[CONVERSION] ffmpeg process started (PID: {proc.pid})")
+
+        # Guardar el proceso para poder cancelarlo
+        active_tasks[conversion_id] = proc
+        debug(f"[CONVERSION] Process saved in active_tasks with ID: {conversion_id}")
+
+        # Leer progreso en tiempo real
+        last_update = 0
+        debug(f"[CONVERSION] Starting progress reading...")
+        while True:
+            # Verificar si la conversión fue cancelada
+            if conversion_id in cancelled_conversions:
+                debug(f"[CONVERSION] Conversion cancelled during progress reading, stopping...")
+                break
+
+            line = await proc.stdout.readline()
+            if not line:
+                break
+
+            line = line.decode().strip()
+
+            # ffmpeg reporta progreso en formato "out_time_ms=XXXXX"
+            if line.startswith("out_time_ms="):
+                try:
+                    time_ms = int(line.split("=")[1])
+                    time_seconds = time_ms / 1000000  # Convertir microsegundos a segundos
+
+                    # Calcular porcentaje si conocemos la duración
+                    if duration_seconds > 0 and status_message:
+                        percentage = min(int((time_seconds / duration_seconds) * 100), 100)
+
+                        # Actualizar cada 5% para no saturar
+                        if percentage >= last_update + 5:
+                            last_update = percentage
+                            debug(f"[CONVERSION] Progress: {percentage}% ({int(time_seconds)}s / {int(duration_seconds)}s)")
+
+                            # Crear barra de progreso
+                            bar_length = 20
+                            filled = int(bar_length * percentage / 100)
+                            bar = "█" * filled + "░" * (bar_length - filled)
+
+                            msg = get_text("converting_video_progress_bar", bar, percentage, int(time_seconds), int(duration_seconds))
+
+                            try:
+                                await safe_edit(
+                                    status_message,
+                                    msg,
+                                    buttons=[Button.inline(get_text("button_cancel_conversion"), data=f"cancelconv:{conversion_id}")],
+                                    parse_mode=PARSE_MODE
+                                )
+                            except Exception as e:
+                                debug(f"[CONVERSION] Error updating progress message: {e}")
+                                # Si falla la edición, puede ser que el mensaje fue eliminado/editado
+                                # Verificar si fue cancelado
+                                if conversion_id in cancelled_conversions:
+                                    debug(f"[CONVERSION] Message edit failed because conversion was cancelled")
+                                    break
+                except Exception as e:
+                    debug(f"[CONVERSION] Error processing progress line: {e}")
+
+        debug(f"[CONVERSION] Waiting for process completion...")
+        await proc.wait()
+
+        debug(f"[CONVERSION] Process finished with code: {proc.returncode}")
+
+        # Limpiar el proceso de active_tasks
+        active_tasks.pop(conversion_id, None)
+        debug(f"[CONVERSION] Process removed from active_tasks")
+
+        # Verificar si la conversión fue cancelada por el usuario
+        if conversion_id in cancelled_conversions:
+            debug(f"[CONVERSION] ❌ Conversion was cancelled by user")
+            # Eliminar de la lista de canceladas
+            cancelled_conversions.discard(conversion_id)
+            # Eliminar archivo de salida parcial si existe
+            if os.path.exists(output_path):
+                debug(f"[CONVERSION] Deleting partial file: {output_path}")
+                try:
+                    os.remove(output_path)
+                except:
+                    pass
+            # Retornar None para indicar cancelación
+            return None
+
+        if proc.returncode == 0 and os.path.exists(output_path):
+            file_size = os.path.getsize(output_path)
+            debug(f"[CONVERSION] ✅ Conversion successful: {output_path} ({file_size} bytes)")
+            debug(f"[CONVERSION] Original file preserved: {input_path}")
+
+            # Actualizar mensaje a "Preparando envío..." para evitar condición de carrera
+            # con el bucle de progreso que puede seguir intentando actualizar
+            if status_message:
+                try:
+                    await safe_edit(
+                        status_message,
+                        get_text("preparing_send"),
+                        parse_mode=PARSE_MODE
+                    )
+                    debug(f"[CONVERSION] Status message updated to 'preparing send'")
+                except Exception as e:
+                    debug(f"[CONVERSION] Could not update status message: {e}")
+
+            # Retornar el archivo convertido (temporal)
+            # NOTA: Este archivo debe ser eliminado después de enviarlo
+            return output_path
+        else:
+            # Leer stderr para obtener mensaje de error
+            stderr = await proc.stderr.read()
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            error(f"[CONVERSIÓN] ❌ Error convirtiendo video (código {proc.returncode}): {error_msg[:200]}")
+            # Si falla la conversión, eliminar el archivo de salida si existe
+            if os.path.exists(output_path):
+                debug(f"[CONVERSION] Deleting failed output file: {output_path}")
+                os.remove(output_path)
+            # Retornar el archivo original sin convertir
+            debug(f"[CONVERSION] Returning original unconverted file: {input_path}")
+            return input_path
+
+    except asyncio.CancelledError:
+        # La tarea fue cancelada (por ejemplo, el usuario canceló la conversión)
+        debug(f"[CONVERSION] ❌ Conversion task cancelled")
+        # Limpiar el proceso de active_tasks
+        active_tasks.pop(conversion_id, None)
+        debug(f"[CONVERSION] Process removed from active_tasks after cancellation")
+        # Eliminar archivo de salida parcial si existe
+        if os.path.exists(output_path):
+            debug(f"[CONVERSION] Deleting partial file: {output_path}")
+            try:
+                os.remove(output_path)
+            except:
+                pass
+        # Retornar None para indicar cancelación
+        return None
+    except Exception as e:
+        error(f"[CONVERSION] ❌ Exception during video conversion: {e}")
+        # Limpiar el proceso de active_tasks
+        active_tasks.pop(conversion_id, None)
+        debug(f"[CONVERSION] Process removed from active_tasks after exception")
+        # Eliminar archivo de salida parcial si existe
+        if os.path.exists(output_path):
+            debug(f"[CONVERSION] Deleting partial file after exception: {output_path}")
+            try:
+                os.remove(output_path)
+            except:
+                pass
+        # En caso de error, retornar el archivo original
+        debug(f"[CONVERSION] Returning original unconverted file after exception: {input_path}")
+        return input_path
+
+async def handle_success(event, file_path, show_action_buttons=True):
     try:
         file_size = os.path.getsize(file_path)
-        debug(get_text("debug_filesize", file_size))
+        debug(f"File size: {file_size} bytes")
 
-        icon = "🎵" if file_path.endswith(".mp3") else "🎥"
-        await safe_reply(event, get_text("downloaded", icon, get_filename_from_path(file_path)), parse_mode=PARSE_MODE)
+        # Obtener información detallada del archivo
+        file_info = await get_file_info(file_path)
+        filename = get_filename_from_path(file_path)
 
-        if file_size <= 2 * 1024 * 1024 * 1024:
-            pending_files[event.id] = file_path
-            buttons = [
-                [
-                    Button.inline(get_text("button_send"), data=f"send:{event.id}"),
-                    Button.inline(get_text("button_send_and_delete"), data=f"senddelete:{event.id}"),
-                ],
-                [Button.inline(get_text("button_only_in_server"), data=f"nosend:{event.id}")]
-            ]
-            await safe_reply(event, get_text("upload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
-        else:
-            debug(get_text("debug_filesize_to_high_to_telegram"))
+        # Construir mensaje con información del archivo
+        icon_map = {
+            "video": "🎥",
+            "audio": "🎵",
+            "image": "🖼️",
+            "document": "📄"
+        }
+        icon = icon_map.get(file_info["type"], "📄")
+
+        # Mensaje unificado: Descarga completada + información detallada
+        info_lines = [
+            f"✅ {icon} **Descarga completada:** `{filename}`",
+            "",
+            f"📦 **Tamaño:** {file_info['size_formatted']}"
+        ]
+
+        # Agregar información específica según el tipo
+        if file_info["type"] == "video":
+            if file_info["duration_formatted"]:
+                info_lines.append(f"⏱️ **Duración:** {file_info['duration_formatted']}")
+            if file_info["resolution"]:
+                info_lines.append(f"📐 **Resolución:** {file_info['resolution']}")
+            if file_info["codec_video"]:
+                codec_info = file_info["codec_video"]
+                if file_info["codec_audio"]:
+                    codec_info += f" + {file_info['codec_audio']}"
+                info_lines.append(f"🎬 **Códec:** {codec_info}")
+        elif file_info["type"] == "audio":
+            if file_info["duration_formatted"]:
+                info_lines.append(f"⏱️ **Duración:** {file_info['duration_formatted']}")
+            if file_info["codec_audio"]:
+                info_lines.append(f"🎵 **Códec:** {file_info['codec_audio']}")
+            if file_info["bitrate"]:
+                info_lines.append(f"📊 **Bitrate:** {file_info['bitrate']}")
+
+        info_message = "\n".join(info_lines)
+        await safe_reply(event, info_message, parse_mode=PARSE_MODE)
+
+        # Solo mostrar botones de acción si se solicita (para descargas de URLs)
+        if show_action_buttons:
+            if file_size <= 2 * 1024 * 1024 * 1024:
+                pending_files[event.id] = file_path
+                buttons = [
+                    [
+                        Button.inline(get_text("button_send"), data=f"send:{event.id}"),
+                        Button.inline(get_text("button_send_and_delete"), data=f"senddelete:{event.id}"),
+                    ],
+                    [Button.inline(get_text("button_only_in_server"), data=f"nosend:{event.id}")]
+                ]
+                await safe_reply(event, get_text("upload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
+            else:
+                debug("File size is too large to send via Telegram. Maximum size is 2GB")
     except Exception as e:
-        debug(get_text("error_sending_the_file", e))
+        error(f"Error sending file: {e}")
 
+
+@bot.on(events.CallbackQuery(pattern=b"listcat:(.+)"))
+async def handle_list_category(event):
+    """Maneja los botones de categorías en /list"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    category = event.pattern_match.group(1).decode()
+
+    # Eliminar TODOS los mensajes anteriores de la lista (si existen)
+    user_id = event.sender_id
+    if user_id in list_messages:
+        for msg in list_messages[user_id]:
+            try:
+                await safe_delete(msg)
+            except:
+                pass
+        list_messages.pop(user_id, None)
+
+    # También eliminar el mensaje actual (el que tiene los botones)
+    await safe_delete(event)
+
+    # Llamar directamente a la lógica de listado con la categoría
+    try:
+        # Mapear categorías a directorios
+        category_map = {
+            "all": list(DOWNLOAD_PATHS.values()),
+            "video": [DOWNLOAD_PATHS["video"], DOWNLOAD_PATHS["url_video"]],
+            "audio": [DOWNLOAD_PATHS["audio"], DOWNLOAD_PATHS["url_audio"]],
+            "photo": [DOWNLOAD_PATHS["photo"]],
+            "torrent": [DOWNLOAD_PATHS["torrent"]],
+            "ebook": [DOWNLOAD_PATHS["ebook"]]
+        }
+
+        directories = category_map.get(category, list(DOWNLOAD_PATHS.values()))
+
+        # Eliminar directorios duplicados
+        directories = list(set(directories))
+
+        # Recopilar archivos
+        files_info = []
+        total_size = 0
+        seen_files = set()
+
+        for directory in directories:
+            if not os.path.exists(directory):
+                continue
+
+            for filename in os.listdir(directory):
+                file_path = os.path.join(directory, filename)
+
+                # Ignorar archivos temporales y ocultos
+                if filename.startswith('.') or '_thumb.jpg' in filename:
+                    continue
+
+                # Evitar duplicados
+                if file_path in seen_files:
+                    continue
+                seen_files.add(file_path)
+
+                try:
+                    is_directory = os.path.isdir(file_path)
+
+                    if is_directory:
+                        # Es una carpeta
+                        file_size = get_directory_size(file_path)
+                        icon = "📁"
+                        item_type = "folder"
+                    else:
+                        # Es un archivo
+                        file_size = os.path.getsize(file_path)
+                        file_ext = os.path.splitext(filename)[1].lower()
+
+                        # Determinar icono según extensión
+                        if file_ext in EXTENSIONS_VIDEO:
+                            icon = "🎥"
+                        elif file_ext in EXTENSIONS_AUDIO:
+                            icon = "🎵"
+                        elif file_ext in EXTENSIONS_IMAGE:
+                            icon = "🖼️"
+                        else:
+                            icon = "📄"
+                        item_type = "file"
+
+                    files_info.append({
+                        "name": filename,
+                        "size": file_size,
+                        "size_formatted": format_file_size(file_size),
+                        "icon": icon,
+                        "path": file_path,
+                        "type": item_type
+                    })
+                    total_size += file_size
+                except Exception as e:
+                    debug(f"Error procesando {filename}: {e}")
+
+        # Ordenar por tamaño (más grandes primero)
+        files_info.sort(key=lambda x: x["size"], reverse=True)
+
+        # Crear botones de categorías (excluyendo la categoría actual)
+        category_buttons = get_category_buttons(exclude_category=category)
+
+        if not files_info:
+            # Mostrar mensaje vacío pero con botones para cambiar de categoría
+            msg = get_text("list_empty")
+            sent_msg = await safe_send_message(event.chat_id, msg, buttons=category_buttons, parse_mode=PARSE_MODE, wait_for_result=True)
+            if sent_msg:
+                list_messages[user_id] = [sent_msg]
+            return
+
+        # Construir mensajes (partiendo si es necesario)
+        MAX_MESSAGE_LENGTH = 3800
+
+        total_size_formatted = format_file_size(total_size)
+        header = f"📂 **Archivos en el servidor**\n\n"
+
+        # Contar archivos y carpetas
+        file_count = sum(1 for item in files_info if item["type"] == "file")
+        folder_count = sum(1 for item in files_info if item["type"] == "folder")
+
+        if folder_count > 0:
+            footer = f"\n\n**Total:** {file_count} archivos, {folder_count} carpetas | **Espacio:** {total_size_formatted}"
+        else:
+            footer = f"\n\n**Total:** {file_count} archivos | **Espacio:** {total_size_formatted}"
+
+        messages = []
+        current_message = ""
+
+        for i, file_info in enumerate(files_info, 1):
+            # Truncar nombre si es muy largo
+            name = file_info["name"]
+            display_name = name
+            if len(name) > 40:
+                display_name = name[:37] + "..."
+
+            # Crear entrada de archivo o carpeta (sin mostrar la ruta)
+            file_entry = f"{i}. {file_info['icon']} `{display_name}`\n   💾 {file_info['size_formatted']}"
+
+            # Calcular longitud del mensaje con header y footer
+            test_message = header + current_message + "\n\n" + file_entry + footer
+
+            if len(test_message) > MAX_MESSAGE_LENGTH and current_message:
+                # Guardar mensaje actual y empezar uno nuevo
+                final_message = header + current_message + footer
+                messages.append(final_message)
+                current_message = file_entry
+            else:
+                # Agregar al mensaje actual
+                if current_message:
+                    current_message += "\n\n" + file_entry
+                else:
+                    current_message = file_entry
+
+        # Agregar el último mensaje
+        if current_message:
+            final_message = header + current_message + footer
+            messages.append(final_message)
+
+        # Enviar mensaje principal con lista de archivos
+        sent_messages = []
+        for idx, msg in enumerate(messages, 1):
+            if len(messages) > 1:
+                # Si hay múltiples mensajes, agregar indicador de página
+                msg = msg.replace("📂 **Archivos en el servidor**", f"📂 **Archivos en el servidor** (Parte {idx}/{len(messages)})")
+
+            # Solo agregar botones de categorías al último mensaje
+            buttons = category_buttons if idx == len(messages) else None
+            sent_msg = await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE, wait_for_result=True)
+            if sent_msg:
+                sent_messages.append(sent_msg)
+
+        # Guardar todos los mensajes enviados para poder borrarlos después
+        if sent_messages:
+            list_messages[user_id] = sent_messages
+
+    except Exception as e:
+        error(f"Error listando archivos: {e}")
+        await safe_send_message(event.chat_id, get_text("error_list_files"), parse_mode=PARSE_MODE)
+
+@bot.on(events.CallbackQuery(pattern=b"managecat:(.+)"))
+async def handle_manage_category(event):
+    """Maneja los botones de categorías en /manage"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    category = event.pattern_match.group(1).decode()
+
+    # Eliminar TODOS los mensajes anteriores de la lista (si existen)
+    user_id = event.sender_id
+    if user_id in list_messages:
+        for msg in list_messages[user_id]:
+            try:
+                await safe_delete(msg)
+            except:
+                pass
+        list_messages.pop(user_id, None)
+
+    # También eliminar el mensaje actual (el que tiene los botones)
+    await safe_delete(event)
+
+    try:
+        # Parsear el comando para obtener la categoría
+        command_parts = ["/manage", category]
+        category = command_parts[1] if len(command_parts) > 1 else "all"
+
+        # Mapear categorías a directorios
+        category_map = {
+            "all": list(DOWNLOAD_PATHS.values()),
+            "video": [DOWNLOAD_PATHS["video"], DOWNLOAD_PATHS["url_video"]],
+            "audio": [DOWNLOAD_PATHS["audio"], DOWNLOAD_PATHS["url_audio"]],
+            "photo": [DOWNLOAD_PATHS["photo"]],
+            "torrent": [DOWNLOAD_PATHS["torrent"]],
+            "ebook": [DOWNLOAD_PATHS["ebook"]]
+        }
+
+        directories = category_map.get(category, list(DOWNLOAD_PATHS.values()))
+
+        # Eliminar directorios duplicados
+        directories = list(set(directories))
+
+        # Recopilar archivos
+        files_info = []
+        total_size = 0
+        seen_files = set()
+
+        for directory in directories:
+            if not os.path.exists(directory):
+                continue
+
+            for filename in os.listdir(directory):
+                file_path = os.path.join(directory, filename)
+
+                # Ignorar archivos temporales y ocultos
+                if filename.startswith('.') or '_thumb.jpg' in filename:
+                    continue
+
+                # Evitar duplicados
+                if file_path in seen_files:
+                    continue
+                seen_files.add(file_path)
+
+                try:
+                    is_directory = os.path.isdir(file_path)
+
+                    if is_directory:
+                        # Es una carpeta
+                        file_size = get_directory_size(file_path)
+                        icon = "📁"
+                        item_type = "folder"
+                    else:
+                        # Es un archivo
+                        file_size = os.path.getsize(file_path)
+                        file_ext = os.path.splitext(filename)[1].lower()
+
+                        # Determinar icono según extensión
+                        if file_ext in EXTENSIONS_VIDEO:
+                            icon = "🎥"
+                        elif file_ext in EXTENSIONS_AUDIO:
+                            icon = "🎵"
+                        elif file_ext in EXTENSIONS_IMAGE:
+                            icon = "🖼️"
+                        else:
+                            icon = "📄"
+                        item_type = "file"
+
+                    files_info.append({
+                        "name": filename,
+                        "size": file_size,
+                        "size_formatted": format_file_size(file_size),
+                        "icon": icon,
+                        "path": file_path,
+                        "type": item_type
+                    })
+                    total_size += file_size
+                except Exception as e:
+                    debug(f"Error procesando {filename}: {e}")
+
+        # Ordenar por tamaño (más grandes primero)
+        files_info.sort(key=lambda x: x["size"], reverse=True)
+
+        # Crear botones de categorías (excluyendo la categoría actual)
+        categories = get_available_categories()
+        category_buttons = []
+        row = []
+        for cat_id, cat_name in categories:
+            if cat_id != category:  # No mostrar la categoría actual
+                row.append(Button.inline(cat_name, data=f"managecat:{cat_id}"))
+                if len(row) == 3:
+                    category_buttons.append(row)
+                    row = []
+
+        # Agregar última fila si quedaron botones
+        if row:
+            category_buttons.append(row)
+
+        # Agregar botón de cerrar
+        category_buttons.append([Button.inline("❌ Cerrar", data="close")])
+
+        if not files_info:
+            msg = "📂 **No hay archivos en esta categoría**\n\nPrueba descargando algo primero."
+            sent_msg = await safe_send_message(event.chat_id, msg, buttons=category_buttons, parse_mode=PARSE_MODE, wait_for_result=True)
+            if sent_msg:
+                list_messages[user_id] = [sent_msg]
+            return
+
+        # Limitar a 80 items para no saturar (Telegram tiene límite de 100 botones)
+        # 80 archivos + ~5 botones de categorías + 1 botón cerrar = ~86 botones (margen de seguridad)
+        if len(files_info) > 80:
+            file_count = sum(1 for item in files_info if item["type"] == "file")
+            folder_count = sum(1 for item in files_info if item["type"] == "folder")
+
+            msg = f"⚠️ **Demasiados elementos**\n\n"
+            if folder_count > 0:
+                msg += f"Hay **{file_count} archivos y {folder_count} carpetas** en esta categoría.\n\n"
+            else:
+                msg += f"Hay **{file_count} archivos** en esta categoría.\n\n"
+            msg += f"Para gestionar archivos, filtra por una categoría más específica o usa el comando `/list` para ver todos los archivos."
+
+            sent_msg = await safe_send_message(event.chat_id, msg, buttons=category_buttons, parse_mode=PARSE_MODE, wait_for_result=True)
+            if sent_msg:
+                list_messages[user_id] = [sent_msg]
+            return
+
+        # Crear botones de acción para cada archivo/carpeta
+        file_buttons = []
+        for i, file_info in enumerate(files_info, 1):
+            # Guardar archivo/carpeta en el diccionario para acciones posteriores
+            file_id = f"{i}_{abs(hash(file_info['path'])) % 100000}"
+            pending_file_actions[file_id] = file_info["path"]
+
+            # Truncar nombre si es muy largo
+            name = file_info["name"]
+            button_label = f"{i}. {file_info['icon']} {name[:25]}..." if len(name) > 25 else f"{i}. {file_info['icon']} {name}"
+            file_buttons.append([Button.inline(button_label, data=f"fileact:{file_id}")])
+
+        # Agregar botones de navegación al final
+        # Agregar los botones de categorías (excluyendo la actual)
+        file_buttons.extend(category_buttons)
+
+        # Mensaje con lista de archivos y carpetas
+        total_size_formatted = format_file_size(total_size)
+        file_count = sum(1 for item in files_info if item["type"] == "file")
+        folder_count = sum(1 for item in files_info if item["type"] == "folder")
+
+        msg = f"🔧 **Gestionar archivos**\n\n"
+        if folder_count > 0:
+            msg += f"**Total:** {file_count} archivos, {folder_count} carpetas | **Espacio:** {total_size_formatted}\n\n"
+        else:
+            msg += f"**Total:** {file_count} archivos | **Espacio:** {total_size_formatted}\n\n"
+        msg += f"Selecciona un elemento para ver opciones:"
+
+        sent_msg = await safe_reply(event, msg, buttons=file_buttons, parse_mode=PARSE_MODE, wait_for_result=True)
+
+        # Guardar el mensaje enviado para poder borrarlo después
+        if sent_msg:
+            list_messages[user_id] = [sent_msg]
+
+    except Exception as e:
+        error(f"Error gestionando archivos: {e}")
+        await safe_reply(event, get_text("error_manage_files"), parse_mode=PARSE_MODE)
+
+@bot.on(events.CallbackQuery(pattern=b"fileact:(.+)"))
+async def handle_file_action(event):
+    """Muestra opciones de acción para un archivo específico"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    file_id = event.pattern_match.group(1).decode()
+
+    file_path = pending_file_actions.get(file_id)
+    if not file_path or not os.path.exists(file_path):
+        await safe_edit(event, get_text("error_item_not_found"), parse_mode=PARSE_MODE)
+        return
+
+    filename = os.path.basename(file_path)
+    is_directory = os.path.isdir(file_path)
+
+    if is_directory:
+        # Es una carpeta
+        file_size_bytes = get_directory_size(file_path)
+        file_size = format_file_size(file_size_bytes)
+        icon = "📁"
+        item_type = "carpeta"
+    else:
+        # Es un archivo
+        file_size_bytes = os.path.getsize(file_path)
+        file_size = format_file_size(file_size_bytes)
+        icon = "📄"
+        item_type = "archivo"
+
+    # Crear mensaje con información del elemento
+    msg = f"🔧 **Acciones sobre {item_type}**\n\n"
+    msg += f"{icon} **Nombre:** `{filename}`\n"
+    msg += f"💾 **Tamaño:** {file_size}\n"
+    msg += f"📁 **Ruta:** `{os.path.dirname(file_path)}`\n\n"
+    msg += "¿Qué deseas hacer?"
+
+    # Botones de acción
+    buttons = []
+
+    # Primera fila: Renombrar y Eliminar
+    buttons.append([
+        Button.inline("✏️ Renombrar", data=f"rename:{file_id}"),
+        Button.inline("🗑️ Eliminar", data=f"delete:{file_id}"),
+    ])
+
+    # Segunda fila: Descargar (solo para archivos menores de 2GB)
+    if not is_directory:
+        MAX_TELEGRAM_SIZE = 2 * 1024 * 1024 * 1024  # 2GB en bytes
+        if file_size_bytes < MAX_TELEGRAM_SIZE:
+            buttons.append([Button.inline("📥 Descargar a Telegram", data=f"download:{file_id}")])
+
+    # Última fila: Volver y Cerrar
+    buttons.append([
+        Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
+        Button.inline(get_text("button_close"), data="close")
+    ])
+
+    await safe_edit(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+
+@bot.on(events.CallbackQuery(pattern=b"download:(.+)"))
+async def handle_download_file(event):
+    """Descarga un archivo del servidor y lo envía a Telegram"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    file_id = event.pattern_match.group(1).decode()
+
+    file_path = pending_file_actions.get(file_id)
+    if not file_path or not os.path.exists(file_path):
+        await safe_edit(event, get_text("error_file_not_found"), parse_mode=PARSE_MODE)
+        return
+
+    filename = os.path.basename(file_path)
+    file_size_bytes = os.path.getsize(file_path)
+
+    # Verificar tamaño
+    MAX_TELEGRAM_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
+    if file_size_bytes >= MAX_TELEGRAM_SIZE:
+        await safe_edit(event, get_text("error_file_too_large"), parse_mode=PARSE_MODE)
+        return
+
+    # Crear un NUEVO mensaje para el progreso de envío (no editar el existente)
+    # Esto permite que el usuario abra otros /manage sin borrar el progreso
+    sending_msg = await safe_send_message(
+        event.chat_id,
+        get_text("sending", filename),
+        parse_mode=PARSE_MODE,
+        wait_for_result=True
+    )
+
+    # Si no se pudo crear el mensaje, usar el evento original
+    if sending_msg is None:
+        sending_msg = event
+
+    try:
+        debug(f"[SEND /manage] Preparing file send: {filename}")
+
+        # Determinar si es video para agregar atributos
+        file_ext = os.path.splitext(filename)[1].lower()
+        is_video = file_ext in EXTENSIONS_VIDEO
+        is_audio = file_ext in EXTENSIONS_AUDIO
+
+        debug(f"[SEND /manage] File type: {'video' if is_video else 'audio' if is_audio else 'document'}")
+
+        attributes = [DocumentAttributeFilename(file_name=filename)]
+        thumb_path = None
+        original_file_path = file_path  # Guardar ruta original
+        converted_file_path = None  # Para rastrear si se creó un archivo convertido
+
+        if is_video:
+            debug(f"[SEND /manage] Starting video conversion...")
+            # Convertir el video a formato compatible con Telegram antes de enviarlo
+            converted_file_path = await convert_video_to_telegram_compatible(file_path, sending_msg)
+
+            # Si la conversión fue cancelada (retorna None), salir
+            if converted_file_path is None:
+                debug("[SEND /manage] ❌ Conversion cancelled, aborting send")
+                # El mensaje ya fue actualizado por el handler de cancelación
+                # No necesitamos hacer nada más, solo salir
+                return
+
+            # Si la conversión creó un archivo diferente, usarlo para enviar
+            if converted_file_path != file_path:
+                debug(f"[SEND /manage] Using converted file: {converted_file_path}")
+                file_path = converted_file_path
+                # Actualizar filename para que muestre .mp4 en lugar de la extensión original
+                filename = os.path.splitext(filename)[0] + ".mp4"
+                debug(f"[SEND /manage] Name updated to: {filename}")
+                # Actualizar el atributo de nombre de archivo
+                attributes = [DocumentAttributeFilename(file_name=filename)]
+            else:
+                debug(f"[SEND /manage] Video already compatible, using original")
+
+            # Obtener metadatos del video
+            debug(f"[SEND /manage] Getting video metadata...")
+            duration, width, height = await get_video_metadata(file_path)
+            if duration and width and height:
+                debug(f"[SEND /manage] Metadata: {duration}s, {width}x{height}")
+                from telethon.tl.types import DocumentAttributeVideo
+                attributes.append(DocumentAttributeVideo(
+                    duration=duration,
+                    w=width,
+                    h=height,
+                    supports_streaming=True
+                ))
+            else:
+                debug(f"[SEND /manage] ⚠️ Could not get video metadata")
+
+            # Generar thumbnail
+            debug(f"[SEND /manage] Generating thumbnail...")
+            thumb_path = await generate_video_thumbnail(file_path)
+            if thumb_path:
+                debug(f"[SEND /manage] Thumbnail generated: {thumb_path}")
+            else:
+                debug(f"[SEND /manage] ⚠️ Could not generate thumbnail")
+
+        elif is_audio:
+            debug(f"[SEND /manage] Getting audio metadata...")
+            # Obtener metadatos del audio
+            duration, _, _ = await get_video_metadata(file_path)
+            if duration:
+                debug(f"[SEND /manage] Audio duration: {duration}s")
+                from telethon.tl.types import DocumentAttributeAudio
+                attributes.append(DocumentAttributeAudio(
+                    duration=duration
+                ))
+            else:
+                debug(f"[SEND /manage] ⚠️ Could not get audio duration")
+
+        # Crear callback de progreso para el envío
+        upload_progress = create_upload_progress_callback(sending_msg, filename)
+
+        debug(f"[SEND /manage] Starting send to Telegram...")
+        file_size = os.path.getsize(file_path)
+        debug(f"[SEND /manage] File size: {file_size} bytes")
+
+        # Enviar archivo con progreso
+        # NO usar wait_for_result=True para no bloquear el event loop
+        # Esto permite que el bot siga respondiendo a otros comandos mientras envía
+        await bot.send_file(
+            event.chat_id,
+            file_path,
+            attributes=attributes,
+            thumb=thumb_path if thumb_path else None,
+            supports_streaming=True if is_video else None,
+            progress_callback=upload_progress
+        )
+
+        debug(f"[SEND /manage] ✅ File sent successfully")
+
+        # Limpiar thumbnail temporal
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                debug(f"[SEND /manage] Deleting temporary thumbnail: {thumb_path}")
+                os.remove(thumb_path)
+            except Exception as e:
+                debug(f"[SEND /manage] ⚠️ Error deleting thumbnail: {e}")
+
+        # Limpiar archivo convertido temporal si se generó (diferente del original)
+        if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
+            try:
+                debug(f"[SEND /manage] Deleting temporary converted file: {converted_file_path}")
+                os.remove(converted_file_path)
+                debug(f"[SEND /manage] ✅ Temporary converted file deleted")
+            except Exception as e:
+                debug(f"[SEND /manage] ⚠️ Error deleting temporary converted file: {e}")
+
+        # Eliminar mensaje de progreso
+        if sending_msg and sending_msg != event:
+            await safe_delete(sending_msg)
+
+        # Mensaje de éxito
+        msg = get_text("file_sent_success", filename)
+
+        buttons = [[
+            Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
+            Button.inline(get_text("button_close"), data="close")
+        ]]
+
+        # Si sending_msg es el evento original, editar; si no, enviar nuevo mensaje
+        if sending_msg == event:
+            await safe_edit(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+        else:
+            await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE)
+
+    except Exception as e:
+        error(f"[ENVÍO /manage] ❌ Error enviando archivo {file_path}: {e}")
+
+        # Limpiar thumbnail temporal si se generó
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                debug(f"[SEND /manage] Deleting thumbnail after error: {thumb_path}")
+                os.remove(thumb_path)
+            except Exception as cleanup_error:
+                debug(f"[SEND /manage] ⚠️ Error deleting thumbnail after error: {cleanup_error}")
+
+        # Limpiar archivo convertido temporal si se generó (diferente del original)
+        if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
+            try:
+                debug(f"[SEND /manage] Deleting converted file after error: {converted_file_path}")
+                os.remove(converted_file_path)
+                debug(f"[SEND /manage] ✅ Temporary converted file deleted after error")
+            except Exception as cleanup_error:
+                debug(f"[SEND /manage] ⚠️ Error deleting temporary converted file after error: {cleanup_error}")
+
+        # Eliminar mensaje de progreso si existe
+        if sending_msg and sending_msg != event:
+            try:
+                await safe_delete(sending_msg)
+            except:
+                pass
+
+        # Mostrar error
+        if sending_msg == event:
+            await safe_edit(event, get_text("error_sending_file", str(e)), parse_mode=PARSE_MODE)
+        else:
+            await safe_send_message(event.chat_id, get_text("error_sending_file", str(e)), parse_mode=PARSE_MODE)
+
+@bot.on(events.CallbackQuery(pattern=b"close"))
+async def handle_close(event):
+    """Cierra/elimina el mensaje actual y todos los mensajes relacionados de la lista"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+
+    # Eliminar TODOS los mensajes de la lista (si existen)
+    user_id = event.sender_id
+    if user_id in list_messages:
+        for msg in list_messages[user_id]:
+            try:
+                await safe_delete(msg)
+            except:
+                pass
+        list_messages.pop(user_id, None)
+
+    # También eliminar el mensaje actual
+    await safe_delete(event)
+
+@bot.on(events.CallbackQuery(pattern=b"delete:(.+)"))
+async def handle_delete_file(event):
+    """Confirma y elimina un archivo o carpeta"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    file_id = event.pattern_match.group(1).decode()
+
+    file_path = pending_file_actions.get(file_id)
+    if not file_path or not os.path.exists(file_path):
+        await safe_edit(event, get_text("error_item_not_found_short"), parse_mode=PARSE_MODE)
+        return
+
+    filename = os.path.basename(file_path)
+    is_directory = os.path.isdir(file_path)
+    item_type = "carpeta" if is_directory else "archivo"
+    icon = "📁" if is_directory else "📄"
+
+    # Pedir confirmación
+    msg = f"⚠️ **Confirmar eliminación**\n\n"
+    msg += f"¿Estás seguro de que deseas eliminar esta {item_type}?\n\n"
+    msg += f"{icon} `{filename}`\n\n"
+    if is_directory:
+        msg += f"**Se eliminará la carpeta y todo su contenido.**\n\n"
+    msg += f"**Esta acción no se puede deshacer.**"
+
+    buttons = [
+        [
+            Button.inline("✅ Sí, eliminar", data=f"confirmdelete:{file_id}"),
+            Button.inline("❌ Cancelar", data=f"fileact:{file_id}"),
+        ]
+    ]
+
+    await safe_edit(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+
+@bot.on(events.CallbackQuery(pattern=b"confirmdelete:(.+)"))
+async def handle_confirm_delete(event):
+    """Elimina el archivo o carpeta confirmado"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    file_id = event.pattern_match.group(1).decode()
+
+    file_path = pending_file_actions.get(file_id)
+    if not file_path or not os.path.exists(file_path):
+        await safe_edit(event, get_text("error_item_not_found_short"), parse_mode=PARSE_MODE)
+        return
+
+    filename = os.path.basename(file_path)
+    is_directory = os.path.isdir(file_path)
+    item_type = "carpeta" if is_directory else "archivo"
+    icon = "📁" if is_directory else "📄"
+
+    try:
+        if is_directory:
+            # Eliminar carpeta y todo su contenido
+            shutil.rmtree(file_path)
+        else:
+            # Eliminar archivo
+            os.remove(file_path)
+
+        pending_file_actions.pop(file_id, None)
+
+        msg = f"✅ **{item_type.capitalize()} eliminado**\n\n"
+        msg += f"{icon} `{filename}`\n\n"
+        msg += f"El {item_type} ha sido eliminado del servidor."
+
+        buttons = [[
+            Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
+            Button.inline(get_text("button_close"), data="close")
+        ]]
+        await safe_edit(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+
+        debug(f"{item_type.capitalize()} eliminado por el usuario: {file_path}")
+    except Exception as e:
+        error(f"Error eliminando {item_type} {file_path}: {e}")
+        await safe_edit(event, get_text("error_deleting_item", item_type, str(e)), parse_mode=PARSE_MODE)
+
+@bot.on(events.CallbackQuery(pattern=b"rename:(.+)"))
+async def handle_rename_file(event):
+    """Inicia el proceso de renombrado de archivo o carpeta"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    file_id = event.pattern_match.group(1).decode()
+
+    file_path = pending_file_actions.get(file_id)
+    if not file_path or not os.path.exists(file_path):
+        await safe_edit(event, get_text("error_item_not_found_short"), parse_mode=PARSE_MODE)
+        return
+
+    filename = os.path.basename(file_path)
+    is_directory = os.path.isdir(file_path)
+    item_type = "carpeta" if is_directory else "archivo"
+    icon = "📁" if is_directory else "📄"
+
+    # Guardar en pending_renames para capturar el siguiente mensaje
+    # Usamos una lista para permitir múltiples renombrados simultáneos
+    if event.sender_id not in pending_renames:
+        pending_renames[event.sender_id] = []
+
+    pending_renames[event.sender_id].append({
+        "file_id": file_id,
+        "file_path": file_path,
+        "original_name": filename,
+        "message": event,  # Guardar el mensaje para borrarlo después
+        "is_directory": is_directory
+    })
+
+    msg = f"✏️ **Renombrar {item_type}**\n\n"
+    msg += f"{icon} **Nombre actual:** `{filename}`\n\n"
+    msg += f"**Responde a este mensaje** con el nuevo nombre para el {item_type}"
+    if not is_directory:
+        msg += f" (incluyendo la extensión)"
+    msg += f".\n\n"
+    msg += f"💡 Ejemplo: `{'mi_carpeta_nueva' if is_directory else 'mi_video_nuevo.mp4'}`"
+
+    buttons = [[Button.inline("❌ Cancelar", data=f"fileact:{file_id}")]]
+
+    await safe_edit(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+
+@bot.on(events.NewMessage(func=lambda e: e.sender_id in pending_renames and len(pending_renames.get(e.sender_id, [])) > 0 and not e.raw_text.startswith('/')))
+async def handle_rename_input(event):
+    """Captura el nuevo nombre del archivo o carpeta y lo renombra"""
+    if not is_admin(event.sender_id):
+        return
+
+    # Obtener la lista de renombrados pendientes del usuario
+    user_renames = pending_renames.get(event.sender_id, [])
+    if not user_renames:
+        return
+
+    # Buscar el renombrado que corresponde al mensaje al que está respondiendo
+    rename_data = None
+    rename_index = None
+
+    # Si el usuario está respondiendo a un mensaje, buscar ese mensaje específico
+    if event.reply_to_msg_id:
+        for i, data in enumerate(user_renames):
+            if data.get("message") and data["message"].id == event.reply_to_msg_id:
+                rename_data = data
+                rename_index = i
+                break
+
+    # Si no está respondiendo o no se encontró, tomar el primero (FIFO)
+    if rename_data is None:
+        rename_data = user_renames[0]
+        rename_index = 0
+
+    # Eliminar el renombrado de la lista
+    user_renames.pop(rename_index)
+
+    # Si no quedan más renombrados pendientes, eliminar la entrada del usuario
+    if not user_renames:
+        pending_renames.pop(event.sender_id, None)
+
+    file_path = rename_data["file_path"]
+    file_id = rename_data["file_id"]
+    original_name = rename_data["original_name"]
+    rename_message = rename_data.get("message")  # Mensaje de "Renombrar archivo/carpeta"
+    is_directory = rename_data.get("is_directory", False)
+    item_type = "carpeta" if is_directory else "archivo"
+    icon = "📁" if is_directory else "📄"
+    new_name = event.raw_text.strip()
+
+    # Borrar el mensaje del usuario con el nuevo nombre
+    try:
+        await event.delete()
+    except:
+        pass  # Si no se puede borrar, continuar de todos modos
+
+    # Borrar el mensaje de "Renombrar archivo/carpeta"
+    if rename_message:
+        try:
+            await safe_delete(rename_message)
+        except:
+            pass  # Si no se puede borrar, continuar de todos modos
+
+    # Validar el nuevo nombre
+    if not new_name or '/' in new_name or '\\' in new_name:
+        msg = f"❌ **Nombre inválido**\n\n"
+        msg += f"El nombre no puede contener `/` o `\\` y no puede estar vacío.\n\n"
+        msg += f"Intenta de nuevo."
+        buttons = [[
+            Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
+            Button.inline(get_text("button_close"), data="close")
+        ]]
+        await safe_reply(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+        return
+
+    # Verificar que el elemento aún existe
+    if not os.path.exists(file_path):
+        await safe_reply(event, get_text("error_type_not_found", item_type.capitalize(), item_type), parse_mode=PARSE_MODE)
+        return
+
+    # Construir nueva ruta
+    directory = os.path.dirname(file_path)
+    new_path = os.path.join(directory, new_name)
+
+    # Verificar si ya existe un elemento con ese nombre
+    if os.path.exists(new_path):
+        msg = f"❌ **El {item_type} ya existe**\n\n"
+        msg += f"Ya existe un {item_type} con el nombre `{new_name}` en el mismo directorio.\n\n"
+        msg += f"Elige otro nombre."
+        buttons = [[
+            Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
+            Button.inline(get_text("button_close"), data="close")
+        ]]
+        await safe_reply(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+        return
+
+    try:
+        # Renombrar el archivo o carpeta
+        os.rename(file_path, new_path)
+
+        # Actualizar en pending_file_actions
+        pending_file_actions[file_id] = new_path
+
+        msg = f"✅ **{item_type.capitalize()} renombrado**\n\n"
+        msg += f"{icon} **Nombre anterior:** `{original_name}`\n"
+        msg += f"{icon} **Nombre nuevo:** `{new_name}`\n\n"
+        msg += f"El {item_type} ha sido renombrado exitosamente."
+
+        buttons = [[
+            Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
+            Button.inline(get_text("button_close"), data="close")
+        ]]
+        await safe_reply(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+
+        debug(f"Archivo renombrado: {file_path} → {new_path}")
+    except Exception as e:
+        error(f"Error renombrando archivo {file_path}: {e}")
+        msg = f"❌ **Error al renombrar**\n\n"
+        msg += f"No se pudo renombrar el archivo: {str(e)}"
+        buttons = [[
+            Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
+            Button.inline(get_text("button_close"), data="close")
+        ]]
+        await safe_reply(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(pattern=b"(send|senddelete|nosend):(.+)"))
 async def handle_send_choice(event):
@@ -1119,7 +2855,7 @@ async def handle_send_choice(event):
 
     if not os.path.exists(file_path):
         await safe_edit(event, get_text("error_file_does_not_exist_user"), parse_mode=PARSE_MODE)
-        error(get_text("error_file_does_not_exist", file_path))
+        error(f"The file does not exist. Path: {file_path}")
         return
 
     if action in ("send", "senddelete"):
@@ -1140,58 +2876,155 @@ async def handle_send_choice(event):
                     wait_for_result=False
                 )
 
+            debug(f"[SEND BUTTON] Preparing file send: {file_path}")
+
             # Detectar si es un video y obtener metadatos
             is_video = file_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'))
-            attributes = None
+            thumb_path = None
+            original_file_path = file_path  # Guardar ruta original
+            converted_file_path = None  # Para rastrear si se creó un archivo convertido
+
+            debug(f"[SEND BUTTON] File type: {'video' if is_video else 'document'}")
+
+            # Inicializar attributes con el nombre del archivo original
+            original_filename = os.path.basename(file_path)
+            display_filename = original_filename  # Por defecto, usar el nombre original
+            attributes = [DocumentAttributeFilename(file_name=original_filename)]
 
             if is_video:
+                debug(f"[SEND BUTTON] Starting video conversion...")
+                # Convertir el video a formato compatible con Telegram antes de enviarlo
+                converted_file_path = await convert_video_to_telegram_compatible(file_path, sending_msg)
+
+                # Si la conversión fue cancelada (retorna None), salir
+                if converted_file_path is None:
+                    debug("[SEND BUTTON] ❌ Conversion cancelled, aborting send")
+                    if sending_msg:
+                        await safe_delete(sending_msg)
+                    return
+
+                # Si la conversión creó un archivo diferente, usarlo para enviar
+                if converted_file_path != file_path:
+                    debug(f"[SEND BUTTON] Using converted file: {converted_file_path}")
+                    file_path = converted_file_path
+                    # Actualizar el nombre del archivo a .mp4 (sin _telegram)
+                    display_filename = os.path.splitext(original_filename)[0] + ".mp4"
+                    debug(f"[SEND BUTTON] Name updated to: {display_filename}")
+                    attributes = [DocumentAttributeFilename(file_name=display_filename)]
+                else:
+                    debug(f"[SEND BUTTON] Video already compatible, using original")
+
+                debug(f"[SEND BUTTON] Getting video metadata...")
                 duration, width, height = await get_video_metadata(file_path)
                 if duration and width and height:
+                    debug(f"[SEND BUTTON] Metadata: {duration}s, {width}x{height}")
                     from telethon.tl.types import DocumentAttributeVideo
-                    attributes = [DocumentAttributeVideo(
+                    attributes.append(DocumentAttributeVideo(
                         duration=duration,
                         w=width,
                         h=height,
                         supports_streaming=True
-                    )]
-                    debug(get_text("debug_video_metadata", duration, width, height))
+                    ))
+                else:
+                    debug(f"[SEND BUTTON] ⚠️ Could not get video metadata")
+
+                # Generar thumbnail del video
+                debug(f"[SEND BUTTON] Generating thumbnail...")
+                thumb_path = await generate_video_thumbnail(file_path)
+                if thumb_path:
+                    debug(f"[SEND BUTTON] Thumbnail generated: {thumb_path}")
+                else:
+                    debug(f"[SEND BUTTON] ⚠️ Could not generate thumbnail")
 
             # Crear callback de progreso para el envío
-            upload_progress = create_upload_progress_callback(sending_msg, os.path.basename(file_path))
+            upload_progress = create_upload_progress_callback(sending_msg, display_filename)
 
-            message = await safe_send_file(
+            debug(f"[SEND BUTTON] Starting send to Telegram...")
+            file_size = os.path.getsize(file_path)
+            debug(f"[SEND BUTTON] File size: {file_size} bytes")
+
+            # NO usar wait_for_result=True para no bloquear el event loop
+            # Esto permite que el bot siga respondiendo a otros comandos mientras envía
+            message = await bot.send_file(
                 event.chat_id,
                 file_path,
-                caption=os.path.basename(file_path),
                 attributes=attributes,
+                thumb=thumb_path if thumb_path else None,
                 supports_streaming=True if is_video else None,
-                progress_callback=upload_progress,
-                wait_for_result=True
+                progress_callback=upload_progress
             )
-            debug(get_text("debug_sent", file_path))
+
+            debug(f"[SEND BUTTON] ✅ File sent successfully")
+
+            # Limpiar thumbnail temporal si se generó
+            if thumb_path and os.path.exists(thumb_path):
+                try:
+                    debug(f"[SEND BUTTON] Deleting temporary thumbnail: {thumb_path}")
+                    os.remove(thumb_path)
+                except Exception as e:
+                    debug(f"[SEND BUTTON] ⚠️ Error deleting temporary thumbnail: {e}")
+
+            # Limpiar archivo convertido temporal si se generó (diferente del original)
+            if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
+                try:
+                    debug(f"[SEND BUTTON] Deleting temporary converted file: {converted_file_path}")
+                    os.remove(converted_file_path)
+                    debug(f"[SEND BUTTON] ✅ Temporary converted file deleted")
+                except Exception as e:
+                    debug(f"[SEND BUTTON] ⚠️ Error deleting temporary converted file: {e}")
+
+            debug(f"[SEND BUTTON] ✅ File sent to Telegram: {original_file_path}")
             if sending_msg:
                 await safe_delete(sending_msg)
 
             if action == "senddelete":
-                os.remove(file_path)
-                debug(get_text("debug_sent_and_delete", file_path))
+                # Eliminar el archivo ORIGINAL, no el convertido
+                debug(f"[SEND BUTTON] Deleting original file from server: {original_file_path}")
+                os.remove(original_file_path)
+                debug(f"[SEND BUTTON] ✅ File sent to Telegram and deleted from server: {original_file_path}")
                 await safe_respond(event, get_text("deleted_from_server"), reply_to=message.id, parse_mode=PARSE_MODE)
         except Exception as e:
+            error(f"[ENVÍO BOTÓN] ❌ Error enviando archivo {file_path}: {e}")
+
+            # Limpiar thumbnail temporal si se generó
+            if thumb_path and os.path.exists(thumb_path):
+                try:
+                    debug(f"[SEND BUTTON] Deleting thumbnail after error: {thumb_path}")
+                    os.remove(thumb_path)
+                except Exception as cleanup_error:
+                    debug(f"[SEND BUTTON] ⚠️ Error deleting thumbnail after error: {cleanup_error}")
+
+            # Limpiar archivo convertido temporal si se generó (diferente del original)
+            if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
+                try:
+                    debug(f"[SEND BUTTON] Deleting converted file after error: {converted_file_path}")
+                    os.remove(converted_file_path)
+                    debug(f"[SEND BUTTON] ✅ Temporary converted file deleted after error")
+                except Exception as cleanup_error:
+                    debug(f"[SEND BUTTON] ⚠️ Error deleting temporary converted file after error: {cleanup_error}")
+
+            # Eliminar mensaje de progreso si existe
+            if sending_msg:
+                try:
+                    await safe_delete(sending_msg)
+                except Exception as delete_error:
+                    debug(f"[SEND BUTTON] ⚠️ Error deleting progress message: {delete_error}")
+
             await safe_reply(event, get_text("error_sending_the_file_user"), parse_mode=PARSE_MODE)
-            debug(get_text("error_sending_the_file", e))
+            error(f"[SEND BUTTON] Error sending file: {e}")
     else:
         await safe_delete(event)
 
 async def handle_cancel(status_message):
     if status_message:
         await safe_edit(status_message, get_text("cancelled"), buttons=None, parse_mode=PARSE_MODE)
-    debug(get_text("debug_url_download_cancelled"))
+    debug("URL download cancelled")
     cleanup_partials()
 
 def cleanup_partials():
     pattern = os.path.join(DOWNLOAD_PATHS["url_video"], "*.part*")
     for f in glob.glob(pattern):
-        debug(get_text("debug_url_cleaning_partial_files", f))
+        debug(f"Cleaning partial files from URL download: {f}")
         os.remove(f)
 
 async def send_startup_message():
@@ -1200,11 +3033,13 @@ async def send_startup_message():
         try:
             await safe_send_message(int(admin), get_text("initial_message", VERSION), parse_mode=PARSE_MODE)
         except Exception as e:
-            error(get_text("error_sending_initial_message", e))
+            error(f"Error sending initial message: {e}")
 
 async def set_commands():
     commands = [
         BotCommand("start", get_text("menu_start")),
+        BotCommand("list", get_text("menu_list")),
+        BotCommand("manage", get_text("menu_manage")),
         BotCommand("version", get_text("menu_version")),
         BotCommand("donate", get_text("menu_donate")),
         BotCommand("donors", get_text("menu_donors")),
@@ -1219,7 +3054,7 @@ async def check_admin_and_warn(event):
     if not is_admin(event.sender_id):
         sender = await event.get_sender()
         username = sender.username if sender else None
-        warning(get_text("warning_not_admin", event.sender_id, username))
+        warning(f"User {event.sender_id} (@{username}) is not an admin and tried to use the bot")
         return True
     return False
 

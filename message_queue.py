@@ -1,6 +1,5 @@
 import asyncio
 from debug import debug, error, warning
-from translations import get_text
 
 class TelegramMessageQueue:
     """
@@ -23,13 +22,13 @@ class TelegramMessageQueue:
         self.max_retries = max_retries
         self.running = True
         self.worker_task = None
-        debug(get_text("debug_message_queue_started", str(delay_between_messages), str(max_retries)))
+        debug(f"Message queue initialized (delay: {delay_between_messages}s, max_retries: {max_retries})")
 
     async def start(self):
         """Inicia el worker que procesa la cola"""
         if self.worker_task is None or self.worker_task.done():
             self.worker_task = asyncio.create_task(self._process_queue())
-            debug("Cola de mensajes iniciada")
+            debug("Message queue worker started")
 
     async def _process_queue(self):
         """Procesa la cola de mensajes de forma continua"""
@@ -48,7 +47,7 @@ class TelegramMessageQueue:
                 # Timeout normal, continuar esperando
                 continue
             except Exception as e:
-                error(f"Error en cola de mensajes: {str(e)}")
+                error(f"Error in message queue: {str(e)}")
 
     async def _execute_message(self, message_data):
         """Ejecuta un mensaje con reintentos y backoff exponencial"""
@@ -78,7 +77,7 @@ class TelegramMessageQueue:
                             wait_time = (2 ** attempt) * 2
 
                         # Esperar el tiempo que Telegram solicita
-                        warning(f"FloodWaitError detectado. Esperando {wait_time}s ({wait_time // 60} minutos) antes de reintentar...")
+                        warning(f"FloodWaitError detected. Waiting {wait_time}s ({wait_time // 60} minutes) before retrying...")
                         await asyncio.sleep(wait_time)
                         continue
                 
@@ -86,19 +85,19 @@ class TelegramMessageQueue:
                 elif "429" in error_msg or "Too Many Requests" in error_msg:
                     if attempt < self.max_retries - 1:
                         wait_time = (2 ** attempt) * 2  # Backoff exponencial: 2, 4, 8, 16 segundos
-                        warning(f"Rate limit detectado (429). Esperando {wait_time}s antes de reintentar...")
+                        warning(f"Rate limit detected (429). Waiting {wait_time}s before retrying...")
                         await asyncio.sleep(wait_time)
                         continue
                 
                 # Otros errores: reintento con delay lineal
                 elif attempt < self.max_retries - 1:
                     wait_time = 1 * (attempt + 1)
-                    debug(f"Reintento {attempt + 1}/{self.max_retries} en {wait_time}s debido a: {error_msg}")
+                    debug(f"Retry {attempt + 1}/{self.max_retries} in {wait_time}s due to: {error_msg}")
                     await asyncio.sleep(wait_time)
                     continue
                 
                 # Último intento fallido
-                error(f"Error final después de {self.max_retries} intentos: {error_msg}")
+                error(f"Final error after {self.max_retries} attempts: {error_msg}")
                 if result_future and not result_future.done():
                     result_future.set_exception(e)
                 break
@@ -129,7 +128,7 @@ class TelegramMessageQueue:
             try:
                 return await asyncio.wait_for(result_future, timeout=300)  # Esperar máximo 5 minutos
             except asyncio.TimeoutError:
-                error("Timeout esperando resultado del mensaje en la cola")
+                error("Timeout waiting for message result in queue")
                 return None
         
         return None
@@ -140,5 +139,5 @@ class TelegramMessageQueue:
         await self.queue.put(None)  # Señal de parada
         if self.worker_task:
             await self.worker_task
-        debug("Cola de mensajes detenida")
+        debug("Message queue stopped")
 

@@ -41,8 +41,8 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | FILTER_VIDEO                   | ❌           | Especifica si los archivos de video deben almacenarse en una carpeta separada `/video` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_TORRENT                 | ❌           | Especifica si los archivos de torrent deben almacenarse en una carpeta separada `/torrent` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_EBOOK                   | ❌           | Especifica si los archivos de libros electrónicos deben almacenarse en una carpeta separada `/ebook` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
-| FILTER_URL_VIDEO               | ❌           | Especifica si los archivos de vídeo descargados desde URLs deben almacenarse en una carpeta separada `/url_video` en lugar de donde van los vídeos. 0 = no, 1 = sí (por defecto 0). **Nota:** Mantiene retrocompatibilidad con `FILTER_YOUTUBE_VIDEO`    |
-| FILTER_URL_AUDIO               | ❌           | Especifica si los archivos de audio descargados desde URLs deben almacenarse en una carpeta separada `/url_audio` en lugar de donde van los audios. 0 = no, 1 = sí (por defecto 0). **Nota:** Mantiene retrocompatibilidad con `FILTER_YOUTUBE_AUDIO`    |
+| FILTER_URL_VIDEO               | ❌           | Especifica si los archivos de vídeo descargados desde URLs deben almacenarse en una carpeta separada `/url_video` en lugar de donde van los vídeos. 0 = no, 1 = sí (por defecto 0)    |
+| FILTER_URL_AUDIO               | ❌           | Especifica si los archivos de audio descargados desde URLs deben almacenarse en una carpeta separada `/url_audio` en lugar de donde van los audios. 0 = no, 1 = sí (por defecto 0)    |
 | AUTO_DOWNLOAD_FORMAT           | ❌           | Descarga automática de URLs sin preguntar. Valores: `ASK` (preguntar, por defecto), `VIDEO` (descargar siempre como video), `AUDIO` (descargar siempre como audio)    |
 
 ### Ejemplo de Docker-Compose para su ejecución normal

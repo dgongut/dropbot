@@ -55,11 +55,10 @@ FILTER_EBOOK = bool(int(os.environ.get("FILTER_EBOOK", 0)))
 PARALLEL_DOWNLOADS = int(os.environ.get("PARALLEL_DOWNLOADS", 2))
 
 # Rutas y filtros para descargas desde URLs (YouTube, Instagram, TikTok, etc.)
-# Mantiene retrocompatibilidad con nombres antiguos DOWNLOAD_YOUTUBE_* y FILTER_YOUTUBE_*
-DOWNLOAD_URL_VIDEO = os.environ.get("DOWNLOAD_URL_VIDEO", os.environ.get("DOWNLOAD_YOUTUBE_VIDEO", "/url_video"))
-DOWNLOAD_URL_AUDIO = os.environ.get("DOWNLOAD_URL_AUDIO", os.environ.get("DOWNLOAD_YOUTUBE_AUDIO", "/url_audio"))
-FILTER_URL_VIDEO = bool(int(os.environ.get("FILTER_URL_VIDEO", os.environ.get("FILTER_YOUTUBE_VIDEO", 0))))
-FILTER_URL_AUDIO = bool(int(os.environ.get("FILTER_URL_AUDIO", os.environ.get("FILTER_YOUTUBE_AUDIO", 0))))
+DOWNLOAD_URL_VIDEO = os.environ.get("DOWNLOAD_URL_VIDEO", "/url_video")
+DOWNLOAD_URL_AUDIO = os.environ.get("DOWNLOAD_URL_AUDIO", "/url_audio")
+FILTER_URL_VIDEO = bool(int(os.environ.get("FILTER_URL_VIDEO", 0)))
+FILTER_URL_AUDIO = bool(int(os.environ.get("FILTER_URL_AUDIO", 0)))
 
 # Descarga automática de URLs sin preguntar
 # Valores posibles: "ASK" (preguntar), "VIDEO" (descargar video automáticamente), "AUDIO" (descargar audio automáticamente)

@@ -33,9 +33,9 @@ RUN apt-get update && \
     mv /tmp/dropbot-${VERSION}/* /app/ && \
     # Instalar dependencias de Python antes de limpiar pip
     pip3 install --no-cache-dir -r /app/requirements.txt && \
-    # Limpiar archivos temporales y cache (mantener wget para descargas directas)
+    # Limpiar archivos temporales y cache (mantener wget y ca-certificates para descargas HTTPS)
     rm -rf /tmp/* && \
-    apt-get remove -y ca-certificates python3-pip && \
+    apt-get remove -y python3-pip && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*

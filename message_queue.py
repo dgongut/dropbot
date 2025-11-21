@@ -22,13 +22,13 @@ class TelegramMessageQueue:
         self.max_retries = max_retries
         self.running = True
         self.worker_task = None
-        debug(f"Message queue initialized (delay: {delay_between_messages}s, max_retries: {max_retries})")
+        debug(f"[STARTUP] Message queue initialized (delay: {delay_between_messages}s, max_retries: {max_retries})")
 
     async def start(self):
         """Inicia el worker que procesa la cola"""
         if self.worker_task is None or self.worker_task.done():
             self.worker_task = asyncio.create_task(self._process_queue())
-            debug("Message queue worker started")
+            debug("[STARTUP] Message queue worker started")
 
     async def _process_queue(self):
         """Procesa la cola de mensajes de forma continua"""

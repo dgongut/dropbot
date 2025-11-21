@@ -1,10 +1,40 @@
-FROM alpine:3.22.2
+# Dockerfile optimizado para desarrollo/testing local
+FROM ubuntu:22.04
+
+# Metadata
+LABEL maintainer="dgongut"
+LABEL description="DropBot - Telegram file management bot (Local Development)"
+
+# Evitar prompts interactivos durante la instalación
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
+
+# Instalar dependencias del sistema
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        tzdata \
+        ffmpeg \
+        unrar \
+        wget && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# Copiar código fuente (esto se hace después de instalar deps para aprovechar cache)
 COPY . .
-RUN apk add --no-cache python3 py3-pip tzdata ffmpeg
-RUN export PIP_BREAK_SYSTEM_PACKAGES=1; pip3 install --no-cache-dir -Ur /app/requirements.txt
+
+# Instalar dependencias de Python
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
 
 VOLUME /downloads
+
+# Healthcheck (verificar que el proceso Python esté corriendo)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD pgrep -f "python3 dropbot.py" || exit 1
 
 ENTRYPOINT ["python3", "dropbot.py"]

@@ -1,21 +1,48 @@
-FROM alpine:3.22.2
+# Dockerfile optimizado para producción
+FROM ubuntu:22.04
 
-ARG VERSION=3.0.0
+# Build argument
+ARG VERSION=3.1.0
+
+# Metadata
+LABEL maintainer="dgongut"
+LABEL description="DropBot - Telegram file management bot"
+LABEL version="${VERSION}"
+
+# Evitar prompts interactivos durante la instalación
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
-RUN wget https://github.com/dgongut/dropbot/archive/refs/tags/v${VERSION}.tar.gz -P /tmp
-RUN tar -xf /tmp/v${VERSION}.tar.gz
-RUN mv dropbot-${VERSION}/dropbot.py /app
-RUN mv dropbot-${VERSION}/config.py /app
-RUN mv dropbot-${VERSION}/translations.py /app
-RUN mv dropbot-${VERSION}/basic.py /app
-RUN mv dropbot-${VERSION}/debug.py /app
-RUN mv dropbot-${VERSION}/message_queue.py /app
-RUN mv dropbot-${VERSION}/locale /app
-RUN mv dropbot-${VERSION}/requirements.txt /app
-RUN rm /tmp/v${VERSION}.tar.gz
-RUN rm -rf dropbot-${VERSION}/
-RUN apk add --no-cache python3 py3-pip tzdata ffmpeg
-RUN export PIP_BREAK_SYSTEM_PACKAGES=1; pip3 install --no-cache-dir -Ur /app/requirements.txt
+
+# Instalar dependencias del sistema y descargar código en una sola capa
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        wget \
+        ca-certificates \
+        python3 \
+        python3-pip \
+        tzdata \
+        ffmpeg \
+        unrar && \
+    # Descargar y extraer código
+    wget -q https://github.com/dgongut/dropbot/archive/refs/tags/v${VERSION}.tar.gz -O /tmp/dropbot.tar.gz && \
+    tar -xzf /tmp/dropbot.tar.gz -C /tmp && \
+    mv /tmp/dropbot-${VERSION}/* /app/ && \
+    # Limpiar archivos temporales y cache (mantener wget para descargas directas)
+    rm -rf /tmp/* && \
+    apt-get remove -y ca-certificates && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# Instalar dependencias de Python (separado para aprovechar cache)
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
+
+# Healthcheck (verificar que el proceso Python esté corriendo)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD pgrep -f "python3 dropbot.py" || exit 1
 
 ENTRYPOINT ["python3", "dropbot.py"]

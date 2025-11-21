@@ -1,6 +1,17 @@
 import os
 import re
+import sys
+import asyncio
+import zipfile
+import tarfile
+import rarfile
+import shutil
+import glob
+import requests
+import time
+import json
 import warnings
+from urllib.parse import urlparse, unquote
 from telethon import TelegramClient, events, functions, types, Button
 from telethon.tl.types import (
     BotCommand, Document, Photo,
@@ -11,40 +22,31 @@ from translations import get_text, load_locale, PARSE_MODE
 from debug import *
 from basic import *
 from message_queue import TelegramMessageQueue
-import sys
-import asyncio
-import zipfile
-import tarfile
-import rarfile
-import shutil
-import glob
-import requests
-import time
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
 if LANGUAGE.lower() not in ("es", "en"):
-    error("LANGUAGE only can be ES/EN")
+    error("[CONFIG] LANGUAGE only can be ES/EN")
     sys.exit(1)
 
 load_locale(LANGUAGE.lower())
 
 if DEFAULT_EMPTY_STR == TELEGRAM_TOKEN:
-    error("Bot token needs to be configured with the TELEGRAM_TOKEN variable")
+    error("[CONFIG] Bot token needs to be configured with the TELEGRAM_TOKEN variable")
     sys.exit(1)
 
 if DEFAULT_EMPTY_STR == TELEGRAM_ADMIN:
-    error("The chatId of the user who will interact with the bot needs to be configured with the TELEGRAM_ADMIN variable")
+    error("[CONFIG] The chatId of the user who will interact with the bot needs to be configured with the TELEGRAM_ADMIN variable")
     sys.exit(1)
 
 if str(ANONYMOUS_USER_ID) in str(TELEGRAM_ADMIN).split(','):
-	error("You cannot be anonymous to control the bot. In the TELEGRAM_ADMIN variable, you must put your user id.")
+	error("[CONFIG] You cannot be anonymous to control the bot. In the TELEGRAM_ADMIN variable, you must put your user id.")
 	sys.exit(1)
 
 if PARALLEL_DOWNLOADS < 1:
-    error("The minimum number of parallel downloads is 1. An incorrect number has been configured in the PARALLEL_DOWNLOADS variable")
+    error("[CONFIG] The minimum number of parallel downloads is 1. An incorrect number has been configured in the PARALLEL_DOWNLOADS variable")
     sys.exit(1)
 
 DOWNLOAD_PATHS = {
@@ -75,25 +77,40 @@ try:
     os.makedirs(TEMP_DIR, exist_ok=True)
     debug(f"[STARTUP] ✅ Temporary directory cleaned and recreated")
 except Exception as e:
-    debug(f"[STARTUP] Could not clean temporary directory: {e}")
+    warning(f"[STARTUP] Could not clean temporary directory: {e}")
     # Si falla, al menos intentar crear la carpeta
     os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Configurar rarfile para usar unrar
+try:
+    # Intentar configurar la herramienta de extracción RAR
+    # unrar está disponible en Ubuntu y tiene soporte completo para RAR/RAR5
+    rarfile.UNRAR_TOOL = "unrar"
+    rarfile.tool_setup()
+    debug("[STARTUP] RAR extraction tool (unrar) configured successfully")
+except rarfile.RarCannotExec:
+    warning("[STARTUP] unrar tool not found. RAR extraction will not work. Install unrar package.")
+except Exception as e:
+    warning(f"[STARTUP] Error configuring RAR tool: {e}")
 
 bot = TelegramClient("dropbot", TELEGRAM_API_ID, TELEGRAM_API_HASH).start(bot_token=TELEGRAM_TOKEN)
 active_tasks = {}
 cancelled_conversions = set()  # Para rastrear conversiones canceladas por el usuario
+send_original_requests = set()  # Para rastrear solicitudes de envío de archivo original sin conversión
 pending_file_actions = {}  # Para almacenar archivos pendientes de renombrar/eliminar
 pending_renames = {}  # Para almacenar archivos esperando nuevo nombre (lista por usuario)
 list_messages = {}  # Para rastrear mensajes de /list y /manage que deben borrarse juntos: {user_id: [msg1, msg2, ...]}
 
 # Intervalo de actualización de progreso adaptativo
 # Evita anti-spam cuando hay múltiples descargas paralelas
-# Telegram permite ~20 mensajes/minuto (1 cada 3s), usamos 2s para estar seguros
-# Fórmula: max(2, PARALLEL_DOWNLOADS * 0.4) segundos
-# Ejemplos: 2 descargas = 2s, 5 descargas = 2s, 10 descargas = 4s
-PROGRESS_UPDATE_INTERVAL = max(2, PARALLEL_DOWNLOADS * 0.4)
+# Telegram permite ~20 mensajes/minuto en grupos, pero con ediciones es más restrictivo
+# Usamos un intervalo muy conservador para evitar FloodWaitError
+# Fórmula: max(10, PARALLEL_DOWNLOADS * 1.5) segundos
+# Ejemplos: 1 descarga = 10s (6 ediciones/min), 5 descargas = 10s (30 ediciones/min), 10 descargas = 15s (40 ediciones/min)
+PROGRESS_UPDATE_INTERVAL = max(10, PARALLEL_DOWNLOADS * 1.5)
 pending_files = {}
 pending_urls = {}
+playlist_downloads = {}  # Para rastrear descargas de playlist en progreso: {event_id: {"is_full_playlist": bool, "final_output_dir": str, "downloaded_files": []}}
 download_semaphore = asyncio.Semaphore(PARALLEL_DOWNLOADS)
 
 # Inicializar cola de mensajes para evitar FloodWaitError
@@ -158,7 +175,7 @@ async def get_array_donors_online():
             error(f"Error getting donors list: error code [{response.status_code}]")
             return []
     except Exception as e:
-        error(f"Error getting donors list: {str(e)}")
+        error(f"[DONORS] Error getting donors list: {str(e)}")
         return []
 
 async def print_donors(chat_id):
@@ -227,16 +244,7 @@ async def handle_list_files(event):
                         # Es un archivo
                         file_size = os.path.getsize(file_path)
                         file_ext = os.path.splitext(filename)[1].lower()
-
-                        # Determinar icono según extensión
-                        if file_ext in EXTENSIONS_VIDEO:
-                            icon = "🎥"
-                        elif file_ext in EXTENSIONS_AUDIO:
-                            icon = "🎵"
-                        elif file_ext in EXTENSIONS_IMAGE:
-                            icon = "🖼️"
-                        else:
-                            icon = "📄"
+                        icon = get_file_icon(file_ext)
                         item_type = "file"
 
                     files_info.append({
@@ -249,10 +257,10 @@ async def handle_list_files(event):
                     })
                     total_size += file_size
                 except Exception as e:
-                    debug(f"Error procesando {filename}: {e}")
+                    warning(f"[FILE_LIST] Error processing {filename}: {e}")
 
-        # Ordenar por tamaño (más grandes primero)
-        files_info.sort(key=lambda x: x["size"], reverse=True)
+        # Ordenar alfabéticamente por nombre
+        files_info.sort(key=lambda x: x["name"].lower())
 
         if not files_info:
             await safe_reply(event, get_text("list_empty"), parse_mode=PARSE_MODE)
@@ -270,9 +278,9 @@ async def handle_list_files(event):
         folder_count = sum(1 for item in files_info if item["type"] == "folder")
 
         if folder_count > 0:
-            footer = f"\n\n**Total:** {file_count} archivos, {folder_count} carpetas | **Espacio:** {total_size_formatted}"
+            footer = f"\n\n{get_text('total_files_folders_space', file_count, folder_count, total_size_formatted)}"
         else:
-            footer = f"\n\n**Total:** {file_count} archivos | **Espacio:** {total_size_formatted}"
+            footer = f"\n\n{get_text('total_files_space', file_count, total_size_formatted)}"
 
         messages = []
         current_message = ""
@@ -324,7 +332,7 @@ async def handle_list_files(event):
             await safe_reply(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
 
     except Exception as e:
-        error(f"Error listando archivos: {e}")
+        error(f"[FILE_LIST] Error listing files: {e}")
         await safe_reply(event, get_text("error_list_files"), parse_mode=PARSE_MODE)
 
 def get_directory_size(directory):
@@ -337,7 +345,7 @@ def get_directory_size(directory):
                 if os.path.exists(filepath):
                     total_size += os.path.getsize(filepath)
     except Exception as e:
-        debug(f"Error calculando tamaño de carpeta {directory}: {e}")
+        warning(f"[FILE_SIZE] Error calculating folder size {directory}: {e}")
     return total_size
 
 def get_unique_filename(directory, filename):
@@ -362,6 +370,23 @@ def get_unique_filename(directory, filename):
         if not os.path.exists(new_path):
             return new_filename
         counter += 1
+
+def get_file_icon(file_extension):
+    """Determina el icono según la extensión del archivo usando las constantes de config.py"""
+    if file_extension in EXTENSIONS_TORRENT:
+        return TOR_ICO
+    elif file_extension in EXTENSIONS_EBOOK:
+        return BOO_ICO
+    elif file_extension in EXTENSIONS_VIDEO:
+        return VID_ICO
+    elif file_extension in EXTENSIONS_AUDIO:
+        return AUD_ICO
+    elif file_extension in EXTENSIONS_IMAGE:
+        return IMG_ICO
+    elif file_extension in EXTENSIONS_COMPRESSED:
+        return ZIP_ICO
+    else:
+        return DEF_ICO
 
 def get_download_path(event):
     message = event.message
@@ -452,8 +477,8 @@ def create_upload_progress_callback(status_message, file_name):
                     eta = "N/A"
 
                 # Crear barra de progreso visual
-                bar_length = 10
-                filled = int(percent / 10)
+                bar_length = 20
+                filled = int(bar_length * percent / 100)
                 bar = "█" * filled + "░" * (bar_length - filled)
 
                 message = get_text("uploading_progress", bar, f"{percent:.1f}", f"{size_current}/{size_total}", speed, eta, file_name)
@@ -469,10 +494,10 @@ def create_upload_progress_callback(status_message, file_name):
                         message_deleted[0] = True
                     else:
                         # Otros errores (FloodWaitError, mensaje no modificado, etc.) - solo log
-                        debug(f"Error editando mensaje de progreso: {edit_error}")
+                        warning(f"[UPLOAD] Error editing progress message: {edit_error}")
         except Exception as e:
             # Ignorar errores de actualización (FloodWaitError, etc.)
-            debug(f"Error actualizando progreso de envío: {e}")
+            warning(f"[UPLOAD] Error updating upload progress: {e}")
 
     return progress_callback
 
@@ -536,8 +561,8 @@ def create_progress_callback(status_message, event, file_name):
                     eta = "N/A"
 
                 # Crear barra de progreso visual
-                bar_length = 10
-                filled = int(percent / 10)
+                bar_length = 20
+                filled = int(bar_length * percent / 100)
                 bar = "█" * filled + "░" * (bar_length - filled)
 
                 message = get_text("downloading_progress", bar, f"{percent:.1f}", f"{size_current}/{size_total}", speed, eta, file_name)
@@ -557,10 +582,10 @@ def create_progress_callback(status_message, event, file_name):
                         message_deleted[0] = True
                     else:
                         # Otros errores (FloodWaitError, mensaje no modificado, etc.) - solo log
-                        debug(f"Error editando mensaje de progreso: {edit_error}")
+                        warning(f"[DOWNLOAD] Error editing progress message: {edit_error}")
         except Exception as e:
             # Ignorar errores de actualización (FloodWaitError, etc.)
-            debug(f"Error actualizando progreso de Telegram: {e}")
+            warning(f"[DOWNLOAD] Error updating Telegram progress: {e}")
 
     return progress_callback
 
@@ -570,13 +595,13 @@ async def download_media(event):
     if not media:
         return
     file_name = get_file_name(media)
-    debug(f"File {file_name} - Received, starting download")
+    debug(f"[DOWNLOAD] File {file_name} - Received, starting download")
     download_path, ico = get_download_path(event)
 
     # Generar nombre único si el archivo ya existe
     unique_file_name = get_unique_filename(download_path, file_name)
     if unique_file_name != file_name:
-        debug(f"Archivo duplicado detectado. Renombrando: {file_name} -> {unique_file_name}")
+        debug(f"[DOWNLOAD] Duplicate file detected. Renaming: {file_name} -> {unique_file_name}")
 
     # Descargar primero a /tmp para que no aparezca en /list mientras se descarga
     timestamp_ms = int(time.time() * 1000)
@@ -596,7 +621,7 @@ async def download_media(event):
 
     # Si no se pudo crear el mensaje de estado (timeout en cola), continuar sin él
     if status_message is None:
-        warning(f"No se pudo crear mensaje de estado para {file_name} - continuando sin actualización de progreso")
+        warning(f"[DOWNLOAD] Could not create status message for {file_name} - continuing without progress updates")
         progress_callback = None
     else:
         # Crear callback de progreso
@@ -619,27 +644,7 @@ async def download_media(event):
 
             # Mostrar información detallada del archivo descargado (sin botones de acción)
             await handle_success(event, final_file_path, show_action_buttons=False)
-            debug(f"File {file_name} - Downloaded")
-
-            if is_compressed_file(final_file_path):
-                if is_split_zip(file_name):
-                    warning(f"File {file_name} - ZIP split extraction not supported at this moment")
-                else:
-                    base_name = os.path.splitext(final_file_path)[0]
-                    if rarfile.is_rarfile(final_file_path):
-                        base_name = clean_rar_base_name(file_name)
-                    extracted_path = os.path.join(download_path, os.path.basename(base_name))
-                    os.makedirs(extracted_path, exist_ok=True)
-
-                    extract_result = extract_file(final_file_path, extracted_path)
-                    if extract_result == True:
-                        buttons = [Button.inline(get_text("button_keep"), data=f"keep:{final_file_path}"), Button.inline(get_text("button_delete"), data=f"del:{final_file_path}")]
-                        await safe_reply(event, get_text("extracted_pending", extracted_path), buttons=buttons, parse_mode=PARSE_MODE)
-                        debug(f"File {file_name} - Extracted")
-                    elif extract_result == False:
-                        await safe_reply(event, get_text("error_file_extracted_user", file_name), parse_mode=PARSE_MODE)
-                    elif extract_result == "missing_parts":
-                        await safe_reply(event, get_text("missing_rar_parts"), parse_mode=PARSE_MODE)
+            debug(f"[DOWNLOAD] File {file_name} - Downloaded")
 
             # Salir del bucle si la descarga fue exitosa
             break
@@ -655,7 +660,7 @@ async def download_media(event):
             if os.path.exists(final_file_path):
                 os.remove(final_file_path)
                 debug(f"[DOWNLOAD] Final file deleted after cancellation: {final_file_path}")
-            debug(f"File {file_name} - Cancelled")
+            debug(f"[DOWNLOAD] File {file_name} - Cancelled")
             raise
 
         except Exception as e:
@@ -680,11 +685,11 @@ async def download_media(event):
                         os.remove(temp_file_path)
                         debug(f"[DOWNLOAD] Partial temp file deleted after error: {temp_file_path}")
                     except Exception as cleanup_error:
-                        error(f"Error deleting {temp_file_path}: {cleanup_error}")
+                        warning(f"[DOWNLOAD] Error deleting {temp_file_path}: {cleanup_error}")
 
                 # Si aún quedan intentos, reintentar
                 if attempt < MAX_DOWNLOAD_RETRIES:
-                    debug(f"Retrying download of {file_name} (attempt {attempt + 1} of {MAX_DOWNLOAD_RETRIES}) after error: {error_msg}")
+                    debug(f"[DOWNLOAD] Retrying download of {file_name} (attempt {attempt + 1} of {MAX_DOWNLOAD_RETRIES}) after error: {error_msg}")
                     if status_message:
                         try:
                             await safe_edit(
@@ -694,13 +699,13 @@ async def download_media(event):
                                 parse_mode=PARSE_MODE
                             )
                         except Exception as msg_error:
-                            error(f"Error updating status message: {msg_error}")
+                            error(f"[DOWNLOAD] Error updating status message: {msg_error}")
 
                     # Esperar antes de reintentar
                     await asyncio.sleep(RETRY_DELAY_SECONDS)
                 else:
                     # Último intento fallido
-                    error(f"Telegram timeout while downloading {file_name}: {error_msg}")
+                    error(f"[DOWNLOAD] Telegram timeout while downloading {file_name}: {error_msg}")
                     if status_message:
                         try:
                             await safe_edit(
@@ -710,7 +715,7 @@ async def download_media(event):
                                 parse_mode=PARSE_MODE
                             )
                         except Exception as msg_error:
-                            error(f"Error updating status message: {msg_error}")
+                            error(f"[DOWNLOAD] Error updating status message: {msg_error}")
             else:
                 raise
 
@@ -719,24 +724,101 @@ async def download_media(event):
 
 def extract_file(file_path, extract_to):
     try:
+        filename = os.path.basename(file_path)
         if file_path.lower().endswith('.zip'):
+            debug(f"[EXTRACT] Extracting ZIP file: {filename}")
             with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                file_count = len(zip_ref.namelist())
+                debug(f"[EXTRACT] ZIP contains {file_count} files")
                 zip_ref.extractall(extract_to)
+            debug(f"[EXTRACT] ZIP extraction completed: {filename}")
         elif any(file_path.lower().endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz']):
+            debug(f"[EXTRACT] Extracting TAR file: {filename}")
             with tarfile.open(file_path, 'r:*') as tar_ref:
+                file_count = len(tar_ref.getmembers())
+                debug(f"[EXTRACT] TAR contains {file_count} files")
                 tar_ref.extractall(extract_to)
+            debug(f"[EXTRACT] TAR extraction completed: {filename}")
         elif rarfile.is_rarfile(file_path):
             try:
+                debug(f"[EXTRACT] Extracting RAR file: {filename}")
                 with rarfile.RarFile(file_path) as rar_ref:
+                    file_count = len(rar_ref.namelist())
+                    debug(f"[EXTRACT] RAR contains {file_count} files")
                     rar_ref.extractall(extract_to)
+                debug(f"[EXTRACT] RAR extraction completed: {filename}")
+            except rarfile.RarCannotExec as e:
+                error(f"[EXTRACT] RAR extraction tool not found: {e}")
+                return False
             except Exception as e:
                 msg = str(e).lower()
                 if ("need to start from first volume" in msg or
                     "need first volume" in msg or
                     "missing volume" in msg or
                     "unexpected end of archive" in msg):
-                    debug(f"File {file_path} - Missing RAR parts")
-                    return "missing_parts" 
+                    warning(f"[EXTRACT] File {file_path} - Missing RAR parts")
+                    # Eliminar carpeta vacía creada
+                    if os.path.exists(extract_to):
+                        try:
+                            shutil.rmtree(extract_to)
+                            debug(f"[EXTRACT] Deleted empty folder after missing parts error: {extract_to}")
+                        except Exception as cleanup_error:
+                            warning(f"[EXTRACT] Error deleting empty folder {extract_to}: {cleanup_error}")
+                    return "missing_parts"
+                elif ("failed the read enough data" in msg):
+                    # Este error puede ocurrir en archivos RAR válidos cuando 7z intenta leer más datos
+                    # de los disponibles al final del archivo. Verificamos si la extracción fue completa.
+                    if os.path.exists(extract_to) and os.listdir(extract_to):
+                        # Verificar si hay archivos de 0 bytes (señal de extracción incompleta)
+                        has_zero_byte_files = False
+                        zero_byte_count = 0
+                        total_files = 0
+
+                        for root, dirs, files in os.walk(extract_to):
+                            for filename in files:
+                                total_files += 1
+                                file_full_path = os.path.join(root, filename)
+                                if os.path.getsize(file_full_path) == 0:
+                                    has_zero_byte_files = True
+                                    zero_byte_count += 1
+                                    debug(f"[EXTRACT] Found zero-byte file: {file_full_path}")
+
+                        if has_zero_byte_files:
+                            warning(f"[EXTRACT] File {file_path} - Partial extraction: {zero_byte_count}/{total_files} files are empty or incomplete")
+                            # Borrar la carpeta parcialmente extraída
+                            try:
+                                shutil.rmtree(extract_to)
+                                debug(f"[EXTRACT] Deleted partially extracted folder: {extract_to}")
+                            except Exception as cleanup_error:
+                                warning(f"[EXTRACT] Error deleting partially extracted folder {extract_to}: {cleanup_error}")
+                            return "partial"
+                        else:
+                            debug(f"[EXTRACT] File {file_path} - Extraction completed despite read warning")
+                            return True
+                    else:
+                        error(f"[EXTRACT] File {file_path} - Corrupted or incomplete RAR file: {e}")
+                        # Eliminar carpeta vacía creada
+                        if os.path.exists(extract_to):
+                            try:
+                                shutil.rmtree(extract_to)
+                                debug(f"[EXTRACT] Deleted empty folder after corruption error: {extract_to}")
+                            except Exception as cleanup_error:
+                                warning(f"[EXTRACT] Error deleting empty folder {extract_to}: {cleanup_error}")
+                        return "corrupted"
+                elif ("corrupt" in msg or
+                      "damaged" in msg or
+                      "bad rar file" in msg or
+                      "crc failed" in msg or
+                      "checksum error" in msg):
+                    error(f"[EXTRACT] File {file_path} - Corrupted or incomplete RAR file: {e}")
+                    # Eliminar carpeta vacía creada
+                    if os.path.exists(extract_to):
+                        try:
+                            shutil.rmtree(extract_to)
+                            debug(f"[EXTRACT] Deleted empty folder after corruption error: {extract_to}")
+                        except Exception as cleanup_error:
+                            warning(f"[EXTRACT] Error deleting empty folder {extract_to}: {cleanup_error}")
+                    return "corrupted"
                 else:
                     raise
         else:
@@ -744,14 +826,115 @@ def extract_file(file_path, extract_to):
         return True
 
     except Exception as e:
-        error(f"Error extracting file {file_path}: {e}")
+        error(f"[EXTRACT] Error extracting file {file_path}: {e}")
         if os.path.exists(extract_to):
             try:
                 shutil.rmtree(extract_to)
-                debug(f"Deleted folder: {extract_to}")
+                debug(f"[EXTRACT] Deleted folder: {extract_to}")
             except Exception as cleanup_error:
-                error(f"Error deleting folder {extract_to}: {cleanup_error}")
+                warning(f"[EXTRACT] Error deleting folder {extract_to}: {cleanup_error}")
         return False
+
+def get_extraction_message_and_buttons(extract_result, filename, extracted_path, file_path, file_id=None, from_manage=False):
+    """
+    Genera mensajes y botones consistentes para los resultados de extracción.
+
+    Args:
+        extract_result: Resultado de extract_file() (True, False, "missing_parts", "corrupted")
+        filename: Nombre del archivo comprimido
+        extracted_path: Ruta donde se extrajo (o intentó extraer)
+        file_path: Ruta completa del archivo comprimido
+        file_id: ID del archivo (solo para flujo de /manage)
+        from_manage: True si viene del flujo de /manage, False si es automático
+
+    Returns:
+        tuple: (mensaje, botones)
+    """
+    if extract_result == True:
+        # Extracción exitosa
+        msg = f"✅ **{get_text('extraction_success_title')}**\n\n"
+        msg += f"📄 **{get_text('extraction_file')}:** `{filename}`\n"
+        msg += f"📁 **{get_text('extraction_folder')}:** `{os.path.basename(extracted_path)}`\n\n"
+        msg += get_text('extraction_ask_delete')
+
+        if from_manage:
+            # Botones para flujo de /manage
+            buttons = [
+                [
+                    Button.inline(f"🗑️ {get_text('extraction_delete_compressed')}", data=f"delcompressed:{file_id}"),
+                    Button.inline(f"💾 {get_text('extraction_keep_compressed')}", data=f"keepcompressed:{file_id}")
+                ],
+                [
+                    Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
+                    Button.inline(get_text("button_close"), data="close")
+                ]
+            ]
+        else:
+            # Botones para flujo automático
+            buttons = [
+                [
+                    Button.inline(get_text("button_delete"), data=f"del:{file_path}"),
+                    Button.inline(get_text("button_keep"), data=f"keep:{file_path}")
+                ]
+            ]
+
+    elif extract_result == "missing_parts":
+        # Faltan partes del archivo RAR
+        msg = f"❌ **{get_text('extraction_missing_parts_title')}**\n\n"
+        msg += f"📄 `{filename}`\n\n"
+        msg += get_text('extraction_missing_parts_desc')
+
+        if from_manage:
+            buttons = [[
+                Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
+                Button.inline(get_text("button_close"), data="close")
+            ]]
+        else:
+            buttons = None
+
+    elif extract_result == "partial":
+        # Extracción parcial - se borra automáticamente
+        msg = f"❌ **{get_text('extraction_partial_title')}**\n\n"
+        msg += f"📄 `{filename}`\n\n"
+        msg += get_text('extraction_partial_desc')
+
+        if from_manage:
+            buttons = [[
+                Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
+                Button.inline(get_text("button_close"), data="close")
+            ]]
+        else:
+            buttons = None
+
+    elif extract_result == "corrupted":
+        # Archivo corrupto o incompleto
+        msg = f"❌ **{get_text('extraction_corrupted_title')}**\n\n"
+        msg += f"📄 `{filename}`\n\n"
+        msg += get_text('extraction_corrupted_desc')
+
+        if from_manage:
+            buttons = [[
+                Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
+                Button.inline(get_text("button_close"), data="close")
+            ]]
+        else:
+            buttons = None
+
+    else:
+        # Error general en la extracción
+        msg = f"❌ **{get_text('extraction_error_title')}**\n\n"
+        msg += f"📄 `{filename}`\n\n"
+        msg += get_text('extraction_error_desc')
+
+        if from_manage:
+            buttons = [[
+                Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
+                Button.inline(get_text("button_close"), data="close")
+            ]]
+        else:
+            buttons = None
+
+    return msg, buttons
 
 def get_file_name(media):
     if isinstance(media, Document):
@@ -781,15 +964,15 @@ def get_available_categories():
 
     # Agregar categorías según filtros activos
     if FILTER_VIDEO or FILTER_URL_VIDEO:
-        categories.append(("video", "🎥 Videos"))
+        categories.append(("video", f"{VID_ICO} Videos"))
     if FILTER_AUDIO or FILTER_URL_AUDIO:
-        categories.append(("audio", "🎵 Audios"))
+        categories.append(("audio", f"{AUD_ICO} Audios"))
     if FILTER_PHOTO:
-        categories.append(("photo", "🖼️ Fotos"))
+        categories.append(("photo", f"{IMG_ICO} Fotos"))
     if FILTER_TORRENT:
-        categories.append(("torrent", "🧲 Torrents"))
+        categories.append(("torrent", f"{TOR_ICO} Torrents"))
     if FILTER_EBOOK:
-        categories.append(("ebook", "📚 Ebooks"))
+        categories.append(("ebook", f"{BOO_ICO} Ebooks"))
 
     return categories
 
@@ -827,7 +1010,7 @@ async def handle_start(event):
         pass
 
     if not is_admin(event.sender_id):
-        debug(f"User {event.sender_id} is not an admin and tried to use the bot")
+        debug(f"[AUTH] User {event.sender_id} is not an admin and tried to use the bot")
         response = get_text("user_not_admin")
         await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE)
     elif event.raw_text == "/start":
@@ -842,11 +1025,14 @@ async def handle_start(event):
     elif event.raw_text == "/donors":
         await print_donors(event.chat_id)
     elif event.raw_text == "/list":
+        debug(f"[LIST] /list command received")
 
         # Mostrar menú de categorías
         buttons = get_category_buttons()
-        msg = "📂 **Listar archivos del servidor**\n\nSelecciona qué categoría deseas listar:"
+        debug(f"[LIST] Category buttons: {buttons}")
+        msg = get_text("list_select_category")
         await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE)
+        debug(f"[LIST] Menu sent")
     elif event.raw_text == "/manage":
         # Borrar el comando del usuario
         try:
@@ -872,7 +1058,7 @@ async def handle_start(event):
         # Agregar botón de cerrar
         buttons.append([Button.inline("❌ Cerrar", data="close")])
 
-        msg = "🔧 **Gestionar archivos del servidor**\n\nSelecciona la categoría de archivos que deseas gestionar:"
+        msg = get_text("manage_select_category")
         await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(data=lambda data: data.startswith(b"cancel:")))
@@ -883,6 +1069,31 @@ async def cancel_download(event):
     msg_id = int(event.data.decode().split(":")[1])
     task = active_tasks.get(msg_id)
 
+    # Verificar si es una descarga de playlist en progreso
+    playlist_info = playlist_downloads.get(msg_id)
+
+    if playlist_info and playlist_info.get("is_full_playlist"):
+        downloaded_files = playlist_info.get("downloaded_files", [])
+        if len(downloaded_files) > 0:
+            debug(f"[CANCEL] Playlist download cancelled. Deleting {len(downloaded_files)} temporary files...")
+
+            # Eliminar todos los archivos temporales descargados
+            deleted_count = 0
+            for temp_file_path in downloaded_files:
+                if os.path.exists(temp_file_path):
+                    try:
+                        os.remove(temp_file_path)
+                        debug(f"[CANCEL] 🗑️ Deleted temporary file: {temp_file_path}")
+                        deleted_count += 1
+                    except Exception as e:
+                        error(f"[CANCEL] Error deleting temporary file {temp_file_path}: {e}")
+
+            debug(f"[CANCEL] ✅ Deleted {deleted_count} temporary files from cancelled playlist download")
+
+        # Limpiar información de playlist
+        playlist_downloads.pop(msg_id, None)
+
+    # Terminar el proceso
     if isinstance(task, asyncio.subprocess.Process):
         task.terminate()
         await safe_answer(event, get_text("cancelling"))
@@ -892,6 +1103,162 @@ async def cancel_download(event):
     else:
         # Ya fue cancelada o terminada, borrar el mensaje
         await safe_delete(event)
+
+async def is_direct_download_url(url):
+    """
+    Detecta si una URL es un enlace directo a un archivo descargable.
+    Retorna (is_direct, filename, content_type, download_path, icon) donde:
+    - is_direct: True si es descarga directa
+    - filename: Nombre del archivo extraído de la URL
+    - content_type: Tipo de contenido detectado
+    - download_path: Ruta de descarga según el tipo
+    - icon: Icono según el tipo de archivo
+    """
+    try:
+        # Combinar todas las extensiones conocidas
+        all_extensions = (
+            list(EXTENSIONS_VIDEO) +
+            list(EXTENSIONS_AUDIO) +
+            list(EXTENSIONS_IMAGE) +
+            list(EXTENSIONS_TORRENT) +
+            list(EXTENSIONS_EBOOK)
+        )
+
+        # Extraer path de la URL (sin query params)
+        parsed = urlparse(url)
+        path = unquote(parsed.path)
+
+        # Verificar si termina con una extensión conocida
+        path_lower = path.lower()
+        for ext in all_extensions:
+            if path_lower.endswith(ext):
+                # Extraer nombre del archivo
+                filename = os.path.basename(path)
+
+                # Determinar tipo de contenido, ruta de descarga e icono (igual que get_download_path)
+                if ext in EXTENSIONS_TORRENT:
+                    content_type = 'torrent'
+                    download_path = DOWNLOAD_PATHS["torrent"]
+                    icon = TOR_ICO
+                elif ext in EXTENSIONS_EBOOK:
+                    content_type = 'ebook'
+                    download_path = DOWNLOAD_PATHS["ebook"]
+                    icon = BOO_ICO
+                elif ext in EXTENSIONS_VIDEO:
+                    content_type = 'video'
+                    download_path = DOWNLOAD_PATHS["video"]
+                    icon = VID_ICO
+                elif ext in EXTENSIONS_AUDIO:
+                    content_type = 'audio'
+                    download_path = DOWNLOAD_PATHS["audio"]
+                    icon = AUD_ICO
+                elif ext in EXTENSIONS_IMAGE:
+                    content_type = 'image'
+                    download_path = DOWNLOAD_PATHS["photo"]
+                    icon = IMG_ICO
+                else:
+                    # Cualquier otra extensión va a DOWNLOAD_PATH
+                    content_type = 'file'
+                    download_path = DOWNLOAD_PATH
+                    icon = DEF_ICO
+
+                debug(f"[DIRECT_DOWNLOAD] Detected direct download: {filename} (type: {content_type}) -> {download_path}")
+                return True, filename, content_type, download_path, icon
+
+        # Si no es directo, intentar HEAD request para verificar Content-Type
+        try:
+            response = requests.head(url, allow_redirects=True, timeout=5)
+            content_type_header = response.headers.get('Content-Type', '').lower()
+            content_disposition = response.headers.get('Content-Disposition', '')
+
+            # Si tiene Content-Disposition con filename, es descarga directa
+            if 'attachment' in content_disposition or 'filename=' in content_disposition:
+                # Extraer filename del header
+                filename_match = re.search(r'filename[^;=\n]*=(([\'"]).*?\2|[^;\n]*)', content_disposition)
+                if filename_match:
+                    filename = filename_match.group(1).strip('\'"')
+                else:
+                    filename = os.path.basename(path) or 'download'
+
+                # Determinar tipo por Content-Type, ruta de descarga e icono
+                if 'application/x-bittorrent' in content_type_header:
+                    content_type = 'torrent'
+                    download_path = DOWNLOAD_PATHS["torrent"]
+                    icon = TOR_ICO
+                elif 'video' in content_type_header:
+                    content_type = 'video'
+                    download_path = DOWNLOAD_PATHS["video"]
+                    icon = VID_ICO
+                elif 'audio' in content_type_header:
+                    content_type = 'audio'
+                    download_path = DOWNLOAD_PATHS["audio"]
+                    icon = AUD_ICO
+                elif 'image' in content_type_header:
+                    content_type = 'image'
+                    download_path = DOWNLOAD_PATHS["photo"]
+                    icon = IMG_ICO
+                else:
+                    # Cualquier otro tipo va a DOWNLOAD_PATH
+                    content_type = 'file'
+                    download_path = DOWNLOAD_PATH
+                    icon = DEF_ICO
+
+                debug(f"[DIRECT_DOWNLOAD] Detected via headers: {filename} (type: {content_type}) -> {download_path}")
+                return True, filename, content_type, download_path, icon
+        except:
+            pass
+
+        return False, None, None, None, None
+
+    except Exception as e:
+        debug(f"[DIRECT_DOWNLOAD] Error detecting direct download: {e}")
+        return False, None, None, None, None
+
+async def detect_playlist(url):
+    """Detecta si una URL es una playlist y retorna (is_playlist, playlist_count, playlist_title)"""
+    try:
+        cmd = ["yt-dlp", "--flat-playlist", "--dump-json", "--no-warnings", url]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await proc.communicate()
+
+        # Mostrar stderr si hay contenido
+        stderr_output = stderr.decode().strip()
+        if stderr_output:
+            for line in stderr_output.splitlines():
+                debug(f"[YT-DLP] Playlist detect stderr: {line}")
+
+        if proc.returncode == 0:
+            lines = stdout.decode().splitlines()
+
+            if len(lines) > 1:
+                # Múltiples líneas JSON = playlist
+                debug(f"[YT-DLP] Playlist detected with {len(lines)} items")
+
+                # Intentar obtener el título de la playlist del primer item
+                try:
+                    first_item = json.loads(lines[0])
+                    playlist_title = first_item.get("playlist_title", first_item.get("playlist", "Playlist"))
+                except:
+                    playlist_title = "Playlist"
+
+                return True, len(lines), playlist_title
+            elif len(lines) == 1:
+                # Una sola línea = video individual
+                debug(f"[YT-DLP] Single video detected")
+                return False, 1, None
+        else:
+            warning(f"[YT-DLP] Playlist detect failed with code {proc.returncode}")
+
+        return False, 1, None
+    except Exception as e:
+        error(f"[YT-DLP] Error detecting playlist: {e}")
+        return False, 1, None
 
 async def detect_content_type(url):
     """Detecta el tipo de contenido sin descargarlo usando yt-dlp --dump-json"""
@@ -910,10 +1277,9 @@ async def detect_content_type(url):
         stderr_output = stderr.decode().strip()
         if stderr_output:
             for line in stderr_output.splitlines():
-                debug(f"yt-dlp detect stderr: {line}")
+                debug(f"[YT-DLP] Detect stderr: {line}")
 
         if proc.returncode == 0:
-            import json
             lines = stdout.decode().splitlines()
 
             # Analizar primer item para detectar tipo
@@ -923,7 +1289,7 @@ async def detect_content_type(url):
                 acodec = data.get("acodec")
                 ext = data.get("ext", "").lower()
 
-                debug(f"Content type detected - vcodec: {vcodec}, acodec: {acodec}, ext: {ext}")
+                debug(f"[YT-DLP] Content type detected - vcodec: {vcodec}, acodec: {acodec}, ext: {ext}")
 
                 # Detectar tipo de contenido
                 if vcodec and vcodec != "none":
@@ -933,13 +1299,13 @@ async def detect_content_type(url):
                 elif ext in ["jpg", "jpeg", "png", "gif", "webp", "bmp"]:
                     return "image"  # Solo imagen
             else:
-                debug("yt-dlp detect: No se recibió JSON en stdout")
+                warning("[YT-DLP] Detect: No JSON received in stdout")
         else:
-            debug(f"yt-dlp detect: Falló con código {proc.returncode}")
+            warning(f"[YT-DLP] Detect: Failed with code {proc.returncode}")
 
         return "unknown"
     except Exception as e:
-        debug(f"Error detecting content type: {e}")
+        warning(f"[YT-DLP] Error detecting content type: {e}")
         return "unknown"
 
 @bot.on(events.NewMessage(pattern=r'https?://[^\s]+'))
@@ -958,7 +1324,58 @@ async def handle_url_link(event):
     if analyzing_msg is None:
         analyzing_msg = await safe_reply(event, get_text("analyzing_url"), wait_for_result=False, parse_mode=PARSE_MODE)
 
-    # Detectar tipo de contenido
+    # Primero detectar si es descarga directa
+    is_direct, filename, direct_type, download_path, icon = await is_direct_download_url(url)
+
+    if is_direct:
+        # Es descarga directa - descargar inmediatamente
+        debug(f"[DIRECT_DOWNLOAD] Direct download detected: {filename} (type: {direct_type}) -> {download_path}")
+        pending_urls.pop(url_id, None)
+
+        # Editar mensaje de análisis
+        if analyzing_msg:
+            status_message = await safe_edit(
+                analyzing_msg,
+                get_text("downloading", icon),
+                buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                parse_mode=PARSE_MODE,
+                wait_for_result=True
+            )
+        else:
+            status_message = await safe_reply(
+                event,
+                get_text("downloading", icon),
+                buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                parse_mode=PARSE_MODE,
+                wait_for_result=False
+            )
+
+        # Iniciar descarga directa
+        task = asyncio.create_task(run_direct_download(event, url, filename, status_message, download_path, icon, direct_type))
+        active_tasks[event.id] = task
+        return
+
+    # No es descarga directa - detectar si es playlist
+    is_playlist, playlist_count, playlist_title = await detect_playlist(url)
+
+    if is_playlist:
+        debug(f"[PLAYLIST] Detected playlist with {playlist_count} videos: {playlist_title}")
+        # Preguntar al usuario si quiere descargar toda la playlist o solo el primero
+        buttons = [
+            [Button.inline(get_text("button_download_full_playlist"), data=f"playlist_full:{url_id}")],
+            [Button.inline(get_text("button_download_first_only"), data=f"playlist_first:{url_id}")],
+            [Button.inline(get_text("button_cancel"), data=f"simplecancel:{url_id}")]
+        ]
+
+        message = get_text("playlist_detected", playlist_title, playlist_count)
+
+        if analyzing_msg:
+            await safe_edit(analyzing_msg, message, buttons=buttons, parse_mode=PARSE_MODE)
+        else:
+            await safe_reply(event, message, buttons=buttons, parse_mode=PARSE_MODE)
+        return
+
+    # No es descarga directa ni playlist - usar yt-dlp para detectar tipo de contenido
     content_type = await detect_content_type(url)
 
     # Si AUTO_DOWNLOAD_FORMAT está configurado, descargar automáticamente sin preguntar
@@ -989,7 +1406,8 @@ async def handle_url_link(event):
 
         # Usar timestamp para evitar sobrescribir archivos durante la descarga
         timestamp = int(time.time() * 1000)  # Timestamp en milisegundos
-        temp_template = f"%(title).200s_temp{timestamp}.%(ext)s"
+        # Incluir índice de playlist en el template para evitar sobrescrituras
+        temp_template = f"%(playlist_index)s-%(title).200s_temp{timestamp}.%(ext)s"
 
         cmd = [
             "yt-dlp",
@@ -1004,7 +1422,7 @@ async def handle_url_link(event):
         if is_audio:
             cmd.extend(["--extract-audio", "--audio-format", "mp3"])
 
-        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir))
+        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False))
         active_tasks[event.id] = task
         return
 
@@ -1051,7 +1469,7 @@ async def cancel_simple(event):
 
     url_id = event.pattern_match.group(1).decode()
     pending_urls.pop(url_id, None)
-    debug("URL download cancelled")
+    debug("[URL_DOWNLOAD] URL download cancelled")
     await safe_delete(event)
 
 @bot.on(events.CallbackQuery(pattern=b"cancelconv:(.+)"))
@@ -1104,6 +1522,41 @@ async def handle_cancel_conversion(event):
             parse_mode=PARSE_MODE
         )
 
+@bot.on(events.CallbackQuery(pattern=b"sendoriginal:(.+)"))
+async def handle_send_original(event):
+    """Maneja la solicitud de enviar el archivo original sin conversión"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    conversion_id = event.pattern_match.group(1).decode()
+
+    debug(f"[SEND_ORIGINAL] User requested to send original file for conversion: {conversion_id}")
+
+    # Marcar la solicitud de envío original
+    send_original_requests.add(conversion_id)
+    debug(f"[SEND_ORIGINAL] Request marked: {conversion_id}")
+
+    # Cancelar la conversión si está en progreso
+    cancelled_conversions.add(conversion_id)
+
+    # Buscar el proceso de conversión y terminarlo
+    proc = active_tasks.get(conversion_id)
+    if proc:
+        try:
+            debug(f"[SEND_ORIGINAL] Terminating conversion process (PID: {proc.pid})...")
+            proc.terminate()
+            debug(f"[SEND_ORIGINAL] ✅ Process terminated")
+        except Exception as e:
+            warning(f"[SEND_ORIGINAL] Error terminating process: {e}")
+
+    # Actualizar mensaje
+    await safe_edit(
+        event,
+        get_text("preparing_send"),
+        parse_mode=PARSE_MODE
+    )
+
 @bot.on(events.CallbackQuery(pattern=b"keep:(.+)"))
 async def handle_keep_file(event):
     if await check_admin_and_warn(event):
@@ -1152,25 +1605,179 @@ async def handle_delete_file(event):
                     try:
                         os.remove(part)
                         msg = get_text("extracted_and_deleted_with_parts", file_path)
-                        debug(f"File {part} - Deleted")
+                        debug(f"[FILE_DELETE] File {part} - Deleted")
                     except Exception as e:
-                        error(f"Error deleting {file_path}: {e}")
+                        error(f"[FILE_DELETE] Error deleting {file_path}: {e}")
             else:
                 os.remove(file_path)
                 msg = get_text("extracted_and_deleted", file_path)
-                debug(f"File {file_path} - Deleted")
+                debug(f"[FILE_DELETE] File {file_path} - Deleted")
         elif os.path.isdir(file_path):
             msg = get_text("error_trying_to_delete_folder_user", file_path)
-            error(f"An attempt was made to delete the folder and it should not happen: {file_path}")
+            error(f"[FILE_DELETE] An attempt was made to delete the folder and it should not happen: {file_path}")
         else:
             msg = get_text("error_file_does_not_exist_user")
-            error(f"The file does not exist. Path: {file_path}")
+            error(f"[FILE_DELETE] The file does not exist. Path: {file_path}")
 
         await safe_edit(event, msg, buttons=None, parse_mode=PARSE_MODE)
 
     except Exception as e:
         await safe_edit(event, get_text("error_deleting_user", file_path), buttons=None, parse_mode=PARSE_MODE)
-        error(f"Error deleting {file_path}: {e}")
+        error(f"[FILE_DELETE] Error deleting {file_path}: {e}")
+
+@bot.on(events.CallbackQuery(pattern=b"playlist_(full|first):(.+)"))
+async def handle_playlist_selection(event):
+    """Maneja la selección de descargar playlist completa o solo primer video"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    playlist_mode = event.pattern_match.group(1).decode()  # "full" o "first"
+    url_id = event.pattern_match.group(2).decode()
+
+    url = pending_urls.get(url_id)
+    if not url:
+        await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
+        return
+
+    debug(f"[PLAYLIST] User selected: {playlist_mode} for URL ID: {url_id}")
+
+    # Si AUTO_DOWNLOAD_FORMAT está configurado, no preguntar formato
+    if AUTO_DOWNLOAD_FORMAT in ["AUDIO", "VIDEO"]:
+        debug(f"[PLAYLIST] AUTO_DOWNLOAD_FORMAT={AUTO_DOWNLOAD_FORMAT}, skipping format selection")
+        # Simular selección de formato automática
+        format_type = AUTO_DOWNLOAD_FORMAT.lower()
+
+        # Llamar directamente a la lógica de descarga
+        pending_urls.pop(url_id, None)
+        is_audio = format_type == "audio"
+        download_full_playlist = playlist_mode == "full"
+
+        debug(f"[PLAYLIST] Downloading {'full playlist' if download_full_playlist else 'first video only'} as {format_type}")
+
+        format_flag = "bestaudio" if is_audio else "bv*+ba/best"
+        final_output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
+
+        status_message = await safe_edit(
+            event,
+            get_text("downloading", AUD_ICO if is_audio else VID_ICO),
+            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+            parse_mode=PARSE_MODE,
+            wait_for_result=True
+        )
+
+        if status_message is None:
+            status_message = await safe_reply(
+                event,
+                get_text("downloading", AUD_ICO if is_audio else VID_ICO),
+                buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                parse_mode=PARSE_MODE,
+                wait_for_result=False
+            )
+
+        # Usar timestamp para evitar sobrescribir archivos durante la descarga
+        timestamp = int(time.time() * 1000)
+        # Incluir índice de playlist en el template para evitar sobrescrituras
+        temp_template = f"%(playlist_index)s-%(title).200s_temp{timestamp}.%(ext)s"
+
+        cmd = [
+            "yt-dlp",
+            "-f", format_flag,
+            "--restrict-filenames",
+            "--newline",
+            "--progress",
+            "-o", os.path.join(TEMP_DIR, temp_template),
+            url
+        ]
+
+        # Si solo quiere el primer video, agregar --no-playlist
+        if not download_full_playlist:
+            cmd.insert(1, "--no-playlist")
+            debug(f"[PLAYLIST] Added --no-playlist flag")
+
+        if is_audio:
+            cmd.extend(["--extract-audio", "--audio-format", "mp3"])
+
+        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist))
+        active_tasks[event.id] = task
+        return
+
+    # Si AUTO_DOWNLOAD_FORMAT=ASK, preguntar el formato (audio o video)
+    buttons = [
+        [Button.inline(get_text("audio", AUD_ICO), data=f"playlistfmt_{playlist_mode}_audio:{url_id}"),
+         Button.inline(get_text("video", VID_ICO), data=f"playlistfmt_{playlist_mode}_video:{url_id}")],
+        [Button.inline(get_text("button_cancel"), data=f"simplecancel:{url_id}")]
+    ]
+
+    await safe_edit(event, get_text("dowload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
+
+@bot.on(events.CallbackQuery(pattern=b"playlistfmt_(full|first)_(audio|video):(.+)"))
+async def handle_playlist_format_selection(event):
+    """Maneja la selección de formato para playlist"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    playlist_mode = event.pattern_match.group(1).decode()  # "full" o "first"
+    format_type = event.pattern_match.group(2).decode()  # "audio" o "video"
+    url_id = event.pattern_match.group(3).decode()
+
+    url = pending_urls.get(url_id)
+    if not url:
+        await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
+        return
+
+    pending_urls.pop(url_id, None)
+    is_audio = format_type == "audio"
+    download_full_playlist = playlist_mode == "full"
+
+    debug(f"[PLAYLIST] Downloading {'full playlist' if download_full_playlist else 'first video only'} as {format_type}")
+
+    format_flag = "bestaudio" if is_audio else "bv*+ba/best"
+    final_output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
+
+    status_message = await safe_edit(
+        event,
+        get_text("downloading", AUD_ICO if is_audio else VID_ICO),
+        buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+        parse_mode=PARSE_MODE,
+        wait_for_result=True
+    )
+
+    if status_message is None:
+        status_message = await safe_reply(
+            event,
+            get_text("downloading", AUD_ICO if is_audio else VID_ICO),
+            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+            parse_mode=PARSE_MODE,
+            wait_for_result=False
+        )
+
+    # Usar timestamp para evitar sobrescribir archivos durante la descarga
+    timestamp = int(time.time() * 1000)
+    # Incluir índice de playlist en el template para evitar sobrescrituras
+    temp_template = f"%(playlist_index)s-%(title).200s_temp{timestamp}.%(ext)s"
+
+    cmd = [
+        "yt-dlp",
+        "-f", format_flag,
+        "--restrict-filenames",
+        "--newline",
+        "--progress",
+        "-o", os.path.join(TEMP_DIR, temp_template),
+        url
+    ]
+
+    # Si solo quiere el primer video, agregar --no-playlist
+    if not download_full_playlist:
+        cmd.insert(1, "--no-playlist")
+        debug(f"[PLAYLIST] Added --no-playlist flag")
+
+    if is_audio:
+        cmd.extend(["--extract-audio", "--audio-format", "mp3"])
+
+    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist))
+    active_tasks[event.id] = task
 
 @bot.on(events.CallbackQuery(pattern=b"url_(audio|video):(.+)"))
 async def handle_format_selection(event):
@@ -1212,7 +1819,8 @@ async def handle_format_selection(event):
 
     # Usar timestamp para evitar sobrescribir archivos durante la descarga
     timestamp = int(time.time() * 1000)  # Timestamp en milisegundos
-    temp_template = f"%(title).200s_temp{timestamp}.%(ext)s"
+    # Incluir índice de playlist en el template para evitar sobrescrituras
+    temp_template = f"%(playlist_index)s-%(title).200s_temp{timestamp}.%(ext)s"
 
     cmd = [
         "yt-dlp",
@@ -1227,7 +1835,7 @@ async def handle_format_selection(event):
     if is_audio:
         cmd.extend(["--extract-audio", "--audio-format", "mp3"])
 
-    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir))
+    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False))
     active_tasks[event.id] = task
 
 def parse_progress(line):
@@ -1251,7 +1859,7 @@ def parse_progress(line):
                 "eta": match.group(4) if match.group(4) else "N/A"
             }
     except Exception as e:
-        debug(f"Error parseando progreso: {e}")
+        warning(f"[URL_DOWNLOAD] Error parsing progress: {e}")
     return None
 
 async def update_progress_message(status_message, progress_info, event, file_name=None):
@@ -1267,8 +1875,8 @@ async def update_progress_message(status_message, progress_info, event, file_nam
         eta = progress_info["eta"]
 
         # Crear barra de progreso visual
-        bar_length = 10
-        filled = int(float(percent) / 10)
+        bar_length = 20
+        filled = int(bar_length * float(percent) / 100)
         bar = "█" * filled + "░" * (bar_length - filled)
 
         # Si no hay nombre de archivo, intentar extraerlo del progreso o usar placeholder
@@ -1286,15 +1894,34 @@ async def update_progress_message(status_message, progress_info, event, file_nam
             )
         except Exception as edit_error:
             # Ignorar errores de edición (FloodWaitError, mensaje no modificado, etc.)
-            debug(f"Error editando mensaje de progreso: {edit_error}")
+            warning(f"[URL_DOWNLOAD] Error editing progress message: {edit_error}")
     except Exception as e:
         # Ignorar errores de actualización (puede ser FloodWaitError)
-        debug(f"Error actualizando progreso: {e}")
+        warning(f"[URL_DOWNLOAD] Error updating progress: {e}")
 
-async def run_url_download(event, cmd, status_message, final_output_dir):
+async def run_direct_download(event, url, filename, status_message, final_output_dir, icon, content_type):
+    """Descarga un archivo directo usando wget"""
     try:
-        debug("Creating URL download subprocess...")
-        debug(f"[URL DOWNLOAD] Final output directory: {final_output_dir}")
+        debug(f"[DIRECT_DOWNLOAD] Starting direct download: {filename}")
+        debug(f"[DIRECT_DOWNLOAD] Final output directory: {final_output_dir}")
+        debug(f"[DIRECT_DOWNLOAD] Content type: {content_type}, Icon: {icon}")
+
+        # Usar timestamp para evitar sobrescribir archivos durante la descarga
+        timestamp = int(time.time() * 1000)
+        temp_filename = f"{filename}_temp{timestamp}"
+        temp_file_path = os.path.join(TEMP_DIR, temp_filename)
+
+        # Comando wget con progreso
+        cmd = [
+            "wget",
+            "--progress=bar:force",  # Mostrar barra de progreso
+            "--show-progress",  # Mostrar progreso detallado
+            "-O", temp_file_path,  # Output file
+            url
+        ]
+
+        debug(f"[DIRECT_DOWNLOAD] Command: {' '.join(cmd)}")
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -1303,41 +1930,203 @@ async def run_url_download(event, cmd, status_message, final_output_dir):
         active_tasks[event.id] = proc
 
         # Variables para control de progreso
+        last_update_time = 0
+        update_interval = PROGRESS_UPDATE_INTERVAL
+
+        # Leer stderr (wget muestra progreso en stderr)
+        async def read_stderr():
+            stderr_lines = []
+            async for line in proc.stderr:
+                line_str = line.decode().strip()
+                stderr_lines.append(line_str)
+
+                # Parsear progreso de wget
+                # Formato: 45% [=====>     ] 123.45M  1.23MB/s    eta 30s
+                if '%' in line_str and status_message:
+                    nonlocal last_update_time
+                    current_time = time.time()
+
+                    if current_time - last_update_time >= update_interval:
+                        try:
+                            # Extraer porcentaje
+                            percent_match = re.search(r'(\d+)%', line_str)
+                            # Extraer tamaño descargado
+                            size_match = re.search(r'\]\s+([\d\.]+[KMG]?)', line_str)
+                            # Extraer velocidad
+                            speed_match = re.search(r'([\d\.]+[KMG]?B/s)', line_str)
+                            # Extraer ETA
+                            eta_match = re.search(r'eta\s+([\dhms]+)', line_str)
+
+                            if percent_match:
+                                progress_info = {
+                                    "percent": percent_match.group(1),
+                                    "size": size_match.group(1) if size_match else "N/A",
+                                    "speed": speed_match.group(1) if speed_match else "N/A",
+                                    "eta": eta_match.group(1) if eta_match else "N/A",
+                                    "filename": filename
+                                }
+
+                                await update_progress_message(status_message, progress_info, event, filename)
+                                last_update_time = current_time
+                        except Exception as e:
+                            debug(f"[DIRECT_DOWNLOAD] Error parsing wget progress: {e}")
+
+                if line_str:
+                    debug(f"[WGET] {line_str}")
+
+            return stderr_lines
+
+        # Leer stdout (normalmente vacío para wget)
+        async def read_stdout():
+            async for line in proc.stdout:
+                line_str = line.decode().strip()
+                if line_str:
+                    debug(f"[WGET] stdout: {line_str}")
+
+        # Ejecutar lectura en paralelo
+        stderr_task = asyncio.create_task(read_stderr())
+        stdout_task = asyncio.create_task(read_stdout())
+
+        await stderr_task
+        await stdout_task
+        await proc.wait()
+
+        debug(f"[DIRECT_DOWNLOAD] Process finished with code {proc.returncode}")
+
+        # Manejar cancelación
+        if proc.returncode == -15 or proc.returncode == 143:  # SIGTERM
+            await handle_cancel(status_message)
+            return
+
+        # Verificar si la descarga fue exitosa
+        if proc.returncode == 0 and os.path.exists(temp_file_path):
+            # Eliminar mensaje de progreso
+            if status_message:
+                await safe_delete(status_message)
+
+            # Mover archivo a directorio final
+            final_file_path = os.path.join(final_output_dir, filename)
+
+            # Si ya existe, agregar número
+            if os.path.exists(final_file_path):
+                base, ext = os.path.splitext(filename)
+                counter = 1
+                while os.path.exists(final_file_path):
+                    final_file_path = os.path.join(final_output_dir, f"{base}_{counter}{ext}")
+                    counter += 1
+
+            shutil.move(temp_file_path, final_file_path)
+            debug(f"[DIRECT_DOWNLOAD] File moved to: {final_file_path}")
+
+            await handle_success(event, final_file_path, icon=icon, content_type=content_type)
+        else:
+            # Eliminar mensaje de progreso antes de mostrar error
+            if status_message:
+                await safe_delete(status_message)
+
+            error(f"[DIRECT_DOWNLOAD] Download failed with code {proc.returncode}")
+            await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
+
+            # Limpiar archivo temporal si existe
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+
+    except asyncio.CancelledError:
+        await handle_cancel(status_message)
+        # Limpiar archivo temporal
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        raise
+    except Exception as e:
+        # Eliminar mensaje de progreso antes de mostrar error
+        if status_message:
+            await safe_delete(status_message)
+
+        error(f"[DIRECT_DOWNLOAD] Error during direct download: {e}")
+        await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
+        # Limpiar archivo temporal
+        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+    finally:
+        debug(f"[DIRECT_DOWNLOAD] Cleaning up. ID {event.id}")
+        active_tasks.pop(event.id, None)
+
+async def run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False):
+    try:
+        debug("[URL_DOWNLOAD] Creating URL download subprocess...")
+        debug(f"[URL_DOWNLOAD] Final output directory: {final_output_dir}")
+        debug(f"[URL_DOWNLOAD] Is full playlist: {is_full_playlist}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        active_tasks[event.id] = proc
+
+        # Registrar información de playlist si es necesario
+        # IMPORTANTE: Usar status_message.id como clave porque el botón de cancelar usa event.id que coincide con el ID del mensaje
+        if is_full_playlist:
+            playlist_downloads[event.id] = {
+                "is_full_playlist": True,
+                "final_output_dir": final_output_dir,
+                "downloaded_files": []
+            }
+            debug(f"[URL_DOWNLOAD] Playlist download registered with ID {event.id}")
+
+        # Variables para control de progreso
         stdout_lines = []
         last_update_time = 0
         update_interval = PROGRESS_UPDATE_INTERVAL  # Intervalo dinámico basado en PARALLEL_DOWNLOADS
-        current_filename = None  # Almacenar el nombre del archivo actual
+        current_filename = None  # Almacenar el nombre del archivo actual (solo nombre, no path completo)
+        current_filepath = None  # Almacenar el path completo del archivo actual
 
         # Leer stdout línea por línea en tiempo real
         async def read_stdout():
-            nonlocal last_update_time, current_filename
+            nonlocal last_update_time, current_filename, current_filepath
             async for line in proc.stdout:
                 line_str = line.decode().strip()
                 stdout_lines.append(line_str)
-                debug(f"yt-dlp: {line_str}")
+                debug(f"[YT-DLP] {line_str}")
 
                 # Detectar nombre del archivo: [download] Destination: /path/to/file.mp4
                 if "[download] Destination:" in line_str:
-                    # Extraer el path completo y obtener solo el nombre del archivo
+                    # Extraer el path completo (ya incluye TEMP_DIR)
                     path_start = line_str.find("Destination:") + len("Destination:")
                     full_path = line_str[path_start:].strip()
-                    current_filename = os.path.basename(full_path)
-                    debug(f"Nombre de archivo detectado: {current_filename}")
+                    current_filepath = full_path  # Guardar el path completo para operaciones de archivo
+                    current_filename = os.path.basename(full_path)  # Guardar solo el nombre para mostrar al usuario
+                    debug(f"[URL_DOWNLOAD] File destination detected: {current_filepath}")
+                    debug(f"[URL_DOWNLOAD] Display filename: {current_filename}")
+
+                # Detectar archivo completado: [download] 100% of 123.45MiB in 00:30
+                # o [download] <filename> has already been downloaded
+                if "[download] 100%" in line_str or "has already been downloaded" in line_str:
+                    # Agregar archivo a la lista de descargados si es playlist
+                    if is_full_playlist and event.id in playlist_downloads:
+                        if current_filepath:
+                            # current_filepath contiene el path completo
+                            if os.path.exists(current_filepath) and current_filepath not in playlist_downloads[event.id]["downloaded_files"]:
+                                playlist_downloads[event.id]["downloaded_files"].append(current_filepath)
+                                debug(f"[URL_DOWNLOAD] ✅ File completed and added to playlist: {current_filepath}")
+                            elif not os.path.exists(current_filepath):
+                                debug(f"[URL_DOWNLOAD] ⚠️ File does not exist yet: {current_filepath}")
+                            else:
+                                debug(f"[URL_DOWNLOAD] ℹ️ File already in list: {current_filepath}")
 
                 # Detectar líneas de progreso: [download]  45.2% of 123.45MiB at 1.23MiB/s ETA 00:30
                 if "[download]" in line_str and "%" in line_str:
                     current_time = asyncio.get_event_loop().time()
                     time_diff = current_time - last_update_time
-                    debug(f"Progreso detectado. Tiempo desde última actualización: {time_diff:.2f}s (intervalo: {update_interval}s)")
+                    debug(f"[URL_DOWNLOAD] Progress detected. Time since last update: {time_diff:.2f}s (interval: {update_interval}s)")
                     if time_diff >= update_interval:
                         last_update_time = current_time
                         # Parsear y actualizar mensaje
                         progress_info = parse_progress(line_str)
                         if progress_info:
-                            debug(f"Actualizando mensaje de progreso: {progress_info}")
+                            debug(f"[URL_DOWNLOAD] Updating progress message: {progress_info}")
                             await update_progress_message(status_message, progress_info, event, current_filename)
                         else:
-                            debug(f"No se pudo parsear el progreso de: {line_str}")
+                            debug(f"[URL_DOWNLOAD] Could not parse progress from: {line_str}")
 
         # Leer stderr en paralelo
         async def read_stderr():
@@ -1346,7 +2135,7 @@ async def run_url_download(event, cmd, status_message, final_output_dir):
                 line_str = line.decode().strip()
                 stderr_lines.append(line_str)
                 if line_str:
-                    debug(f"yt-dlp stderr: {line_str}")
+                    debug(f"[YT-DLP] stderr: {line_str}")
             return stderr_lines
 
         # Ejecutar lectura de stdout y stderr en paralelo
@@ -1356,7 +2145,7 @@ async def run_url_download(event, cmd, status_message, final_output_dir):
 
         # Esperar a que termine el proceso
         await proc.wait()
-        debug(f"Exiting URL download subprocess. Code {proc.returncode}")
+        debug(f"[URL_DOWNLOAD] Exiting URL download subprocess. Code {proc.returncode}")
 
         if proc.returncode == -15:
             await handle_cancel(status_message)
@@ -1368,38 +2157,71 @@ async def run_url_download(event, cmd, status_message, final_output_dir):
             temp_file_paths = extract_file_paths(stdout_lines)
 
             if temp_file_paths:
-                for temp_file_path in temp_file_paths:
-                    if os.path.exists(temp_file_path):
-                        # Mover archivo de /tmp a carpeta final
-                        filename = os.path.basename(temp_file_path)
-                        final_file_path = os.path.join(final_output_dir, filename)
+                # Si es playlist completa con múltiples archivos, solo almacenar sin mostrar botones
+                if is_full_playlist and len(temp_file_paths) > 1:
+                    debug(f"[URL_DOWNLOAD] Full playlist detected with {len(temp_file_paths)} files. Storing without action buttons.")
+                    stored_files = []
+                    for temp_file_path in temp_file_paths:
+                        if os.path.exists(temp_file_path):
+                            # Mover archivo de /tmp a carpeta final
+                            filename = os.path.basename(temp_file_path)
+                            final_file_path = os.path.join(final_output_dir, filename)
 
-                        debug(f"[URL DOWNLOAD] Moving file from temp to final location...")
-                        debug(f"[URL DOWNLOAD] Temp: {temp_file_path}")
-                        debug(f"[URL DOWNLOAD] Final: {final_file_path}")
+                            debug(f"[URL DOWNLOAD] Moving file from temp to final location...")
+                            debug(f"[URL DOWNLOAD] Temp: {temp_file_path}")
+                            debug(f"[URL DOWNLOAD] Final: {final_file_path}")
 
-                        shutil.move(temp_file_path, final_file_path)
-                        debug(f"[URL DOWNLOAD] ✅ File moved to: {final_file_path}")
+                            shutil.move(temp_file_path, final_file_path)
+                            debug(f"[URL DOWNLOAD] ✅ File moved to: {final_file_path}")
+                            stored_files.append(filename)
+                        else:
+                            warning(f"[URL_DOWNLOAD] Output file not found: {temp_file_path}")
 
-                        await handle_success(event, final_file_path)
-                    else:
-                        debug(f"Output file not found: {temp_file_path}")
+                    # Mostrar mensaje de éxito sin botones
+                    if stored_files:
+                        file_ext = os.path.splitext(stored_files[0])[1].lower()
+                        icon = get_file_icon(file_ext)
+                        message = get_text("playlist_stored", icon, len(stored_files))
+                        await safe_reply(event, message, parse_mode=PARSE_MODE)
+                else:
+                    # Video individual o primer video de playlist - mostrar botones normales
+                    for temp_file_path in temp_file_paths:
+                        if os.path.exists(temp_file_path):
+                            # Mover archivo de /tmp a carpeta final
+                            filename = os.path.basename(temp_file_path)
+                            final_file_path = os.path.join(final_output_dir, filename)
+
+                            debug(f"[URL DOWNLOAD] Moving file from temp to final location...")
+                            debug(f"[URL DOWNLOAD] Temp: {temp_file_path}")
+                            debug(f"[URL DOWNLOAD] Final: {final_file_path}")
+
+                            shutil.move(temp_file_path, final_file_path)
+                            debug(f"[URL DOWNLOAD] ✅ File moved to: {final_file_path}")
+
+                            await handle_success(event, final_file_path)
+                        else:
+                            warning(f"[URL_DOWNLOAD] Output file not found: {temp_file_path}")
             else:
-                debug("No downloaded files found in yt-dlp output")
-                debug(f"Comando ejecutado: {' '.join(cmd)}")
-                debug(f"Stdout completo: {chr(10).join(stdout_lines)}")
+                warning("[URL_DOWNLOAD] No downloaded files found in yt-dlp output")
+                debug(f"[URL_DOWNLOAD] Command executed: {' '.join(cmd)}")
+                debug(f"[URL_DOWNLOAD] Full stdout: {chr(10).join(stdout_lines)}")
                 await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
         else:
             stderr_output = "\n".join(stderr_lines)
-            debug(f"URL download failed. Error: {stderr_output}")
+            error(f"[URL_DOWNLOAD] URL download failed. Error: {stderr_output}")
             await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
 
     except asyncio.CancelledError:
+        # No limpiar playlist_downloads aquí si fue cancelada - se limpia en handle_playlist_cancel_confirmation
         await handle_cancel(status_message)
         raise
     finally:
-        debug(f"Cleaning URL download subprocess. ID {event.id}")
+        debug(f"[URL_DOWNLOAD] Cleaning URL download subprocess. ID {event.id}")
         active_tasks.pop(event.id, None)
+        # Limpiar información de playlist si la descarga terminó exitosamente (no fue cancelada)
+        if event.id in playlist_downloads:
+            debug(f"[URL_DOWNLOAD] Cleaning playlist info for ID {event.id}")
+            playlist_downloads.pop(event.id, None)
 
 def extract_file_paths(stdout_lines):
     """Extrae todas las rutas de archivos descargados (soporta playlists/carruseles)"""
@@ -1408,7 +2230,7 @@ def extract_file_paths(stdout_lines):
     is_partial = False
 
     for line in stdout_lines:
-        debug(f"yt-dlp: {line}")
+        debug(f"[YT-DLP] {line}")
 
         # Detectar archivo de destino inicial
         if "[download] Destination: " in line:
@@ -1421,30 +2243,30 @@ def extract_file_paths(stdout_lines):
         # Detectar merge de formatos (este es el archivo final)
         elif "[Merger]" in line and "Merging formats into" in line:
             merged_path = line.split("Merging formats into")[-1].strip().strip('"')
-            debug(f"Detected merged output file: {merged_path}")
+            debug(f"[URL_DOWNLOAD] Detected merged output file: {merged_path}")
             current_file = merged_path
             is_partial = False  # El archivo mergeado es el final
             # Agregar inmediatamente el archivo mergeado
             if current_file and current_file not in file_paths:
                 file_paths.append(current_file)
-                debug(f"File added to download list: {current_file}")
+                debug(f"[URL_DOWNLOAD] File added to download list: {current_file}")
 
         # Detectar extracción de audio (este es el archivo final)
         elif "[ExtractAudio]" in line and "Destination:" in line:
             audio_path = line.split("Destination:")[-1].strip()
-            debug(f"Detected audio output file: {audio_path}")
+            debug(f"[URL_DOWNLOAD] Detected audio output file: {audio_path}")
             current_file = audio_path
             is_partial = False  # El audio extraído es el final
             # Agregar inmediatamente el audio extraído
             if current_file and current_file not in file_paths:
                 file_paths.append(current_file)
-                debug(f"File added to download list: {current_file}")
+                debug(f"[URL_DOWNLOAD] File added to download list: {current_file}")
 
         # Detectar finalización de descarga (solo agregar si NO es parcial)
         elif "[download] 100%" in line or "has already been downloaded" in line:
             if current_file and not is_partial and current_file not in file_paths:
                 file_paths.append(current_file)
-                debug(f"File added to download list: {current_file}")
+                debug(f"[URL_DOWNLOAD] File added to download list: {current_file}")
                 current_file = None
 
     # Limpiar nombres temporales y manejar duplicados
@@ -1468,12 +2290,12 @@ def extract_file_paths(stdout_lines):
         try:
             os.rename(file_path, unique_path)
             if unique_filename != clean_filename:
-                debug(f"Archivo renombrado (duplicado): {clean_filename} -> {unique_filename}")
+                debug(f"[URL_DOWNLOAD] File renamed (duplicate): {clean_filename} -> {unique_filename}")
             else:
-                debug(f"Archivo renombrado: {filename} -> {unique_filename}")
+                debug(f"[URL_DOWNLOAD] File renamed: {filename} -> {unique_filename}")
             final_paths.append(unique_path)
         except Exception as e:
-            error(f"Error renombrando archivo: {e}")
+            warning(f"[URL_DOWNLOAD] Error renaming file: {e}")
             final_paths.append(file_path)
 
     return final_paths
@@ -1515,14 +2337,14 @@ async def get_video_metadata(file_path):
                     debug(f"[METADATA] ✅ Metadata obtained: {duration}s, {width}x{height}")
                     return duration, width, height
 
-            debug(f"[METADATA] ⚠️ Video stream not found")
+            warning(f"[METADATA] ⚠️ Video stream not found")
         else:
             error_msg = stderr.decode() if stderr else "Unknown error"
-            debug(f"[METADATA] ❌ Error running ffprobe (code {proc.returncode}): {error_msg[:200]}")
+            error(f"[METADATA] ❌ Error running ffprobe (code {proc.returncode}): {error_msg[:200]}")
 
         return None, None, None
     except Exception as e:
-        debug(f"[METADATA] ❌ Exception getting video metadata: {e}")
+        warning(f"[METADATA] ❌ Exception getting video metadata: {e}")
         return None, None, None
 
 async def get_file_info(file_path):
@@ -1606,7 +2428,7 @@ async def get_file_info(file_path):
 
         return info
     except Exception as e:
-        debug(f"Error obteniendo información del archivo: {e}")
+        warning(f"[FILE_INFO] Error getting file information: {e}")
         return {
             "size": os.path.getsize(file_path) if os.path.exists(file_path) else 0,
             "size_formatted": format_file_size(os.path.getsize(file_path)) if os.path.exists(file_path) else "0 B",
@@ -1677,10 +2499,10 @@ async def generate_video_thumbnail(video_path, output_path=None, timestamp="00:0
             return output_path
         else:
             error_msg = stderr.decode() if stderr else "Unknown error"
-            debug(f"[THUMBNAIL] ❌ Error generating thumbnail (code {proc.returncode}): {error_msg[:200]}")
+            warning(f"[THUMBNAIL] ❌ Error generating thumbnail (code {proc.returncode}): {error_msg[:200]}")
             return None
     except Exception as e:
-        debug(f"[THUMBNAIL] ❌ Exception generating thumbnail: {e}")
+        warning(f"[THUMBNAIL] ❌ Exception generating thumbnail: {e}")
         return None
 
 async def convert_video_to_telegram_compatible(input_path, status_message=None):
@@ -1715,12 +2537,30 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
         conversion_id = f"conv_{abs(hash(input_path)) % 1000000}"
         debug(f"[CONVERSION] Conversion ID: {conversion_id}")
 
+        # Determinar si es un video largo (>300s = 5 minutos) para mostrar botón de enviar original
+        is_long_video = duration_seconds > 300
+        if is_long_video:
+            debug(f"[CONVERSION] Long video detected ({int(duration_seconds / 60)} minutes), will show send original button")
+
         if status_message:
-            debug(f"[CONVERSION] Updating status message with cancel button")
+            # Preparar botones según si es video largo o no
+            if is_long_video:
+                buttons = [
+                    [Button.inline(get_text("button_cancel_conversion"), data=f"cancelconv:{conversion_id}")],
+                    [Button.inline(get_text("button_send_original"), data=f"sendoriginal:{conversion_id}")]
+                ]
+                # Usar mensaje específico para videos largos con advertencia
+                duration_minutes = int(duration_seconds / 60)
+                msg = get_text("converting_video_long_progress", duration_minutes)
+            else:
+                buttons = [Button.inline(get_text("button_cancel_conversion"), data=f"cancelconv:{conversion_id}")]
+                msg = get_text("converting_video_progress")
+
+            debug(f"[CONVERSION] Updating status message with cancel button" + (" and send original button" if is_long_video else ""))
             await safe_edit(
                 status_message,
-                get_text("converting_video_progress"),
-                buttons=[Button.inline(get_text("button_cancel_conversion"), data=f"cancelconv:{conversion_id}")],
+                msg,
+                buttons=buttons,
                 parse_mode=PARSE_MODE
             )
 
@@ -1753,9 +2593,9 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
         last_update = 0
         debug(f"[CONVERSION] Starting progress reading...")
         while True:
-            # Verificar si la conversión fue cancelada
-            if conversion_id in cancelled_conversions:
-                debug(f"[CONVERSION] Conversion cancelled during progress reading, stopping...")
+            # Verificar si la conversión fue cancelada o si se solicitó enviar original
+            if conversion_id in cancelled_conversions or conversion_id in send_original_requests:
+                debug(f"[CONVERSION] Conversion cancelled or send original requested during progress reading, stopping...")
                 break
 
             line = await proc.stdout.readline()
@@ -1784,24 +2624,38 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
                             filled = int(bar_length * percentage / 100)
                             bar = "█" * filled + "░" * (bar_length - filled)
 
-                            msg = get_text("converting_video_progress_bar", bar, percentage, int(time_seconds), int(duration_seconds))
+                            # Usar mensaje específico para videos largos con advertencia
+                            if is_long_video:
+                                duration_minutes = int(duration_seconds / 60)
+                                msg = get_text("converting_video_long_progress_bar", duration_minutes, bar, percentage, int(time_seconds), int(duration_seconds))
+                            else:
+                                msg = get_text("converting_video_progress_bar", bar, percentage, int(time_seconds), int(duration_seconds))
+
+                            # Preparar botones según si es video largo o no
+                            if is_long_video:
+                                buttons = [
+                                    [Button.inline(get_text("button_cancel_conversion"), data=f"cancelconv:{conversion_id}")],
+                                    [Button.inline(get_text("button_send_original"), data=f"sendoriginal:{conversion_id}")]
+                                ]
+                            else:
+                                buttons = [Button.inline(get_text("button_cancel_conversion"), data=f"cancelconv:{conversion_id}")]
 
                             try:
                                 await safe_edit(
                                     status_message,
                                     msg,
-                                    buttons=[Button.inline(get_text("button_cancel_conversion"), data=f"cancelconv:{conversion_id}")],
+                                    buttons=buttons,
                                     parse_mode=PARSE_MODE
                                 )
                             except Exception as e:
-                                debug(f"[CONVERSION] Error updating progress message: {e}")
+                                warning(f"[CONVERSION] Error updating progress message: {e}")
                                 # Si falla la edición, puede ser que el mensaje fue eliminado/editado
-                                # Verificar si fue cancelado
-                                if conversion_id in cancelled_conversions:
-                                    debug(f"[CONVERSION] Message edit failed because conversion was cancelled")
+                                # Verificar si fue cancelado o se solicitó enviar original
+                                if conversion_id in cancelled_conversions or conversion_id in send_original_requests:
+                                    debug(f"[CONVERSION] Message edit failed because conversion was cancelled or send original requested")
                                     break
                 except Exception as e:
-                    debug(f"[CONVERSION] Error processing progress line: {e}")
+                    warning(f"[CONVERSION] Error processing progress line: {e}")
 
         debug(f"[CONVERSION] Waiting for process completion...")
         await proc.wait()
@@ -1810,7 +2664,23 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
 
         # Limpiar el proceso de active_tasks
         active_tasks.pop(conversion_id, None)
+        active_tasks.pop(f"{conversion_id}_original_path", None)
         debug(f"[CONVERSION] Process removed from active_tasks")
+
+        # Verificar si el usuario eligió enviar el archivo original
+        if conversion_id in send_original_requests:
+            debug(f"[CONVERSION] ✅ User chose to send original file")
+            send_original_requests.discard(conversion_id)
+            cancelled_conversions.discard(conversion_id)
+            # Eliminar archivo de salida parcial si existe
+            if os.path.exists(output_path):
+                debug(f"[CONVERSION] Deleting partial file: {output_path}")
+                try:
+                    os.remove(output_path)
+                except:
+                    pass
+            # Retornar el archivo original sin convertir
+            return input_path
 
         # Verificar si la conversión fue cancelada por el usuario
         if conversion_id in cancelled_conversions:
@@ -1855,7 +2725,7 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
             error(f"[CONVERSIÓN] ❌ Error convirtiendo video (código {proc.returncode}): {error_msg[:200]}")
             # Si falla la conversión, eliminar el archivo de salida si existe
             if os.path.exists(output_path):
-                debug(f"[CONVERSION] Deleting failed output file: {output_path}")
+                warning(f"[CONVERSION] Deleting failed output file: {output_path}")
                 os.remove(output_path)
             # Retornar el archivo original sin convertir
             debug(f"[CONVERSION] Returning original unconverted file: {input_path}")
@@ -1892,55 +2762,61 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
         debug(f"[CONVERSION] Returning original unconverted file after exception: {input_path}")
         return input_path
 
-async def handle_success(event, file_path, show_action_buttons=True):
+async def handle_success(event, file_path, show_action_buttons=True, icon=None, content_type=None):
     try:
         file_size = os.path.getsize(file_path)
-        debug(f"File size: {file_size} bytes")
+        debug(f"[SEND_FILE] File size: {file_size} bytes")
 
         # Obtener información detallada del archivo
         file_info = await get_file_info(file_path)
         filename = get_filename_from_path(file_path)
 
-        # Construir mensaje con información del archivo
-        icon_map = {
-            "video": "🎥",
-            "audio": "🎵",
-            "image": "🖼️",
-            "document": "📄"
-        }
-        icon = icon_map.get(file_info["type"], "📄")
+        # Si se proporcionó un icono y tipo desde descarga directa, usarlos
+        if icon and content_type:
+            debug(f"[SEND_FILE] Using provided icon and type: {icon} ({content_type})")
+            file_type = content_type
+        else:
+            # Construir mensaje con información del archivo
+            icon_map = {
+                "video": VID_ICO,
+                "audio": AUD_ICO,
+                "image": IMG_ICO,
+                "document": DEF_ICO
+            }
+            icon = icon_map.get(file_info["type"], DEF_ICO)
+            file_type = file_info["type"]
 
         # Mensaje unificado: Descarga completada + información detallada
         info_lines = [
-            f"✅ {icon} **Descarga completada:** `{filename}`",
+            get_text("downloaded", icon, filename),
             "",
-            f"📦 **Tamaño:** {file_info['size_formatted']}"
+            get_text("file_info_size", file_info['size_formatted'])
         ]
 
         # Agregar información específica según el tipo
         if file_info["type"] == "video":
             if file_info["duration_formatted"]:
-                info_lines.append(f"⏱️ **Duración:** {file_info['duration_formatted']}")
+                info_lines.append(get_text("file_info_duration", file_info['duration_formatted']))
             if file_info["resolution"]:
-                info_lines.append(f"📐 **Resolución:** {file_info['resolution']}")
+                info_lines.append(get_text("file_info_resolution", file_info['resolution']))
             if file_info["codec_video"]:
                 codec_info = file_info["codec_video"]
                 if file_info["codec_audio"]:
                     codec_info += f" + {file_info['codec_audio']}"
-                info_lines.append(f"🎬 **Códec:** {codec_info}")
+                info_lines.append(get_text("file_info_codec", codec_info))
         elif file_info["type"] == "audio":
             if file_info["duration_formatted"]:
-                info_lines.append(f"⏱️ **Duración:** {file_info['duration_formatted']}")
+                info_lines.append(get_text("file_info_duration", file_info['duration_formatted']))
             if file_info["codec_audio"]:
-                info_lines.append(f"🎵 **Códec:** {file_info['codec_audio']}")
+                info_lines.append(get_text("file_info_codec_audio", file_info['codec_audio']))
             if file_info["bitrate"]:
-                info_lines.append(f"📊 **Bitrate:** {file_info['bitrate']}")
+                info_lines.append(get_text("file_info_bitrate", file_info['bitrate']))
 
         info_message = "\n".join(info_lines)
         await safe_reply(event, info_message, parse_mode=PARSE_MODE)
 
-        # Solo mostrar botones de acción si se solicita (para descargas de URLs)
-        if show_action_buttons:
+        # Solo mostrar botones de acción si se solicita (para descargas de URLs) y solo para video/audio
+        if show_action_buttons and file_type in ["video", "audio"]:
             if file_size <= 2 * 1024 * 1024 * 1024:
                 pending_files[event.id] = file_path
                 buttons = [
@@ -1952,19 +2828,23 @@ async def handle_success(event, file_path, show_action_buttons=True):
                 ]
                 await safe_reply(event, get_text("upload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
             else:
-                debug("File size is too large to send via Telegram. Maximum size is 2GB")
+                debug("[SEND_FILE] File size is too large to send via Telegram. Maximum size is 2GB")
     except Exception as e:
-        error(f"Error sending file: {e}")
+        error(f"[SEND_FILE] Error sending file: {e}")
 
 
 @bot.on(events.CallbackQuery(pattern=b"listcat:(.+)"))
 async def handle_list_category(event):
     """Maneja los botones de categorías en /list"""
+    debug(f"[LIST] handle_list_category called")
+
     if await check_admin_and_warn(event):
+        debug(f"[LIST] User is not admin, returning")
         return
 
     await safe_answer(event)
     category = event.pattern_match.group(1).decode()
+    debug(f"[LIST] Category selected: {category}")
 
     # Eliminar TODOS los mensajes anteriores de la lista (si existen)
     user_id = event.sender_id
@@ -1983,7 +2863,7 @@ async def handle_list_category(event):
     try:
         # Mapear categorías a directorios
         category_map = {
-            "all": list(DOWNLOAD_PATHS.values()),
+            "all": list(DOWNLOAD_PATHS.values()) + [DOWNLOAD_PATH],
             "video": [DOWNLOAD_PATHS["video"], DOWNLOAD_PATHS["url_video"]],
             "audio": [DOWNLOAD_PATHS["audio"], DOWNLOAD_PATHS["url_audio"]],
             "photo": [DOWNLOAD_PATHS["photo"]],
@@ -1991,10 +2871,12 @@ async def handle_list_category(event):
             "ebook": [DOWNLOAD_PATHS["ebook"]]
         }
 
-        directories = category_map.get(category, list(DOWNLOAD_PATHS.values()))
+        directories = category_map.get(category, list(DOWNLOAD_PATHS.values()) + [DOWNLOAD_PATH])
 
         # Eliminar directorios duplicados
         directories = list(set(directories))
+
+        debug(f"[LIST] Category: {category}, Directories to scan: {directories}")
 
         # Recopilar archivos
         files_info = []
@@ -2003,9 +2885,13 @@ async def handle_list_category(event):
 
         for directory in directories:
             if not os.path.exists(directory):
+                debug(f"[LIST] Directory does not exist: {directory}")
                 continue
 
-            for filename in os.listdir(directory):
+            dir_files = os.listdir(directory)
+            debug(f"[LIST] Directory {directory} contains {len(dir_files)} items: {dir_files}")
+
+            for filename in dir_files:
                 file_path = os.path.join(directory, filename)
 
                 # Ignorar archivos temporales y ocultos
@@ -2029,16 +2915,7 @@ async def handle_list_category(event):
                         # Es un archivo
                         file_size = os.path.getsize(file_path)
                         file_ext = os.path.splitext(filename)[1].lower()
-
-                        # Determinar icono según extensión
-                        if file_ext in EXTENSIONS_VIDEO:
-                            icon = "🎥"
-                        elif file_ext in EXTENSIONS_AUDIO:
-                            icon = "🎵"
-                        elif file_ext in EXTENSIONS_IMAGE:
-                            icon = "🖼️"
-                        else:
-                            icon = "📄"
+                        icon = get_file_icon(file_ext)
                         item_type = "file"
 
                     files_info.append({
@@ -2051,10 +2928,10 @@ async def handle_list_category(event):
                     })
                     total_size += file_size
                 except Exception as e:
-                    debug(f"Error procesando {filename}: {e}")
+                    warning(f"[FILE_LIST] Error processing {filename}: {e}")
 
-        # Ordenar por tamaño (más grandes primero)
-        files_info.sort(key=lambda x: x["size"], reverse=True)
+        # Ordenar alfabéticamente por nombre
+        files_info.sort(key=lambda x: x["name"].lower())
 
         # Crear botones de categorías (excluyendo la categoría actual)
         category_buttons = get_category_buttons(exclude_category=category)
@@ -2078,9 +2955,9 @@ async def handle_list_category(event):
         folder_count = sum(1 for item in files_info if item["type"] == "folder")
 
         if folder_count > 0:
-            footer = f"\n\n**Total:** {file_count} archivos, {folder_count} carpetas | **Espacio:** {total_size_formatted}"
+            footer = f"\n\n{get_text('total_files_folders_space', file_count, folder_count, total_size_formatted)}"
         else:
-            footer = f"\n\n**Total:** {file_count} archivos | **Espacio:** {total_size_formatted}"
+            footer = f"\n\n{get_text('total_files_space', file_count, total_size_formatted)}"
 
         messages = []
         current_message = ""
@@ -2133,7 +3010,7 @@ async def handle_list_category(event):
             list_messages[user_id] = sent_messages
 
     except Exception as e:
-        error(f"Error listando archivos: {e}")
+        error(f"[FILE_LIST] Error listing files: {e}")
         await safe_send_message(event.chat_id, get_text("error_list_files"), parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(pattern=b"managecat:(.+)"))
@@ -2165,7 +3042,7 @@ async def handle_manage_category(event):
 
         # Mapear categorías a directorios
         category_map = {
-            "all": list(DOWNLOAD_PATHS.values()),
+            "all": list(DOWNLOAD_PATHS.values()) + [DOWNLOAD_PATH],
             "video": [DOWNLOAD_PATHS["video"], DOWNLOAD_PATHS["url_video"]],
             "audio": [DOWNLOAD_PATHS["audio"], DOWNLOAD_PATHS["url_audio"]],
             "photo": [DOWNLOAD_PATHS["photo"]],
@@ -2173,7 +3050,7 @@ async def handle_manage_category(event):
             "ebook": [DOWNLOAD_PATHS["ebook"]]
         }
 
-        directories = category_map.get(category, list(DOWNLOAD_PATHS.values()))
+        directories = category_map.get(category, list(DOWNLOAD_PATHS.values()) + [DOWNLOAD_PATH])
 
         # Eliminar directorios duplicados
         directories = list(set(directories))
@@ -2182,12 +3059,18 @@ async def handle_manage_category(event):
         files_info = []
         total_size = 0
         seen_files = set()
+        scanned_dirs = 0
+        total_items = 0
 
         for directory in directories:
             if not os.path.exists(directory):
                 continue
 
-            for filename in os.listdir(directory):
+            dir_files = os.listdir(directory)
+            scanned_dirs += 1
+            total_items += len(dir_files)
+
+            for filename in dir_files:
                 file_path = os.path.join(directory, filename)
 
                 # Ignorar archivos temporales y ocultos
@@ -2211,16 +3094,7 @@ async def handle_manage_category(event):
                         # Es un archivo
                         file_size = os.path.getsize(file_path)
                         file_ext = os.path.splitext(filename)[1].lower()
-
-                        # Determinar icono según extensión
-                        if file_ext in EXTENSIONS_VIDEO:
-                            icon = "🎥"
-                        elif file_ext in EXTENSIONS_AUDIO:
-                            icon = "🎵"
-                        elif file_ext in EXTENSIONS_IMAGE:
-                            icon = "🖼️"
-                        else:
-                            icon = "📄"
+                        icon = get_file_icon(file_ext)
                         item_type = "file"
 
                     files_info.append({
@@ -2233,10 +3107,13 @@ async def handle_manage_category(event):
                     })
                     total_size += file_size
                 except Exception as e:
-                    debug(f"Error procesando {filename}: {e}")
+                    warning(f"[FILE_MANAGE] Error processing {filename}: {e}")
 
-        # Ordenar por tamaño (más grandes primero)
-        files_info.sort(key=lambda x: x["size"], reverse=True)
+        # Log consolidado del escaneo
+        debug(f"[MANAGE] Category '{category}': scanned {scanned_dirs} directories, found {len(files_info)} items ({total_items} total including hidden/temp)")
+
+        # Ordenar alfabéticamente por nombre
+        files_info.sort(key=lambda x: x["name"].lower())
 
         # Crear botones de categorías (excluyendo la categoría actual)
         categories = get_available_categories()
@@ -2257,7 +3134,7 @@ async def handle_manage_category(event):
         category_buttons.append([Button.inline("❌ Cerrar", data="close")])
 
         if not files_info:
-            msg = "📂 **No hay archivos en esta categoría**\n\nPrueba descargando algo primero."
+            msg = get_text("manage_no_files")
             sent_msg = await safe_send_message(event.chat_id, msg, buttons=category_buttons, parse_mode=PARSE_MODE, wait_for_result=True)
             if sent_msg:
                 list_messages[user_id] = [sent_msg]
@@ -2269,12 +3146,12 @@ async def handle_manage_category(event):
             file_count = sum(1 for item in files_info if item["type"] == "file")
             folder_count = sum(1 for item in files_info if item["type"] == "folder")
 
-            msg = f"⚠️ **Demasiados elementos**\n\n"
+            msg = f"{get_text('manage_too_many_items')}\n\n"
             if folder_count > 0:
-                msg += f"Hay **{file_count} archivos y {folder_count} carpetas** en esta categoría.\n\n"
+                msg += f"{get_text('manage_too_many_files_folders', file_count, folder_count)}\n\n"
             else:
-                msg += f"Hay **{file_count} archivos** en esta categoría.\n\n"
-            msg += f"Para gestionar archivos, filtra por una categoría más específica o usa el comando `/list` para ver todos los archivos."
+                msg += f"{get_text('manage_too_many_files', file_count)}\n\n"
+            msg += get_text('manage_too_many_hint')
 
             sent_msg = await safe_send_message(event.chat_id, msg, buttons=category_buttons, parse_mode=PARSE_MODE, wait_for_result=True)
             if sent_msg:
@@ -2302,12 +3179,12 @@ async def handle_manage_category(event):
         file_count = sum(1 for item in files_info if item["type"] == "file")
         folder_count = sum(1 for item in files_info if item["type"] == "folder")
 
-        msg = f"🔧 **Gestionar archivos**\n\n"
+        msg = f"{get_text('manage_files_title')}\n\n"
         if folder_count > 0:
-            msg += f"**Total:** {file_count} archivos, {folder_count} carpetas | **Espacio:** {total_size_formatted}\n\n"
+            msg += f"{get_text('total_files_folders_space', file_count, folder_count, total_size_formatted)}\n\n"
         else:
-            msg += f"**Total:** {file_count} archivos | **Espacio:** {total_size_formatted}\n\n"
-        msg += f"Selecciona un elemento para ver opciones:"
+            msg += f"{get_text('total_files_space', file_count, total_size_formatted)}\n\n"
+        msg += get_text('manage_select_item')
 
         sent_msg = await safe_reply(event, msg, buttons=file_buttons, parse_mode=PARSE_MODE, wait_for_result=True)
 
@@ -2316,7 +3193,7 @@ async def handle_manage_category(event):
             list_messages[user_id] = [sent_msg]
 
     except Exception as e:
-        error(f"Error gestionando archivos: {e}")
+        error(f"[FILE_MANAGE] Error managing files: {e}")
         await safe_reply(event, get_text("error_manage_files"), parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(pattern=b"fileact:(.+)"))
@@ -2346,15 +3223,16 @@ async def handle_file_action(event):
         # Es un archivo
         file_size_bytes = os.path.getsize(file_path)
         file_size = format_file_size(file_size_bytes)
-        icon = "📄"
+        file_ext = os.path.splitext(filename)[1].lower()
+        icon = get_file_icon(file_ext)
         item_type = "archivo"
 
     # Crear mensaje con información del elemento
-    msg = f"🔧 **Acciones sobre {item_type}**\n\n"
-    msg += f"{icon} **Nombre:** `{filename}`\n"
-    msg += f"💾 **Tamaño:** {file_size}\n"
-    msg += f"📁 **Ruta:** `{os.path.dirname(file_path)}`\n\n"
-    msg += "¿Qué deseas hacer?"
+    msg = f"{get_text('file_actions_title', item_type)}\n\n"
+    msg += f"{icon} {get_text('file_actions_name', filename)}\n"
+    msg += f"{get_text('file_actions_size', file_size)}\n"
+    msg += f"{get_text('file_actions_path', os.path.dirname(file_path))}\n\n"
+    msg += get_text('file_actions_what_to_do')
 
     # Botones de acción
     buttons = []
@@ -2370,6 +3248,10 @@ async def handle_file_action(event):
         MAX_TELEGRAM_SIZE = 2 * 1024 * 1024 * 1024  # 2GB en bytes
         if file_size_bytes < MAX_TELEGRAM_SIZE:
             buttons.append([Button.inline("📥 Descargar a Telegram", data=f"download:{file_id}")])
+
+        # Botón de descomprimir si es un archivo comprimido
+        if is_compressed_file(file_path):
+            buttons.append([Button.inline("📦 Descomprimir", data=f"extract:{file_id}")])
 
     # Última fila: Volver y Cerrar
     buttons.append([
@@ -2517,7 +3399,7 @@ async def handle_download_file(event):
                 debug(f"[SEND /manage] Deleting temporary thumbnail: {thumb_path}")
                 os.remove(thumb_path)
             except Exception as e:
-                debug(f"[SEND /manage] ⚠️ Error deleting thumbnail: {e}")
+                warning(f"[SEND /manage] ⚠️ Error deleting thumbnail: {e}")
 
         # Limpiar archivo convertido temporal si se generó (diferente del original)
         if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
@@ -2526,7 +3408,7 @@ async def handle_download_file(event):
                 os.remove(converted_file_path)
                 debug(f"[SEND /manage] ✅ Temporary converted file deleted")
             except Exception as e:
-                debug(f"[SEND /manage] ⚠️ Error deleting temporary converted file: {e}")
+                warning(f"[SEND /manage] ⚠️ Error deleting temporary converted file: {e}")
 
         # Eliminar mensaje de progreso
         if sending_msg and sending_msg != event:
@@ -2555,7 +3437,7 @@ async def handle_download_file(event):
                 debug(f"[SEND /manage] Deleting thumbnail after error: {thumb_path}")
                 os.remove(thumb_path)
             except Exception as cleanup_error:
-                debug(f"[SEND /manage] ⚠️ Error deleting thumbnail after error: {cleanup_error}")
+                warning(f"[SEND /manage] ⚠️ Error deleting thumbnail after error: {cleanup_error}")
 
         # Limpiar archivo convertido temporal si se generó (diferente del original)
         if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
@@ -2564,7 +3446,7 @@ async def handle_download_file(event):
                 os.remove(converted_file_path)
                 debug(f"[SEND /manage] ✅ Temporary converted file deleted after error")
             except Exception as cleanup_error:
-                debug(f"[SEND /manage] ⚠️ Error deleting temporary converted file after error: {cleanup_error}")
+                warning(f"[SEND /manage] ⚠️ Error deleting temporary converted file after error: {cleanup_error}")
 
         # Eliminar mensaje de progreso si existe
         if sending_msg and sending_msg != event:
@@ -2617,20 +3499,25 @@ async def handle_delete_file(event):
     filename = os.path.basename(file_path)
     is_directory = os.path.isdir(file_path)
     item_type = "carpeta" if is_directory else "archivo"
-    icon = "📁" if is_directory else "📄"
+
+    if is_directory:
+        icon = "📁"
+    else:
+        file_ext = os.path.splitext(filename)[1].lower()
+        icon = get_file_icon(file_ext)
 
     # Pedir confirmación
-    msg = f"⚠️ **Confirmar eliminación**\n\n"
-    msg += f"¿Estás seguro de que deseas eliminar esta {item_type}?\n\n"
+    msg = f"{get_text('confirm_delete_title')}\n\n"
+    msg += f"{get_text('confirm_delete_question', item_type)}\n\n"
     msg += f"{icon} `{filename}`\n\n"
     if is_directory:
-        msg += f"**Se eliminará la carpeta y todo su contenido.**\n\n"
-    msg += f"**Esta acción no se puede deshacer.**"
+        msg += f"{get_text('confirm_delete_folder_warning')}\n\n"
+    msg += get_text('confirm_delete_no_undo')
 
     buttons = [
         [
-            Button.inline("✅ Sí, eliminar", data=f"confirmdelete:{file_id}"),
-            Button.inline("❌ Cancelar", data=f"fileact:{file_id}"),
+            Button.inline(get_text("button_yes_delete"), data=f"confirmdelete:{file_id}"),
+            Button.inline(get_text("button_cancel"), data=f"fileact:{file_id}"),
         ]
     ]
 
@@ -2665,9 +3552,9 @@ async def handle_confirm_delete(event):
 
         pending_file_actions.pop(file_id, None)
 
-        msg = f"✅ **{item_type.capitalize()} eliminado**\n\n"
+        msg = f"{get_text('item_deleted_title', item_type.capitalize())}\n\n"
         msg += f"{icon} `{filename}`\n\n"
-        msg += f"El {item_type} ha sido eliminado del servidor."
+        msg += get_text('item_deleted_desc', item_type)
 
         buttons = [[
             Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
@@ -2675,9 +3562,9 @@ async def handle_confirm_delete(event):
         ]]
         await safe_edit(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
 
-        debug(f"{item_type.capitalize()} eliminado por el usuario: {file_path}")
+        debug(f"[FILE_DELETE] {item_type.capitalize()} deleted by user: {file_path}")
     except Exception as e:
-        error(f"Error eliminando {item_type} {file_path}: {e}")
+        error(f"[FILE_DELETE] Error deleting {item_type} {file_path}: {e}")
         await safe_edit(event, get_text("error_deleting_item", item_type, str(e)), parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(pattern=b"rename:(.+)"))
@@ -2712,15 +3599,15 @@ async def handle_rename_file(event):
         "is_directory": is_directory
     })
 
-    msg = f"✏️ **Renombrar {item_type}**\n\n"
-    msg += f"{icon} **Nombre actual:** `{filename}`\n\n"
-    msg += f"**Responde a este mensaje** con el nuevo nombre para el {item_type}"
+    msg = f"{get_text('rename_title', item_type)}\n\n"
+    msg += f"{icon} {get_text('rename_current_name', filename)}\n\n"
+    msg += get_text('rename_reply_with_new_name', item_type)
     if not is_directory:
-        msg += f" (incluyendo la extensión)"
+        msg += get_text('rename_include_extension')
     msg += f".\n\n"
-    msg += f"💡 Ejemplo: `{'mi_carpeta_nueva' if is_directory else 'mi_video_nuevo.mp4'}`"
+    msg += get_text('rename_example', 'my_new_folder' if is_directory else 'my_new_video.mp4')
 
-    buttons = [[Button.inline("❌ Cancelar", data=f"fileact:{file_id}")]]
+    buttons = [[Button.inline(get_text("button_cancel"), data=f"fileact:{file_id}")]]
 
     await safe_edit(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
 
@@ -2783,9 +3670,9 @@ async def handle_rename_input(event):
 
     # Validar el nuevo nombre
     if not new_name or '/' in new_name or '\\' in new_name:
-        msg = f"❌ **Nombre inválido**\n\n"
-        msg += f"El nombre no puede contener `/` o `\\` y no puede estar vacío.\n\n"
-        msg += f"Intenta de nuevo."
+        msg = f"{get_text('rename_invalid_title')}\n\n"
+        msg += f"{get_text('rename_invalid_chars')}\n\n"
+        msg += get_text('rename_try_again')
         buttons = [[
             Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
             Button.inline(get_text("button_close"), data="close")
@@ -2804,9 +3691,9 @@ async def handle_rename_input(event):
 
     # Verificar si ya existe un elemento con ese nombre
     if os.path.exists(new_path):
-        msg = f"❌ **El {item_type} ya existe**\n\n"
-        msg += f"Ya existe un {item_type} con el nombre `{new_name}` en el mismo directorio.\n\n"
-        msg += f"Elige otro nombre."
+        msg = f"{get_text('rename_already_exists_title', item_type)}\n\n"
+        msg += f"{get_text('rename_already_exists_desc', item_type, new_name)}\n\n"
+        msg += get_text('rename_choose_another')
         buttons = [[
             Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
             Button.inline(get_text("button_close"), data="close")
@@ -2821,10 +3708,10 @@ async def handle_rename_input(event):
         # Actualizar en pending_file_actions
         pending_file_actions[file_id] = new_path
 
-        msg = f"✅ **{item_type.capitalize()} renombrado**\n\n"
-        msg += f"{icon} **Nombre anterior:** `{original_name}`\n"
-        msg += f"{icon} **Nombre nuevo:** `{new_name}`\n\n"
-        msg += f"El {item_type} ha sido renombrado exitosamente."
+        msg = f"{get_text('rename_success_title', item_type.capitalize())}\n\n"
+        msg += f"{icon} {get_text('rename_old_name', original_name)}\n"
+        msg += f"{icon} {get_text('rename_new_name', new_name)}\n\n"
+        msg += get_text('rename_success_desc', item_type)
 
         buttons = [[
             Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
@@ -2832,16 +3719,197 @@ async def handle_rename_input(event):
         ]]
         await safe_reply(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
 
-        debug(f"Archivo renombrado: {file_path} → {new_path}")
+        debug(f"[FILE_RENAME] File renamed: {file_path} → {new_path}")
     except Exception as e:
-        error(f"Error renombrando archivo {file_path}: {e}")
-        msg = f"❌ **Error al renombrar**\n\n"
-        msg += f"No se pudo renombrar el archivo: {str(e)}"
+        error(f"[FILE_RENAME] Error renaming file {file_path}: {e}")
+        msg = f"{get_text('rename_error_title')}\n\n"
+        msg += get_text('rename_error_desc', str(e))
         buttons = [[
             Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
             Button.inline(get_text("button_close"), data="close")
         ]]
         await safe_reply(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+
+@bot.on(events.CallbackQuery(pattern=b"extract:(.+)"))
+async def handle_extract_file(event):
+    """Descomprime un archivo comprimido"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    file_id = event.pattern_match.group(1).decode()
+
+    file_path = pending_file_actions.get(file_id)
+    if not file_path or not os.path.exists(file_path):
+        await safe_edit(event, get_text("error_file_not_found"), parse_mode=PARSE_MODE)
+        return
+
+    filename = os.path.basename(file_path)
+
+    # Verificar que sea un archivo comprimido
+    if not is_compressed_file(file_path):
+        await safe_edit(event, get_text("error_not_compressed"), parse_mode=PARSE_MODE)
+        return
+
+    # Verificar si es un ZIP split (no soportado)
+    if is_split_zip(filename):
+        await safe_edit(event, get_text("error_split_zip_not_supported"), parse_mode=PARSE_MODE)
+        return
+
+    # Determinar la carpeta de extracción
+    download_path = os.path.dirname(file_path)
+    base_name = os.path.splitext(file_path)[0]
+
+    # Para archivos RAR, limpiar el nombre base
+    if rarfile.is_rarfile(file_path):
+        base_name = clean_rar_base_name(filename)
+
+    extracted_path = os.path.join(download_path, os.path.basename(base_name))
+
+    # Verificar si la carpeta de destino ya existe
+    if os.path.exists(extracted_path):
+        await safe_edit(event, get_text("error_extraction_folder_exists", os.path.basename(extracted_path)), parse_mode=PARSE_MODE)
+        return
+
+    # Crear carpeta de extracción
+    os.makedirs(extracted_path, exist_ok=True)
+
+    # Mostrar mensaje de progreso inicial
+    progress_msg = await safe_edit(event, get_text("decompressing_file", filename), parse_mode=PARSE_MODE, wait_for_result=True)
+
+    debug(f"[EXTRACT] Starting extraction of {filename} to {extracted_path}")
+
+    # Extraer archivo en un executor para no bloquear (archivos grandes pueden tardar mucho)
+    loop = asyncio.get_event_loop()
+
+    # Tarea para actualizar progreso cada 10 segundos
+    extraction_done = asyncio.Event()
+
+    async def update_progress():
+        """Actualiza el mensaje cada 10 segundos para mostrar que sigue extrayendo"""
+        elapsed = 0
+        while not extraction_done.is_set():
+            await asyncio.sleep(10)
+            if not extraction_done.is_set():
+                elapsed += 10
+                try:
+                    await safe_edit(
+                        progress_msg,
+                        get_text('decompressing_file_progress', filename, elapsed),
+                        parse_mode=PARSE_MODE
+                    )
+                    debug(f"[EXTRACT] Still extracting {filename} ({elapsed}s elapsed)")
+                except Exception as e:
+                    debug(f"[EXTRACT] Error updating progress message: {e}")
+
+    # Iniciar tarea de progreso
+    progress_task = asyncio.create_task(update_progress())
+
+    try:
+        # Ejecutar extracción en thread pool
+        extract_result = await loop.run_in_executor(None, extract_file, file_path, extracted_path)
+        debug(f"[EXTRACT] Extraction completed for {filename}, result: {extract_result}")
+    finally:
+        # Detener tarea de progreso
+        extraction_done.set()
+        await progress_task
+
+    # Usar función unificada para mensajes y botones
+    msg, buttons = get_extraction_message_and_buttons(
+        extract_result,
+        filename,
+        extracted_path,
+        file_path,
+        file_id=file_id,
+        from_manage=True
+    )
+
+    await safe_edit(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
+
+    if extract_result == True:
+        debug(f"[EXTRACT] File {filename} - Extracted to {extracted_path}")
+
+@bot.on(events.CallbackQuery(pattern=b"(delcompressed|keepcompressed):(.+)"))
+async def handle_compressed_file_action(event):
+    """Maneja la acción de eliminar o conservar el archivo comprimido después de extraer"""
+    if await check_admin_and_warn(event):
+        return
+
+    await safe_answer(event)
+    action = event.pattern_match.group(1).decode()
+    file_id = event.pattern_match.group(2).decode()
+
+    file_path = pending_file_actions.get(file_id)
+    if not file_path or not os.path.exists(file_path):
+        await safe_edit(event, get_text("error_file_not_found"), parse_mode=PARSE_MODE)
+        return
+
+    filename = os.path.basename(file_path)
+
+    if action == "delcompressed":
+        # Eliminar el archivo comprimido
+        try:
+            # Si es un archivo RAR multi-parte, eliminar todas las partes
+            if rarfile.is_rarfile(file_path):
+                dirname = os.path.dirname(file_path)
+                filename_lower = filename.lower()
+                rar_patterns = [
+                    r"(.*)\.part\d+\.rar$",
+                    r"(.*)\.r\d{2}$",
+                    r"(.*)\.rar$"
+                ]
+
+                matched_base = None
+                for pattern in rar_patterns:
+                    m = re.match(pattern, filename_lower)
+                    if m:
+                        matched_base = m.group(1)
+                        break
+
+                if matched_base:
+                    all_parts = []
+                    for f in os.listdir(dirname):
+                        f_lower = f.lower()
+                        if (f_lower.startswith(matched_base)
+                            and (f_lower.endswith(".rar") or re.match(r".*\.r\d{2}$", f_lower) or ".part" in f_lower)):
+                            full_path = os.path.join(dirname, f)
+                            if os.path.isfile(full_path):
+                                all_parts.append(full_path)
+
+                    for part in all_parts:
+                        os.remove(part)
+                        debug(f"[FILE_DELETE] File {part} - Deleted")
+
+                    msg = f"{get_text('files_deleted_title')}\n\n"
+                    msg += get_text('files_deleted_count', len(all_parts))
+                else:
+                    os.remove(file_path)
+                    msg = f"{get_text('file_deleted_title')}\n\n"
+                    msg += f"📄 `{filename}`"
+                    debug(f"[FILE_DELETE] File {file_path} - Deleted")
+            else:
+                os.remove(file_path)
+                msg = f"{get_text('file_deleted_title')}\n\n"
+                msg += f"📄 `{filename}`"
+                debug(f"[FILE_DELETE] File {file_path} - Deleted")
+
+            pending_file_actions.pop(file_id, None)
+
+        except Exception as e:
+            error(f"[FILE_DELETE] Error deleting compressed file {file_path}: {e}")
+            msg = f"{get_text('delete_error_title')}\n\n"
+            msg += get_text('delete_error_desc', str(e))
+
+    else:  # keepcompressed
+        msg = f"{get_text('file_kept_title')}\n\n"
+        msg += f"📄 `{filename}`\n\n"
+        msg += get_text('file_kept_desc')
+
+    buttons = [[
+        Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
+        Button.inline(get_text("button_close"), data="close")
+    ]]
+    await safe_edit(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(pattern=b"(send|senddelete|nosend):(.+)"))
 async def handle_send_choice(event):
@@ -2855,7 +3923,7 @@ async def handle_send_choice(event):
 
     if not os.path.exists(file_path):
         await safe_edit(event, get_text("error_file_does_not_exist_user"), parse_mode=PARSE_MODE)
-        error(f"The file does not exist. Path: {file_path}")
+        error(f"[FILE_DELETE] The file does not exist. Path: {file_path}")
         return
 
     if action in ("send", "senddelete"):
@@ -2962,7 +4030,7 @@ async def handle_send_choice(event):
                     debug(f"[SEND BUTTON] Deleting temporary thumbnail: {thumb_path}")
                     os.remove(thumb_path)
                 except Exception as e:
-                    debug(f"[SEND BUTTON] ⚠️ Error deleting temporary thumbnail: {e}")
+                    warning(f"[SEND BUTTON] ⚠️ Error deleting temporary thumbnail: {e}")
 
             # Limpiar archivo convertido temporal si se generó (diferente del original)
             if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
@@ -2971,7 +4039,7 @@ async def handle_send_choice(event):
                     os.remove(converted_file_path)
                     debug(f"[SEND BUTTON] ✅ Temporary converted file deleted")
                 except Exception as e:
-                    debug(f"[SEND BUTTON] ⚠️ Error deleting temporary converted file: {e}")
+                    warning(f"[SEND BUTTON] ⚠️ Error deleting temporary converted file: {e}")
 
             debug(f"[SEND BUTTON] ✅ File sent to Telegram: {original_file_path}")
             if sending_msg:
@@ -2992,7 +4060,7 @@ async def handle_send_choice(event):
                     debug(f"[SEND BUTTON] Deleting thumbnail after error: {thumb_path}")
                     os.remove(thumb_path)
                 except Exception as cleanup_error:
-                    debug(f"[SEND BUTTON] ⚠️ Error deleting thumbnail after error: {cleanup_error}")
+                    warning(f"[SEND BUTTON] ⚠️ Error deleting thumbnail after error: {cleanup_error}")
 
             # Limpiar archivo convertido temporal si se generó (diferente del original)
             if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
@@ -3001,14 +4069,14 @@ async def handle_send_choice(event):
                     os.remove(converted_file_path)
                     debug(f"[SEND BUTTON] ✅ Temporary converted file deleted after error")
                 except Exception as cleanup_error:
-                    debug(f"[SEND BUTTON] ⚠️ Error deleting temporary converted file after error: {cleanup_error}")
+                    warning(f"[SEND BUTTON] ⚠️ Error deleting temporary converted file after error: {cleanup_error}")
 
             # Eliminar mensaje de progreso si existe
             if sending_msg:
                 try:
                     await safe_delete(sending_msg)
                 except Exception as delete_error:
-                    debug(f"[SEND BUTTON] ⚠️ Error deleting progress message: {delete_error}")
+                    warning(f"[SEND BUTTON] ⚠️ Error deleting progress message: {delete_error}")
 
             await safe_reply(event, get_text("error_sending_the_file_user"), parse_mode=PARSE_MODE)
             error(f"[SEND BUTTON] Error sending file: {e}")
@@ -3018,13 +4086,13 @@ async def handle_send_choice(event):
 async def handle_cancel(status_message):
     if status_message:
         await safe_edit(status_message, get_text("cancelled"), buttons=None, parse_mode=PARSE_MODE)
-    debug("URL download cancelled")
+    debug("[URL_DOWNLOAD] URL download cancelled")
     cleanup_partials()
 
 def cleanup_partials():
     pattern = os.path.join(DOWNLOAD_PATHS["url_video"], "*.part*")
     for f in glob.glob(pattern):
-        debug(f"Cleaning partial files from URL download: {f}")
+        debug(f"[URL_DOWNLOAD] Cleaning partial files from URL download: {f}")
         os.remove(f)
 
 async def send_startup_message():
@@ -3033,7 +4101,7 @@ async def send_startup_message():
         try:
             await safe_send_message(int(admin), get_text("initial_message", VERSION), parse_mode=PARSE_MODE)
         except Exception as e:
-            error(f"Error sending initial message: {e}")
+            error(f"[STARTUP] Error sending initial message: {e}")
 
 async def set_commands():
     commands = [
@@ -3054,12 +4122,12 @@ async def check_admin_and_warn(event):
     if not is_admin(event.sender_id):
         sender = await event.get_sender()
         username = sender.username if sender else None
-        warning(f"User {event.sender_id} (@{username}) is not an admin and tried to use the bot")
+        warning(f"[AUTH] User {event.sender_id} (@{username}) is not an admin and tried to use the bot")
         return True
     return False
 
 async def main():
-    debug(f"DropBot v{VERSION}")
+    debug(f"[STARTUP] DropBot v{VERSION}")
     await bot.start()
     await message_queue.start()  # Iniciar la cola de mensajes
     await set_commands()

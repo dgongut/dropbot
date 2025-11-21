@@ -17,7 +17,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
-# Instalar dependencias del sistema y descargar código en una sola capa
+# Instalar dependencias del sistema, descargar código e instalar dependencias Python en una sola capa
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         wget \
@@ -31,15 +31,14 @@ RUN apt-get update && \
     wget -q https://github.com/dgongut/dropbot/archive/refs/tags/v${VERSION}.tar.gz -O /tmp/dropbot.tar.gz && \
     tar -xzf /tmp/dropbot.tar.gz -C /tmp && \
     mv /tmp/dropbot-${VERSION}/* /app/ && \
+    # Instalar dependencias de Python antes de limpiar pip
+    pip3 install --no-cache-dir -r /app/requirements.txt && \
     # Limpiar archivos temporales y cache (mantener wget para descargas directas)
     rm -rf /tmp/* && \
-    apt-get remove -y ca-certificates && \
+    apt-get remove -y ca-certificates python3-pip && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
-
-# Instalar dependencias de Python (separado para aprovechar cache)
-RUN pip3 install --no-cache-dir -r /app/requirements.txt
 
 # Healthcheck (verificar que el proceso Python esté corriendo)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \

@@ -23,7 +23,7 @@ from debug import *
 from basic import *
 from message_queue import TelegramMessageQueue
 
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -630,8 +630,19 @@ async def download_media(event):
     # Intentar descargar con reintentos
     for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
         try:
-            # Descargar a archivo temporal
-            await bot.download_media(message, file=temp_file_path, progress_callback=progress_callback)
+            # Descargar a archivo temporal con timeout
+            # Timeout dinámico: 10 minutos base + 2 minutos por cada 100MB de archivo
+            # Esto previene que descargas se queden colgadas indefinidamente
+            # Ejemplos: 100MB=12min, 500MB=20min, 1GB=30min, 2GB=50min
+            # Basado en datos reales: descargas normales tardan 2-22min para archivos de 1-2GB
+            file_size_mb = message.file.size / (1024 * 1024) if message.file and message.file.size else 100
+            download_timeout = 600 + (file_size_mb / 100) * 120  # 10 min base + 2 min por cada 100MB
+            debug(f"[DOWNLOAD] Download timeout set to {int(download_timeout)}s ({int(download_timeout/60)}min) for {file_size_mb:.1f}MB file")
+
+            await asyncio.wait_for(
+                bot.download_media(message, file=temp_file_path, progress_callback=progress_callback),
+                timeout=download_timeout
+            )
 
             # Mover archivo de /tmp a carpeta final
             debug(f"[DOWNLOAD] Moving file from temp to final location...")
@@ -662,6 +673,48 @@ async def download_media(event):
                 debug(f"[DOWNLOAD] Final file deleted after cancellation: {final_file_path}")
             debug(f"[DOWNLOAD] File {file_name} - Cancelled")
             raise
+
+        except asyncio.TimeoutError:
+            # Timeout específico de asyncio.wait_for
+            error(f"[DOWNLOAD] Download timeout after {int(download_timeout)}s for {file_name}")
+
+            # Eliminar archivo parcialmente descargado (temporal)
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                    debug(f"[DOWNLOAD] Partial temp file deleted after timeout: {temp_file_path}")
+                except Exception as cleanup_error:
+                    warning(f"[DOWNLOAD] Error deleting {temp_file_path}: {cleanup_error}")
+
+            # Si aún quedan intentos, reintentar
+            if attempt < MAX_DOWNLOAD_RETRIES:
+                debug(f"[DOWNLOAD] Retrying download of {file_name} (attempt {attempt + 1} of {MAX_DOWNLOAD_RETRIES}) after timeout")
+                if status_message:
+                    try:
+                        await safe_edit(
+                            status_message,
+                            get_text("warning_retrying_download", attempt + 1, MAX_DOWNLOAD_RETRIES),
+                            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
+                            parse_mode=PARSE_MODE
+                        )
+                    except Exception as msg_error:
+                        error(f"[DOWNLOAD] Error updating status message: {msg_error}")
+
+                # Esperar antes de reintentar
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
+            else:
+                # Último intento fallido
+                error(f"[DOWNLOAD] Download failed after {MAX_DOWNLOAD_RETRIES} attempts due to timeout")
+                if status_message:
+                    try:
+                        await safe_edit(
+                            status_message,
+                            get_text("error_telegram_timeout_user", file_name),
+                            buttons=None,
+                            parse_mode=PARSE_MODE
+                        )
+                    except Exception as msg_error:
+                        error(f"[DOWNLOAD] Error updating status message: {msg_error}")
 
         except Exception as e:
             error_msg = str(e)
@@ -1071,24 +1124,64 @@ async def cancel_download(event):
 
     # Verificar si es una descarga de playlist en progreso
     playlist_info = playlist_downloads.get(msg_id)
+    has_partial_playlist = False
+    partial_count = 0
+    partial_total = 0
 
     if playlist_info and playlist_info.get("is_full_playlist"):
-        downloaded_files = playlist_info.get("downloaded_files", [])
-        if len(downloaded_files) > 0:
-            debug(f"[CANCEL] Playlist download cancelled. Deleting {len(downloaded_files)} temporary files...")
+        total_videos = playlist_info.get("total_videos", 0)
+        final_output_dir = playlist_info.get("final_output_dir")
 
-            # Eliminar todos los archivos temporales descargados
-            deleted_count = 0
-            for temp_file_path in downloaded_files:
-                if os.path.exists(temp_file_path):
-                    try:
-                        os.remove(temp_file_path)
-                        debug(f"[CANCEL] 🗑️ Deleted temporary file: {temp_file_path}")
-                        deleted_count += 1
-                    except Exception as e:
-                        error(f"[CANCEL] Error deleting temporary file {temp_file_path}: {e}")
+        debug(f"[CANCEL] Playlist download cancelled. Searching for completed files in {TEMP_DIR}")
 
-            debug(f"[CANCEL] ✅ Deleted {deleted_count} temporary files from cancelled playlist download")
+        # Buscar TODOS los archivos en /tmp
+        all_temp_files = []
+        try:
+            if os.path.exists(TEMP_DIR):
+                all_temp_files = [os.path.join(TEMP_DIR, f) for f in os.listdir(TEMP_DIR) if os.path.isfile(os.path.join(TEMP_DIR, f))]
+                debug(f"[CANCEL] Found {len(all_temp_files)} total files in /tmp")
+                for f in all_temp_files:
+                    debug(f"[CANCEL]   - {os.path.basename(f)}")
+        except Exception as e:
+            error(f"[CANCEL] Error listing /tmp directory: {e}")
+
+        # Filtrar archivos completos de vídeo/audio (no parciales de yt-dlp)
+        # Archivos parciales de yt-dlp tienen extensiones como .f137.mp4, .f140.m4a, .part
+        # Archivos completos tienen extensiones normales: .mp4, .webm, .mkv, .m4a, .mp3
+        completed_files = []
+        for f in all_temp_files:
+            basename = os.path.basename(f)
+            # Ignorar archivos parciales
+            if '.part' in basename or '.f' in basename.split('.')[-2] if len(basename.split('.')) > 2 else False:
+                debug(f"[CANCEL] Skipping partial file: {basename}")
+                continue
+            # Solo archivos de vídeo/audio completos
+            if basename.endswith(('.mp4', '.webm', '.mkv', '.m4a', '.mp3', '.opus')):
+                completed_files.append(f)
+                debug(f"[CANCEL] Found completed file: {basename}")
+
+        if len(completed_files) > 0:
+            debug(f"[CANCEL] Moving {len(completed_files)} completed files to final location...")
+
+            moved_count = 0
+            for temp_file_path in completed_files:
+                try:
+                    filename = os.path.basename(temp_file_path)
+                    final_file_path = os.path.join(final_output_dir, filename)
+
+                    shutil.move(temp_file_path, final_file_path)
+                    moved_count += 1
+                    debug(f"[CANCEL] ✅ Moved: {filename}")
+                except Exception as e:
+                    error(f"[CANCEL] Error moving file {temp_file_path}: {e}")
+
+            if moved_count > 0:
+                has_partial_playlist = True
+                partial_count = moved_count
+                partial_total = total_videos
+                debug(f"[CANCEL] Successfully moved {moved_count} files before cancelling")
+        else:
+            debug(f"[CANCEL] No completed files found to move")
 
         # Limpiar información de playlist
         playlist_downloads.pop(msg_id, None)
@@ -1103,6 +1196,16 @@ async def cancel_download(event):
     else:
         # Ya fue cancelada o terminada, borrar el mensaje
         await safe_delete(event)
+        return
+
+    # Esperar un momento para que el proceso termine
+    await asyncio.sleep(0.5)
+
+    # Mostrar mensaje apropiado según si hay archivos parciales
+    if has_partial_playlist and partial_count > 0:
+        message = get_text("cancelled_playlist_partial", partial_count, partial_total)
+        await safe_edit(event, message, buttons=None, parse_mode=PARSE_MODE)
+    # Si no hay archivos parciales, el mensaje normal de cancelación se mostrará en handle_cancel
 
 async def is_direct_download_url(url):
     """
@@ -1214,6 +1317,46 @@ async def is_direct_download_url(url):
         debug(f"[DIRECT_DOWNLOAD] Error detecting direct download: {e}")
         return False, None, None, None, None
 
+def calculate_ytdlp_sleep_interval(playlist_count):
+    """
+    Calcula automáticamente el delay entre descargas de vídeos para evitar rate-limiting de YouTube.
+
+    YouTube puede bloquear temporalmente (hasta 1 hora) si se hacen demasiadas peticiones seguidas.
+    Esta función ajusta el delay basándose en el número de vídeos en la playlist.
+
+    Args:
+        playlist_count: Número de vídeos en la playlist (1 para vídeos individuales)
+
+    Returns:
+        int: Segundos de delay entre descargas
+
+    Estrategia:
+        - 1 vídeo: 0s (sin delay)
+        - 2-10 vídeos: 1s (delay mínimo)
+        - 11-50 vídeos: 2s (delay bajo)
+        - 51-100 vídeos: 5s (delay moderado-bajo)
+        - 101-200 vídeos: 8s (delay moderado)
+        - 201-300 vídeos: 12s (delay moderado-alto)
+        - 301-500 vídeos: 18s (delay alto)
+        - >500 vídeos: 25s (delay muy alto)
+    """
+    if playlist_count <= 1:
+        return 0
+    elif playlist_count <= 10:
+        return 1
+    elif playlist_count <= 50:
+        return 2
+    elif playlist_count <= 100:
+        return 5
+    elif playlist_count <= 200:
+        return 8
+    elif playlist_count <= 300:
+        return 12
+    elif playlist_count <= 500:
+        return 18
+    else:
+        return 25
+
 async def detect_playlist(url):
     """Detecta si una URL es una playlist y retorna (is_playlist, playlist_count, playlist_title)"""
     try:
@@ -1315,7 +1458,8 @@ async def handle_url_link(event):
 
     url = event.raw_text.strip()
     url_id = str(event.id)
-    pending_urls[url_id] = url
+    # Almacenar URL con información de playlist (se actualizará si es playlist)
+    pending_urls[url_id] = {"url": url, "playlist_count": 1}
 
     # Mostrar mensaje de análisis
     analyzing_msg = await safe_reply(event, get_text("analyzing_url"), wait_for_result=True, parse_mode=PARSE_MODE)
@@ -1360,6 +1504,9 @@ async def handle_url_link(event):
 
     if is_playlist:
         debug(f"[PLAYLIST] Detected playlist with {playlist_count} videos: {playlist_title}")
+        # Almacenar el playlist_count para usarlo después
+        pending_urls[url_id]["playlist_count"] = playlist_count
+
         # Preguntar al usuario si quiere descargar toda la playlist o solo el primero
         buttons = [
             [Button.inline(get_text("button_download_full_playlist"), data=f"playlist_full:{url_id}")],
@@ -1380,7 +1527,8 @@ async def handle_url_link(event):
 
     # Si AUTO_DOWNLOAD_FORMAT está configurado, descargar automáticamente sin preguntar
     if AUTO_DOWNLOAD_FORMAT in ["VIDEO", "AUDIO"]:
-        pending_urls.pop(url_id, None)
+        url_data = pending_urls.pop(url_id, None)
+        playlist_count = url_data.get("playlist_count", 1) if url_data else 1
         is_audio = AUTO_DOWNLOAD_FORMAT == "AUDIO"
 
         format_flag = "bestaudio" if is_audio else "bv*+ba/best"
@@ -1419,10 +1567,17 @@ async def handle_url_link(event):
             url
         ]
 
+        # Calcular delay automático basado en el número de vídeos
+        sleep_interval = calculate_ytdlp_sleep_interval(playlist_count)
+
+        if sleep_interval > 0:
+            cmd.extend(["--sleep-interval", str(sleep_interval)])
+            debug(f"[URL_DOWNLOAD] Auto-calculated sleep interval: {sleep_interval}s for {playlist_count} video(s)")
+
         if is_audio:
             cmd.extend(["--extract-audio", "--audio-format", "mp3"])
 
-        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False))
+        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=playlist_count))
         active_tasks[event.id] = task
         return
 
@@ -1635,12 +1790,15 @@ async def handle_playlist_selection(event):
     playlist_mode = event.pattern_match.group(1).decode()  # "full" o "first"
     url_id = event.pattern_match.group(2).decode()
 
-    url = pending_urls.get(url_id)
-    if not url:
+    url_data = pending_urls.get(url_id)
+    if not url_data:
         await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
         return
 
-    debug(f"[PLAYLIST] User selected: {playlist_mode} for URL ID: {url_id}")
+    url = url_data["url"]
+    playlist_count = url_data.get("playlist_count", 1)
+
+    debug(f"[PLAYLIST] User selected: {playlist_mode} for URL ID: {url_id} (playlist_count: {playlist_count})")
 
     # Si AUTO_DOWNLOAD_FORMAT está configurado, no preguntar formato
     if AUTO_DOWNLOAD_FORMAT in ["AUDIO", "VIDEO"]:
@@ -1695,10 +1853,21 @@ async def handle_playlist_selection(event):
             cmd.insert(1, "--no-playlist")
             debug(f"[PLAYLIST] Added --no-playlist flag")
 
+        # Calcular delay automático basado en el número de vídeos
+        # Si download_full_playlist es False, solo descarga 1 vídeo
+        videos_to_download = playlist_count if download_full_playlist else 1
+        sleep_interval = calculate_ytdlp_sleep_interval(videos_to_download)
+
+        if sleep_interval > 0:
+            cmd.extend(["--sleep-interval", str(sleep_interval)])
+            debug(f"[URL_DOWNLOAD] Auto-calculated sleep interval: {sleep_interval}s for {videos_to_download} video(s)")
+
         if is_audio:
             cmd.extend(["--extract-audio", "--audio-format", "mp3"])
 
-        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist))
+        # Pasar el número total de vídeos solo si es playlist completa
+        total_vids = playlist_count if download_full_playlist else 1
+        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist, total_videos=total_vids))
         active_tasks[event.id] = task
         return
 
@@ -1722,16 +1891,18 @@ async def handle_playlist_format_selection(event):
     format_type = event.pattern_match.group(2).decode()  # "audio" o "video"
     url_id = event.pattern_match.group(3).decode()
 
-    url = pending_urls.get(url_id)
-    if not url:
+    url_data = pending_urls.get(url_id)
+    if not url_data:
         await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
         return
 
+    url = url_data["url"]
+    playlist_count = url_data.get("playlist_count", 1)
     pending_urls.pop(url_id, None)
     is_audio = format_type == "audio"
     download_full_playlist = playlist_mode == "full"
 
-    debug(f"[PLAYLIST] Downloading {'full playlist' if download_full_playlist else 'first video only'} as {format_type}")
+    debug(f"[PLAYLIST] Downloading {'full playlist' if download_full_playlist else 'first video only'} as {format_type} (playlist_count: {playlist_count})")
 
     format_flag = "bestaudio" if is_audio else "bv*+ba/best"
     final_output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
@@ -1773,10 +1944,21 @@ async def handle_playlist_format_selection(event):
         cmd.insert(1, "--no-playlist")
         debug(f"[PLAYLIST] Added --no-playlist flag")
 
+    # Calcular delay automático basado en el número de vídeos
+    # Si download_full_playlist es False, solo descarga 1 vídeo
+    videos_to_download = playlist_count if download_full_playlist else 1
+    sleep_interval = calculate_ytdlp_sleep_interval(videos_to_download)
+
+    if sleep_interval > 0:
+        cmd.extend(["--sleep-interval", str(sleep_interval)])
+        debug(f"[URL_DOWNLOAD] Auto-calculated sleep interval: {sleep_interval}s for {videos_to_download} video(s)")
+
     if is_audio:
         cmd.extend(["--extract-audio", "--audio-format", "mp3"])
 
-    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist))
+    # Pasar el número total de vídeos solo si es playlist completa
+    total_vids = playlist_count if download_full_playlist else 1
+    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist, total_videos=total_vids))
     active_tasks[event.id] = task
 
 @bot.on(events.CallbackQuery(pattern=b"url_(audio|video):(.+)"))
@@ -1788,11 +1970,13 @@ async def handle_format_selection(event):
     format_type = event.pattern_match.group(1).decode()
     url_id = event.pattern_match.group(2).decode()
 
-    url = pending_urls.get(url_id)
-    if not url:
+    url_data = pending_urls.get(url_id)
+    if not url_data:
         await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
         return
 
+    url = url_data["url"]
+    playlist_count = url_data.get("playlist_count", 1)
     pending_urls.pop(url_id, None)
     is_audio = format_type == "audio"
 
@@ -1832,10 +2016,17 @@ async def handle_format_selection(event):
         url
     ]
 
+    # Calcular delay automático basado en el número de vídeos (siempre 1 en este caso)
+    sleep_interval = calculate_ytdlp_sleep_interval(playlist_count)
+
+    if sleep_interval > 0:
+        cmd.extend(["--sleep-interval", str(sleep_interval)])
+        debug(f"[URL_DOWNLOAD] Auto-calculated sleep interval: {sleep_interval}s for {playlist_count} video(s)")
+
     if is_audio:
         cmd.extend(["--extract-audio", "--audio-format", "mp3"])
 
-    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False))
+    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=playlist_count))
     active_tasks[event.id] = task
 
 def parse_progress(line):
@@ -1862,8 +2053,16 @@ def parse_progress(line):
         warning(f"[URL_DOWNLOAD] Error parsing progress: {e}")
     return None
 
-async def update_progress_message(status_message, progress_info, event, file_name=None):
-    """Actualiza el mensaje de Telegram con el progreso de descarga"""
+async def update_progress_message(status_message, progress_info, event, file_name=None, playlist_info=None):
+    """Actualiza el mensaje de Telegram con el progreso de descarga
+
+    Args:
+        status_message: Mensaje de Telegram a actualizar
+        progress_info: Diccionario con percent, size, speed, eta
+        event: Evento de Telegram
+        file_name: Nombre del archivo actual (opcional)
+        playlist_info: Diccionario con {"current": int, "total": int} para playlists (opcional)
+    """
     # Si no hay mensaje de estado, no hacer nada
     if status_message is None:
         return
@@ -1874,7 +2073,7 @@ async def update_progress_message(status_message, progress_info, event, file_nam
         speed = progress_info["speed"]
         eta = progress_info["eta"]
 
-        # Crear barra de progreso visual
+        # Crear barra de progreso visual del vídeo actual
         bar_length = 20
         filled = int(bar_length * float(percent) / 100)
         bar = "█" * filled + "░" * (bar_length - filled)
@@ -1883,7 +2082,17 @@ async def update_progress_message(status_message, progress_info, event, file_nam
         if not file_name:
             file_name = progress_info.get("filename", "...")
 
-        message = get_text("downloading_progress", bar, percent, size, speed, eta, file_name)
+        # Si es una playlist, añadir información de progreso de la playlist
+        if playlist_info:
+            current = playlist_info["current"]
+            total = playlist_info["total"]
+            # Calcular progreso global de la playlist
+            playlist_percent = ((current - 1) / total * 100) + (float(percent) / total)
+            message = get_text("downloading_progress_playlist",
+                             bar, percent, size, speed, eta, file_name,
+                             current, total, f"{playlist_percent:.1f}")
+        else:
+            message = get_text("downloading_progress", bar, percent, size, speed, eta, file_name)
 
         # Usar edición directa sin cola para actualizaciones de progreso (más rápido)
         try:
@@ -2051,11 +2260,12 @@ async def run_direct_download(event, url, filename, status_message, final_output
         debug(f"[DIRECT_DOWNLOAD] Cleaning up. ID {event.id}")
         active_tasks.pop(event.id, None)
 
-async def run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False):
+async def run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=None):
     try:
         debug("[URL_DOWNLOAD] Creating URL download subprocess...")
         debug(f"[URL_DOWNLOAD] Final output directory: {final_output_dir}")
         debug(f"[URL_DOWNLOAD] Is full playlist: {is_full_playlist}")
+        debug(f"[URL_DOWNLOAD] Total videos in playlist: {total_videos}")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -2069,7 +2279,8 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
             playlist_downloads[event.id] = {
                 "is_full_playlist": True,
                 "final_output_dir": final_output_dir,
-                "downloaded_files": []
+                "downloaded_files": [],
+                "total_videos": total_videos
             }
             debug(f"[URL_DOWNLOAD] Playlist download registered with ID {event.id}")
 
@@ -2079,10 +2290,11 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
         update_interval = PROGRESS_UPDATE_INTERVAL  # Intervalo dinámico basado en PARALLEL_DOWNLOADS
         current_filename = None  # Almacenar el nombre del archivo actual (solo nombre, no path completo)
         current_filepath = None  # Almacenar el path completo del archivo actual
+        current_video_index = None  # Índice del vídeo actual en la playlist
 
         # Leer stdout línea por línea en tiempo real
         async def read_stdout():
-            nonlocal last_update_time, current_filename, current_filepath
+            nonlocal last_update_time, current_filename, current_filepath, current_video_index
             async for line in proc.stdout:
                 line_str = line.decode().strip()
                 stdout_lines.append(line_str)
@@ -2095,23 +2307,26 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                     full_path = line_str[path_start:].strip()
                     current_filepath = full_path  # Guardar el path completo para operaciones de archivo
                     current_filename = os.path.basename(full_path)  # Guardar solo el nombre para mostrar al usuario
+
+                    # Extraer índice de playlist del nombre del archivo (formato: 001-nombre.mp4, 016-nombre.mp4, etc.)
+                    if is_full_playlist:
+                        match = re.match(r'^(\d+)-', current_filename)
+                        if match:
+                            current_video_index = int(match.group(1))
+                            debug(f"[URL_DOWNLOAD] Playlist video index detected: {current_video_index}/{total_videos}")
+
                     debug(f"[URL_DOWNLOAD] File destination detected: {current_filepath}")
                     debug(f"[URL_DOWNLOAD] Display filename: {current_filename}")
 
                 # Detectar archivo completado: [download] 100% of 123.45MiB in 00:30
                 # o [download] <filename> has already been downloaded
+                # NOTA: NO mover archivos aquí porque pueden ser archivos parciales (vídeo o audio separados)
+                # que yt-dlp aún necesita mergear
                 if "[download] 100%" in line_str or "has already been downloaded" in line_str:
-                    # Agregar archivo a la lista de descargados si es playlist
+                    # Solo registrar para tracking, pero NO mover archivos
                     if is_full_playlist and event.id in playlist_downloads:
                         if current_filepath:
-                            # current_filepath contiene el path completo
-                            if os.path.exists(current_filepath) and current_filepath not in playlist_downloads[event.id]["downloaded_files"]:
-                                playlist_downloads[event.id]["downloaded_files"].append(current_filepath)
-                                debug(f"[URL_DOWNLOAD] ✅ File completed and added to playlist: {current_filepath}")
-                            elif not os.path.exists(current_filepath):
-                                debug(f"[URL_DOWNLOAD] ⚠️ File does not exist yet: {current_filepath}")
-                            else:
-                                debug(f"[URL_DOWNLOAD] ℹ️ File already in list: {current_filepath}")
+                            debug(f"[URL_DOWNLOAD] File download completed (may need merging): {current_filepath}")
 
                 # Detectar líneas de progreso: [download]  45.2% of 123.45MiB at 1.23MiB/s ETA 00:30
                 if "[download]" in line_str and "%" in line_str:
@@ -2124,7 +2339,11 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                         progress_info = parse_progress(line_str)
                         if progress_info:
                             debug(f"[URL_DOWNLOAD] Updating progress message: {progress_info}")
-                            await update_progress_message(status_message, progress_info, event, current_filename)
+                            # Pasar información de playlist si está disponible
+                            playlist_info = None
+                            if is_full_playlist and current_video_index and total_videos:
+                                playlist_info = {"current": current_video_index, "total": total_videos}
+                            await update_progress_message(status_message, progress_info, event, current_filename, playlist_info)
                         else:
                             debug(f"[URL_DOWNLOAD] Could not parse progress from: {line_str}")
 
@@ -2183,6 +2402,13 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                         icon = get_file_icon(file_ext)
                         message = get_text("playlist_stored", icon, len(stored_files))
                         await safe_reply(event, message, parse_mode=PARSE_MODE)
+
+                    # Limpiar información de playlist
+                    if event.id in playlist_downloads:
+                        playlist_downloads.pop(event.id, None)
+                    # Limpiar información de playlist
+                    if event.id in playlist_downloads:
+                        playlist_downloads.pop(event.id, None)
                 else:
                     # Video individual o primer video de playlist - mostrar botones normales
                     for temp_file_path in temp_file_paths:
@@ -2201,6 +2427,10 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                             await handle_success(event, final_file_path)
                         else:
                             warning(f"[URL_DOWNLOAD] Output file not found: {temp_file_path}")
+
+                    # Limpiar información de playlist
+                    if event.id in playlist_downloads:
+                        playlist_downloads.pop(event.id, None)
             else:
                 warning("[URL_DOWNLOAD] No downloaded files found in yt-dlp output")
                 debug(f"[URL_DOWNLOAD] Command executed: {' '.join(cmd)}")

@@ -23,7 +23,7 @@ from debug import *
 from basic import *
 from message_queue import TelegramMessageQueue
 
-VERSION = "3.1.1"
+VERSION = "3.1.2"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -415,8 +415,17 @@ async def handle_files(event):
     active_tasks[event.id] = task
 
 async def limited_download(event):
-    async with download_semaphore:
-        await download_media(event)
+    try:
+        debug(f"[DOWNLOAD] limited_download() called for event.id={event.id}")
+        async with download_semaphore:
+            await download_media(event)
+        debug(f"[DOWNLOAD] limited_download() completed for event.id={event.id}")
+    except Exception as e:
+        error(f"[DOWNLOAD] ❌ Unhandled exception in limited_download for event.id={event.id}: {e}")
+        error(f"[DOWNLOAD] Exception type: {type(e).__name__}")
+        import traceback
+        error(f"[DOWNLOAD] Traceback: {traceback.format_exc()}")
+        # No re-lanzar para evitar que Telethon capture silenciosamente
 
 def create_upload_progress_callback(status_message, file_name):
     """
@@ -432,7 +441,11 @@ def create_upload_progress_callback(status_message, file_name):
             return
         try:
             current_time = asyncio.get_event_loop().time()
-            if current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL:
+            # Siempre actualizar si llegamos al 100%, sin importar el intervalo
+            is_complete = (current >= total)
+            should_update = (current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL) or is_complete
+
+            if should_update:
                 last_update_time[0] = current_time
 
                 # Calcular progreso
@@ -516,7 +529,16 @@ def create_progress_callback(status_message, event, file_name):
 
         try:
             current_time = asyncio.get_event_loop().time()
-            if current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL:
+            # Siempre actualizar si llegamos al 100%, sin importar el intervalo
+            is_complete = (current >= total)
+            should_update = (current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL) or is_complete
+
+            # Log cuando llegamos al 100%
+            if is_complete and not hasattr(progress_callback, 'logged_100'):
+                debug(f"[DOWNLOAD PROGRESS] Reached 100% ({current}/{total} bytes)")
+                progress_callback.logged_100 = True
+
+            if should_update:
                 last_update_time[0] = current_time
 
                 # Calcular progreso
@@ -569,11 +591,20 @@ def create_progress_callback(status_message, event, file_name):
 
                 # Usar edición directa sin cola para actualizaciones de progreso (más rápido)
                 try:
+                    # Log cuando actualizamos al 100%
+                    if is_complete:
+                        debug(f"[DOWNLOAD PROGRESS] Updating message to 100%")
+
                     await status_message.edit(
                         message,
                         buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
                         parse_mode=PARSE_MODE
                     )
+
+                    # Log cuando se actualiza exitosamente al 100%
+                    if is_complete:
+                        debug(f"[DOWNLOAD PROGRESS] ✅ Message updated to 100% successfully")
+
                 except Exception as edit_error:
                     # Si el mensaje fue eliminado o es inválido, marcar como eliminado y dejar de intentar
                     error_msg = str(edit_error)
@@ -590,9 +621,11 @@ def create_progress_callback(status_message, event, file_name):
     return progress_callback
 
 async def download_media(event):
+    debug(f"[DOWNLOAD] download_media() called for event.id={event.id}")
     message = event.message
     media = message.document or message.video or message.audio or message.photo
     if not media:
+        debug(f"[DOWNLOAD] No media found in message, returning")
         return
     file_name = get_file_name(media)
     debug(f"[DOWNLOAD] File {file_name} - Received, starting download")
@@ -638,26 +671,118 @@ async def download_media(event):
             file_size_mb = message.file.size / (1024 * 1024) if message.file and message.file.size else 100
             download_timeout = 600 + (file_size_mb / 100) * 120  # 10 min base + 2 min por cada 100MB
             debug(f"[DOWNLOAD] Download timeout set to {int(download_timeout)}s ({int(download_timeout/60)}min) for {file_size_mb:.1f}MB file")
+            debug(f"[DOWNLOAD] Starting download to: {temp_file_path}")
+            debug(f"[DOWNLOAD] Progress callback enabled: {progress_callback is not None}")
 
             await asyncio.wait_for(
                 bot.download_media(message, file=temp_file_path, progress_callback=progress_callback),
                 timeout=download_timeout
             )
 
+            debug(f"[DOWNLOAD] ✅ bot.download_media() completed successfully")
+            debug(f"[DOWNLOAD] Checking if temp file exists...")
+
             # Mover archivo de /tmp a carpeta final
             debug(f"[DOWNLOAD] Moving file from temp to final location...")
-            shutil.move(temp_file_path, final_file_path)
-            debug(f"[DOWNLOAD] ✅ File moved to: {final_file_path}")
+            debug(f"[DOWNLOAD] Source: {temp_file_path}")
+            debug(f"[DOWNLOAD] Destination: {final_file_path}")
 
-            # Descarga exitosa
+            try:
+                # Verificar que el archivo temporal existe antes de mover
+                if not os.path.exists(temp_file_path):
+                    error(f"[DOWNLOAD] ❌ Temporary file not found: {temp_file_path}")
+                    raise FileNotFoundError(f"Temporary file not found: {temp_file_path}")
+
+                debug(f"[DOWNLOAD] ✅ Temporary file exists")
+                temp_size = os.path.getsize(temp_file_path)
+                debug(f"[DOWNLOAD] Temporary file size: {temp_size} bytes ({temp_size / (1024*1024):.2f} MB)")
+
+                # Verificar permisos de lectura
+                if not os.access(temp_file_path, os.R_OK):
+                    error(f"[DOWNLOAD] ❌ No read permission for temp file: {temp_file_path}")
+                    raise PermissionError(f"No read permission for temp file")
+
+                debug(f"[DOWNLOAD] ✅ Temp file is readable")
+
+                # Verificar que el directorio de destino existe
+                dest_dir = os.path.dirname(final_file_path)
+                if not os.path.exists(dest_dir):
+                    error(f"[DOWNLOAD] ❌ Destination directory does not exist: {dest_dir}")
+                    raise FileNotFoundError(f"Destination directory not found: {dest_dir}")
+
+                debug(f"[DOWNLOAD] ✅ Destination directory exists: {dest_dir}")
+
+                # Verificar permisos de escritura en destino
+                if not os.access(dest_dir, os.W_OK):
+                    error(f"[DOWNLOAD] ❌ No write permission for destination directory: {dest_dir}")
+                    raise PermissionError(f"No write permission for destination directory")
+
+                debug(f"[DOWNLOAD] ✅ Destination directory is writable")
+
+                # Mover archivo de forma asíncrona para no bloquear el event loop
+                # shutil.move() puede tardar mucho con archivos grandes
+                debug(f"[DOWNLOAD] Executing shutil.move() asynchronously...")
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, shutil.move, temp_file_path, final_file_path)
+                debug(f"[DOWNLOAD] ✅ shutil.move() completed")
+
+                # Verificar que el archivo final existe
+                if not os.path.exists(final_file_path):
+                    error(f"[DOWNLOAD] ❌ Final file not found after move: {final_file_path}")
+                    raise FileNotFoundError(f"Final file not found after move: {final_file_path}")
+
+                debug(f"[DOWNLOAD] ✅ Final file exists")
+                final_size = os.path.getsize(final_file_path)
+                debug(f"[DOWNLOAD] Final file size: {final_size} bytes ({final_size / (1024*1024):.2f} MB)")
+
+                # Verificar que los tamaños coinciden
+                if temp_size != final_size:
+                    warning(f"[DOWNLOAD] ⚠️ File size mismatch! Temp: {temp_size}, Final: {final_size}")
+                else:
+                    debug(f"[DOWNLOAD] ✅ File sizes match")
+
+            except Exception as move_error:
+                error(f"[DOWNLOAD] ❌ Error moving file: {move_error}")
+                error(f"[DOWNLOAD] Error type: {type(move_error).__name__}")
+                import traceback
+                error(f"[DOWNLOAD] Traceback: {traceback.format_exc()}")
+                # Re-lanzar la excepción para que se maneje en el except general
+                raise
+
+            # Descarga exitosa - borrar mensaje de progreso
+            debug(f"[DOWNLOAD] Deleting progress message...")
             if status_message:
-                await safe_delete(status_message)
+                try:
+                    debug(f"[DOWNLOAD] Calling safe_delete with wait_for_result=True...")
+                    delete_result = await safe_delete(status_message, wait_for_result=True)
+                    debug(f"[DOWNLOAD] safe_delete returned: {delete_result}")
+                    debug(f"[DOWNLOAD] ✅ Progress message deleted successfully")
+                except asyncio.TimeoutError:
+                    warning(f"[DOWNLOAD] ⚠️ Timeout deleting progress message (waited 5 minutes)")
+                except Exception as delete_error:
+                    warning(f"[DOWNLOAD] ⚠️ Could not delete progress message: {delete_error}")
+                    warning(f"[DOWNLOAD] Delete error type: {type(delete_error).__name__}")
+                    # Continuar aunque falle el borrado
+            else:
+                debug(f"[DOWNLOAD] No status message to delete")
 
             # Mostrar información detallada del archivo descargado (sin botones de acción)
-            await handle_success(event, final_file_path, show_action_buttons=False)
-            debug(f"[DOWNLOAD] File {file_name} - Downloaded")
+            debug(f"[DOWNLOAD] Calling handle_success for: {final_file_path}")
+            try:
+                await handle_success(event, final_file_path, show_action_buttons=False)
+                debug(f"[DOWNLOAD] ✅ handle_success completed")
+            except Exception as success_error:
+                error(f"[DOWNLOAD] ❌ Error in handle_success: {success_error}")
+                error(f"[DOWNLOAD] Success error type: {type(success_error).__name__}")
+                import traceback
+                error(f"[DOWNLOAD] Traceback: {traceback.format_exc()}")
+                # Re-lanzar para que se capture en el except general
+                raise
+
+            debug(f"[DOWNLOAD] ✅ File {file_name} - Downloaded successfully")
 
             # Salir del bucle si la descarga fue exitosa
+            debug(f"[DOWNLOAD] Breaking from retry loop")
             break
 
         except asyncio.CancelledError:
@@ -718,6 +843,12 @@ async def download_media(event):
 
         except Exception as e:
             error_msg = str(e)
+            error_type = type(e).__name__
+
+            # Loguear SIEMPRE el error antes de decidir qué hacer
+            error(f"[DOWNLOAD] ❌ Exception caught in download loop: {error_type} - {error_msg}")
+            import traceback
+            error(f"[DOWNLOAD] Traceback: {traceback.format_exc()}")
 
             # Errores que deben reintentar: TimeoutError, ValueError, errores de red, errores internos de Telegram
             should_retry = (
@@ -730,6 +861,8 @@ async def download_media(event):
                 "connection" in error_msg.lower() or
                 "network" in error_msg.lower()
             )
+
+            debug(f"[DOWNLOAD] should_retry={should_retry} for error type {error_type}")
 
             if should_retry:
                 # Eliminar archivo parcialmente descargado (temporal)
@@ -770,10 +903,16 @@ async def download_media(event):
                         except Exception as msg_error:
                             error(f"[DOWNLOAD] Error updating status message: {msg_error}")
             else:
+                # Error que NO debe reintentar - loguear y re-lanzar
+                error(f"[DOWNLOAD] ❌ Non-retryable error, re-raising: {error_type} - {error_msg}")
                 raise
+
+    # Si llegamos aquí, el bucle terminó sin break (todos los intentos fallaron)
+    debug(f"[DOWNLOAD] Exited retry loop for {file_name}")
 
     # Limpiar tareas activas
     active_tasks.pop(event.id, None)
+    debug(f"[DOWNLOAD] Cleaned up active task for event.id={event.id}")
 
 def extract_file(file_path, extract_to):
     try:
@@ -2155,7 +2294,12 @@ async def run_direct_download(event, url, filename, status_message, final_output
                     nonlocal last_update_time
                     current_time = time.time()
 
-                    if current_time - last_update_time >= update_interval:
+                    # Detectar si llegamos al 100%
+                    percent_match_check = re.search(r'(\d+)%', line_str)
+                    is_complete = percent_match_check and int(percent_match_check.group(1)) >= 100
+                    should_update = (current_time - last_update_time >= update_interval) or is_complete
+
+                    if should_update:
                         try:
                             # Extraer porcentaje
                             percent_match = re.search(r'(\d+)%', line_str)
@@ -2251,7 +2395,10 @@ async def run_direct_download(event, url, filename, status_message, final_output
         if status_message:
             await safe_delete(status_message)
 
-        error(f"[DIRECT_DOWNLOAD] Error during direct download: {e}")
+        error(f"[DIRECT_DOWNLOAD] ❌ Error during direct download: {e}")
+        error(f"[DIRECT_DOWNLOAD] Exception type: {type(e).__name__}")
+        import traceback
+        error(f"[DIRECT_DOWNLOAD] Traceback: {traceback.format_exc()}")
         await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
         # Limpiar archivo temporal
         if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
@@ -2333,7 +2480,12 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                     current_time = asyncio.get_event_loop().time()
                     time_diff = current_time - last_update_time
                     debug(f"[URL_DOWNLOAD] Progress detected. Time since last update: {time_diff:.2f}s (interval: {update_interval}s)")
-                    if time_diff >= update_interval:
+
+                    # Detectar si llegamos al 100%
+                    is_complete = "[download] 100%" in line_str
+                    should_update = (time_diff >= update_interval) or is_complete
+
+                    if should_update:
                         last_update_time = current_time
                         # Parsear y actualizar mensaje
                         progress_info = parse_progress(line_str)
@@ -2445,6 +2597,18 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
         # No limpiar playlist_downloads aquí si fue cancelada - se limpia en handle_playlist_cancel_confirmation
         await handle_cancel(status_message)
         raise
+    except Exception as e:
+        error(f"[URL_DOWNLOAD] ❌ Error during URL download: {e}")
+        error(f"[URL_DOWNLOAD] Exception type: {type(e).__name__}")
+        import traceback
+        error(f"[URL_DOWNLOAD] Traceback: {traceback.format_exc()}")
+        # Intentar notificar al usuario
+        try:
+            if status_message:
+                await safe_delete(status_message)
+            await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
+        except:
+            pass  # Si falla la notificación, al menos ya logueamos el error original
     finally:
         debug(f"[URL_DOWNLOAD] Cleaning URL download subprocess. ID {event.id}")
         active_tasks.pop(event.id, None)
@@ -2994,11 +3158,20 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
 
 async def handle_success(event, file_path, show_action_buttons=True, icon=None, content_type=None):
     try:
+        debug(f"[SEND_FILE] handle_success called for: {file_path}")
+
+        if not os.path.exists(file_path):
+            error(f"[SEND_FILE] File does not exist: {file_path}")
+            return
+
         file_size = os.path.getsize(file_path)
         debug(f"[SEND_FILE] File size: {file_size} bytes")
 
         # Obtener información detallada del archivo
+        debug(f"[SEND_FILE] Getting file info...")
         file_info = await get_file_info(file_path)
+        debug(f"[SEND_FILE] File type: {file_info.get('type', 'unknown')}")
+
         filename = get_filename_from_path(file_path)
 
         # Si se proporcionó un icono y tipo desde descarga directa, usarlos
@@ -3043,9 +3216,25 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
                 info_lines.append(get_text("file_info_bitrate", file_info['bitrate']))
 
         info_message = "\n".join(info_lines)
-        await safe_reply(event, info_message, parse_mode=PARSE_MODE)
+        debug(f"[SEND_FILE] Message prepared, length: {len(info_message)} chars")
+        debug(f"[SEND_FILE] Sending success message to user...")
+        debug(f"[SEND_FILE] Calling safe_reply with wait_for_result=True...")
+
+        try:
+            reply_result = await safe_reply(event, info_message, parse_mode=PARSE_MODE, wait_for_result=True)
+            debug(f"[SEND_FILE] safe_reply returned: {reply_result}")
+            debug(f"[SEND_FILE] ✅ Success message sent")
+        except asyncio.TimeoutError:
+            error(f"[SEND_FILE] ❌ Timeout sending success message (waited 5 minutes)")
+            raise
+        except Exception as reply_error:
+            error(f"[SEND_FILE] ❌ Error sending success message: {reply_error}")
+            error(f"[SEND_FILE] Reply error type: {type(reply_error).__name__}")
+            raise
 
         # Solo mostrar botones de acción si se solicita (para descargas de URLs) y solo para video/audio
+        debug(f"[SEND_FILE] Checking if action buttons should be shown...")
+        debug(f"[SEND_FILE] show_action_buttons={show_action_buttons}, file_type={file_type}")
         if show_action_buttons and file_type in ["video", "audio"]:
             if file_size <= 2 * 1024 * 1024 * 1024:
                 pending_files[event.id] = file_path
@@ -3060,7 +3249,12 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
             else:
                 debug("[SEND_FILE] File size is too large to send via Telegram. Maximum size is 2GB")
     except Exception as e:
-        error(f"[SEND_FILE] Error sending file: {e}")
+        error(f"[SEND_FILE] ❌ Error in handle_success: {e}")
+        error(f"[SEND_FILE] Exception type: {type(e).__name__}")
+        import traceback
+        error(f"[SEND_FILE] Traceback: {traceback.format_exc()}")
+        # Re-lanzar para que el caller pueda manejar el error
+        raise
 
 
 @bot.on(events.CallbackQuery(pattern=b"listcat:(.+)"))

@@ -23,7 +23,7 @@ from debug import *
 from basic import *
 from message_queue import TelegramMessageQueue
 
-VERSION = "3.1.2"
+VERSION = "3.1.3"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -720,11 +720,17 @@ async def download_media(event):
                 debug(f"[DOWNLOAD] ✅ Destination directory is writable")
 
                 # Mover archivo de forma asíncrona para no bloquear el event loop
-                # shutil.move() puede tardar mucho con archivos grandes
-                debug(f"[DOWNLOAD] Executing shutil.move() asynchronously...")
+                # Usar copy + remove en lugar de move para evitar problemas de permisos con copystat
+                debug(f"[DOWNLOAD] Copying file asynchronously...")
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, shutil.move, temp_file_path, final_file_path)
-                debug(f"[DOWNLOAD] ✅ shutil.move() completed")
+
+                # Copiar archivo (sin copystat para evitar PermissionError)
+                await loop.run_in_executor(None, shutil.copy, temp_file_path, final_file_path)
+                debug(f"[DOWNLOAD] ✅ File copied successfully")
+
+                # Eliminar archivo temporal
+                await loop.run_in_executor(None, os.remove, temp_file_path)
+                debug(f"[DOWNLOAD] ✅ Temporary file removed")
 
                 # Verificar que el archivo final existe
                 if not os.path.exists(final_file_path):

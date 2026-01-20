@@ -23,7 +23,7 @@ from debug import *
 from basic import *
 from message_queue import TelegramMessageQueue
 
-VERSION = "3.1.3"
+VERSION = "3.1.4"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -720,13 +720,14 @@ async def download_media(event):
                 debug(f"[DOWNLOAD] ✅ Destination directory is writable")
 
                 # Mover archivo de forma asíncrona para no bloquear el event loop
-                # Usar copy + remove en lugar de move para evitar problemas de permisos con copystat
-                debug(f"[DOWNLOAD] Copying file asynchronously...")
+                # Usar copyfile + remove en lugar de move/copy para evitar problemas de permisos
+                # copyfile() solo copia el contenido, NO intenta copiar permisos/metadata
+                debug(f"[DOWNLOAD] Copying file asynchronously (content only, no metadata)...")
                 loop = asyncio.get_event_loop()
 
-                # Copiar archivo (sin copystat para evitar PermissionError)
-                await loop.run_in_executor(None, shutil.copy, temp_file_path, final_file_path)
-                debug(f"[DOWNLOAD] ✅ File copied successfully")
+                # Copiar solo el contenido del archivo (sin permisos/metadata)
+                await loop.run_in_executor(None, shutil.copyfile, temp_file_path, final_file_path)
+                debug(f"[DOWNLOAD] ✅ File content copied successfully")
 
                 # Eliminar archivo temporal
                 await loop.run_in_executor(None, os.remove, temp_file_path)
@@ -1314,7 +1315,9 @@ async def cancel_download(event):
                     filename = os.path.basename(temp_file_path)
                     final_file_path = os.path.join(final_output_dir, filename)
 
-                    shutil.move(temp_file_path, final_file_path)
+                    # Usar copyfile + remove para evitar PermissionError en cross-device
+                    shutil.copyfile(temp_file_path, final_file_path)
+                    os.remove(temp_file_path)
                     moved_count += 1
                     debug(f"[CANCEL] ✅ Moved: {filename}")
                 except Exception as e:
@@ -2374,7 +2377,9 @@ async def run_direct_download(event, url, filename, status_message, final_output
                     final_file_path = os.path.join(final_output_dir, f"{base}_{counter}{ext}")
                     counter += 1
 
-            shutil.move(temp_file_path, final_file_path)
+            # Usar copyfile + remove para evitar PermissionError en cross-device
+            shutil.copyfile(temp_file_path, final_file_path)
+            os.remove(temp_file_path)
             debug(f"[DIRECT_DOWNLOAD] File moved to: {final_file_path}")
 
             await handle_success(event, final_file_path, icon=icon, content_type=content_type)
@@ -2548,7 +2553,9 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                             debug(f"[URL DOWNLOAD] Temp: {temp_file_path}")
                             debug(f"[URL DOWNLOAD] Final: {final_file_path}")
 
-                            shutil.move(temp_file_path, final_file_path)
+                            # Usar copyfile + remove para evitar PermissionError en cross-device
+                            shutil.copyfile(temp_file_path, final_file_path)
+                            os.remove(temp_file_path)
                             debug(f"[URL DOWNLOAD] ✅ File moved to: {final_file_path}")
                             stored_files.append(filename)
                         else:
@@ -2579,7 +2586,9 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                             debug(f"[URL DOWNLOAD] Temp: {temp_file_path}")
                             debug(f"[URL DOWNLOAD] Final: {final_file_path}")
 
-                            shutil.move(temp_file_path, final_file_path)
+                            # Usar copyfile + remove para evitar PermissionError en cross-device
+                            shutil.copyfile(temp_file_path, final_file_path)
+                            os.remove(temp_file_path)
                             debug(f"[URL DOWNLOAD] ✅ File moved to: {final_file_path}")
 
                             await handle_success(event, final_file_path)

@@ -2,7 +2,7 @@
 FROM ubuntu:22.04
 
 # Build argument
-ARG VERSION=3.1.3
+ARG VERSION=3.1.4
 
 # Metadata
 LABEL maintainer="dgongut"

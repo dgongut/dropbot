@@ -13,6 +13,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
+# Copiar archivo de configuración de yt-dlp antes de instalar dependencias
+# Esto permite que yt-dlp descargue automáticamente los scripts EJS necesarios para YouTube
+COPY yt-dlp.conf /etc/yt-dlp.conf
+
 # Instalar dependencias del sistema
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -21,7 +25,20 @@ RUN apt-get update && \
         tzdata \
         ffmpeg \
         unrar \
-        wget && \
+        wget \
+        curl \
+        unzip && \
+    # Instalar Deno (requerido por yt-dlp para descargas de YouTube)
+    # Deno es el runtime de JavaScript recomendado para resolver desafíos JS de YouTube
+    curl -fsSL https://deno.land/install.sh | sh && \
+    mv /root/.deno/bin/deno /usr/local/bin/deno && \
+    chmod +x /usr/local/bin/deno && \
+    # Verificar instalación de Deno
+    deno --version && \
+    # Limpiar archivos temporales
+    rm -rf /root/.deno && \
+    apt-get remove -y curl unzip && \
+    apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 

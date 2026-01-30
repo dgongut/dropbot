@@ -23,7 +23,7 @@ from debug import *
 from basic import *
 from message_queue import TelegramMessageQueue
 
-VERSION = "3.1.4"
+VERSION = "3.1.5"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 

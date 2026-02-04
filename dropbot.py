@@ -23,7 +23,7 @@ from debug import *
 from basic import *
 from message_queue import TelegramMessageQueue
 
-VERSION = "3.1.5"
+VERSION = "3.1.6"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -2787,6 +2787,8 @@ async def get_file_info(file_path):
             info["type"] = "audio"
         elif file_ext in EXTENSIONS_IMAGE:
             info["type"] = "image"
+        elif file_ext in EXTENSIONS_TORRENT:
+            info["type"] = "torrent"
         else:
             info["type"] = "document"
 
@@ -3175,19 +3177,36 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
     try:
         debug(f"[SEND_FILE] handle_success called for: {file_path}")
 
-        if not os.path.exists(file_path):
+        # Para archivos .torrent, el gestor de torrents puede procesarlos inmediatamente
+        # (renombrarlos o eliminarlos), lo cual es comportamiento esperado
+        is_torrent = file_path.lower().endswith('.torrent')
+        file_exists = os.path.exists(file_path)
+
+        if not file_exists and not is_torrent:
             error(f"[SEND_FILE] File does not exist: {file_path}")
             return
 
-        file_size = os.path.getsize(file_path)
-        debug(f"[SEND_FILE] File size: {file_size} bytes")
-
-        # Obtener información detallada del archivo
-        debug(f"[SEND_FILE] Getting file info...")
-        file_info = await get_file_info(file_path)
-        debug(f"[SEND_FILE] File type: {file_info.get('type', 'unknown')}")
-
+        # Obtener información del archivo
         filename = get_filename_from_path(file_path)
+
+        if file_exists:
+            file_size = os.path.getsize(file_path)
+            debug(f"[SEND_FILE] File size: {file_size} bytes")
+            debug(f"[SEND_FILE] Getting file info...")
+            file_info = await get_file_info(file_path)
+            debug(f"[SEND_FILE] File type: {file_info.get('type', 'unknown')}")
+        else:
+            # Archivo .torrent ya procesado por el gestor
+            debug(f"[SEND_FILE] Torrent file already processed by torrent manager (expected behavior)")
+            file_info = {
+                'type': 'torrent',
+                'size_formatted': 'Unknown',
+                'duration_formatted': None,
+                'resolution': None,
+                'codec_video': None,
+                'codec_audio': None,
+                'bitrate': None
+            }
 
         # Si se proporcionó un icono y tipo desde descarga directa, usarlos
         if icon and content_type:
@@ -3199,6 +3218,7 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
                 "video": VID_ICO,
                 "audio": AUD_ICO,
                 "image": IMG_ICO,
+                "torrent": TOR_ICO,
                 "document": DEF_ICO
             }
             icon = icon_map.get(file_info["type"], DEF_ICO)
@@ -3207,9 +3227,12 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
         # Mensaje unificado: Descarga completada + información detallada
         info_lines = [
             get_text("downloaded", icon, filename),
-            "",
-            get_text("file_info_size", file_info['size_formatted'])
+            ""
         ]
+
+        # Solo agregar tamaño si está disponible
+        if file_info['size_formatted'] and file_info['size_formatted'] != 'Unknown':
+            info_lines.append(get_text("file_info_size", file_info['size_formatted']))
 
         # Agregar información específica según el tipo
         if file_info["type"] == "video":

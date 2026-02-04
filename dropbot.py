@@ -23,7 +23,7 @@ from debug import *
 from basic import *
 from message_queue import TelegramMessageQueue
 
-VERSION = "3.1.6"
+VERSION = "3.1.6a"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -734,19 +734,28 @@ async def download_media(event):
                 debug(f"[DOWNLOAD] ✅ Temporary file removed")
 
                 # Verificar que el archivo final existe
-                if not os.path.exists(final_file_path):
-                    error(f"[DOWNLOAD] ❌ Final file not found after move: {final_file_path}")
-                    raise FileNotFoundError(f"Final file not found after move: {final_file_path}")
+                # Para archivos .torrent, el gestor puede procesarlos inmediatamente
+                is_torrent = final_file_path.lower().endswith('.torrent')
+                file_exists = os.path.exists(final_file_path)
 
-                debug(f"[DOWNLOAD] ✅ Final file exists")
-                final_size = os.path.getsize(final_file_path)
-                debug(f"[DOWNLOAD] Final file size: {final_size} bytes ({final_size / (1024*1024):.2f} MB)")
+                if not file_exists:
+                    if is_torrent:
+                        debug(f"[DOWNLOAD] Torrent file was processed by torrent manager (expected behavior)")
+                        # Continuar normalmente, el archivo fue procesado correctamente
+                    else:
+                        error(f"[DOWNLOAD] ❌ Final file not found after move: {final_file_path}")
+                        raise FileNotFoundError(f"Final file not found after move: {final_file_path}")
 
-                # Verificar que los tamaños coinciden
-                if temp_size != final_size:
-                    warning(f"[DOWNLOAD] ⚠️ File size mismatch! Temp: {temp_size}, Final: {final_size}")
-                else:
-                    debug(f"[DOWNLOAD] ✅ File sizes match")
+                if file_exists:
+                    debug(f"[DOWNLOAD] ✅ Final file exists")
+                    final_size = os.path.getsize(final_file_path)
+                    debug(f"[DOWNLOAD] Final file size: {final_size} bytes ({final_size / (1024*1024):.2f} MB)")
+
+                    # Verificar que los tamaños coinciden
+                    if temp_size != final_size:
+                        warning(f"[DOWNLOAD] ⚠️ File size mismatch! Temp: {temp_size}, Final: {final_size}")
+                    else:
+                        debug(f"[DOWNLOAD] ✅ File sizes match")
 
             except Exception as move_error:
                 error(f"[DOWNLOAD] ❌ Error moving file: {move_error}")

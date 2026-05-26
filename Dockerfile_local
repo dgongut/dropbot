@@ -1,5 +1,5 @@
 # Dockerfile optimizado para desarrollo/testing local
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Metadata
 LABEL maintainer="dgongut"
@@ -46,12 +46,13 @@ RUN apt-get update && \
 COPY . .
 
 # Instalar dependencias de Python
-RUN pip3 install --no-cache-dir -r /app/requirements.txt
+# En Ubuntu 24.04 con Python 3.12, necesitamos --break-system-packages para pip en contenedores
+RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
 
 VOLUME /downloads
 
-# Healthcheck (verificar que el proceso Python esté corriendo)
+# Healthcheck: verifica que el bot está vivo y respondiendo (fichero heartbeat actualizado en <60s)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD pgrep -f "python3 dropbot.py" || exit 1
+    CMD [ $(($(date +%s) - $(stat -c %Y /tmp/dropbot_heartbeat 2>/dev/null || echo 0))) -lt 60 ] || exit 1
 
 ENTRYPOINT ["python3", "dropbot.py"]

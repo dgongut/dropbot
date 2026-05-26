@@ -6,8 +6,7 @@ from pathlib import Path
 
 def is_admin(id):
     admins = TELEGRAM_ADMIN.split(',')
-    if str(id) in admins:
-        return True
+    return str(id) in admins
 
 def sanitize_filename(filename):
     base, ext = os.path.splitext(filename)

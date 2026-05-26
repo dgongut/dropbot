@@ -1,8 +1,8 @@
 # Dockerfile optimizado para producción
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Build argument
-ARG VERSION=3.1.6a
+ARG VERSION=3.7.0
 
 # Metadata
 LABEL maintainer="dgongut"
@@ -44,7 +44,8 @@ RUN apt-get update && \
     # Esto permite que yt-dlp descargue automáticamente los scripts EJS necesarios para YouTube
     mv /app/yt-dlp.conf /etc/yt-dlp.conf && \
     # Instalar dependencias de Python antes de limpiar pip
-    pip3 install --no-cache-dir -r /app/requirements.txt && \
+    # En Ubuntu 24.04 con Python 3.12, necesitamos --break-system-packages para pip en contenedores
+    pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt && \
     # Limpiar archivos temporales y cache (mantener wget y ca-certificates para descargas HTTPS)
     rm -rf /tmp/* /root/.deno && \
     apt-get remove -y python3-pip curl unzip && \
@@ -52,8 +53,8 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Healthcheck (verificar que el proceso Python esté corriendo)
+# Healthcheck: verifica que el bot está vivo y respondiendo (fichero heartbeat actualizado en <60s)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD pgrep -f "python3 dropbot.py" || exit 1
+    CMD [ $(($(date +%s) - $(stat -c %Y /tmp/dropbot_heartbeat 2>/dev/null || echo 0))) -lt 60 ] || exit 1
 
 ENTRYPOINT ["python3", "dropbot.py"]

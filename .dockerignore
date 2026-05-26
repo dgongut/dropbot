@@ -19,9 +19,6 @@ __pycache__
 dist
 build
 *.egg
-.pytest_cache
-.coverage
-htmlcov
 
 # Virtual environments
 venv
@@ -45,10 +42,6 @@ docs/
 # CI/CD
 .github
 .gitlab-ci.yml
-
-# Logs
-*.log
-logs/
 
 # Temporary files
 *.tmp

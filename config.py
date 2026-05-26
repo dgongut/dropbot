@@ -7,7 +7,7 @@ DEFAULT_EMPTY_STR = "abc"
 DONORS_URL = "https://donate.dgongut.com/donors.json"
 MAX_DOWNLOAD_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
-URL_PATTERN = re.compile(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+")
+URL_PATTERN = re.compile(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+")
 EXTENSIONS_VIDEO = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".mpeg", ".3gp", ".mts",
     ".m2ts", ".ts", ".divx", ".vob", ".m4v", ".f4v", ".rm", ".rmvb"
@@ -42,6 +42,13 @@ DOWNLOAD_VIDEO = "/video"
 DOWNLOAD_PHOTO = "/photo"
 DOWNLOAD_TORRENT = "/torrent"
 DOWNLOAD_EBOOK = "/ebook"
+
+# Carpeta temporal para archivos de conversión, descargas, thumbnails, etc.
+TEMP_DIR = "/tmp/dropbot_conversions"
+
+# Fichero de heartbeat para healthcheck de Docker (mtime actualizado periódicamente)
+HEARTBEAT_FILE = "/tmp/dropbot_heartbeat"
+HEARTBEAT_INTERVAL = 15  # segundos entre escrituras
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", DEFAULT_EMPTY_STR)
 TELEGRAM_ADMIN = os.environ.get("TELEGRAM_ADMIN", DEFAULT_EMPTY_STR)

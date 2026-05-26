@@ -1,10 +1,10 @@
-from datetime import datetime
+"""
+Módulo de logging (deprecated - usar logger.py).
 
-def debug(message):
-    print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} - DEBUG: {message}')
+Este módulo se mantiene para compatibilidad hacia atrás.
+Internamente usa el nuevo sistema de logging profesional.
+"""
 
-def error(message):
-    print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} - ERROR: {message}')
+from logger import debug, info, warning, error, critical
 
-def warning(message):
-    print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} - WARNING: {message}')
+__all__ = ['debug', 'info', 'warning', 'error', 'critical']

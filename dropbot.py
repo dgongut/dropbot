@@ -2,8 +2,6 @@ import os
 import re
 import sys
 import asyncio
-import zipfile
-import tarfile
 import rarfile
 import shutil
 import glob
@@ -19,13 +17,53 @@ from telethon.tl.types import (
 )
 from config import *
 from translations import get_text, load_locale, PARSE_MODE
-from debug import *
 from basic import *
 from message_queue import TelegramMessageQueue
+from utils.file_helpers import (
+    format_file_size, get_directory_size, get_unique_filename, get_file_icon
+)
+from utils import telegram_helpers
+from utils.telegram_helpers import (
+    safe_edit, safe_reply, safe_respond, safe_answer,
+    safe_delete, safe_send_message, safe_send_file,
+)
+from services.extraction_service import extract_file
+from services.donors_service import print_donors
+from services.video_service import (
+    get_video_metadata, generate_video_thumbnail, format_duration
+)
 
-VERSION = "3.1.6a"
+# Inicializar sistema de logging profesional
+import logger as log_module
+
+# Detectar si estamos en Docker (contenedor)
+IS_DOCKER = os.path.exists('/.dockerenv')
+
+# En Docker, los logs van a stdout para `docker logs`
+# En desarrollo local, se puede usar archivo con rotación
+# En Docker usamos DEBUG en consola para ver toda la actividad en docker logs
+logger = log_module.setup_logger(
+    name='dropbot',
+    log_file=None if IS_DOCKER else '/var/log/dropbot/dropbot.log',
+    log_level='DEBUG',
+    console_level='DEBUG' if IS_DOCKER else 'INFO',  # DEBUG en Docker para ver actividad
+    file_level='DEBUG',
+    max_bytes=10_485_760,  # 10MB
+    backup_count=5,
+    use_colors=True
+)
+
+# Mantener compatibilidad con debug.py
+from debug import debug, info, warning, error, critical
+
+VERSION = "3.7.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
+
+# Log inicial del sistema
+logger.info(f"=" * 60)
+logger.info(f"DropBot v{VERSION} starting...")
+logger.info(f"=" * 60)
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("[CONFIG] LANGUAGE only can be ES/EN")
@@ -61,9 +99,6 @@ DOWNLOAD_PATHS = {
 
 for path in DOWNLOAD_PATHS.values():
     os.makedirs(path, exist_ok=True)
-
-# Carpeta temporal para archivos de conversión, descargas, thumbnails, etc.
-TEMP_DIR = "/tmp/dropbot_conversions"
 
 # Limpiar TODA la carpeta temporal al arrancar (eliminar archivos huérfanos de sesiones anteriores)
 debug(f"[STARTUP] Cleaning temporary directory: {TEMP_DIR}...")
@@ -121,73 +156,8 @@ message_queue = TelegramMessageQueue(
     max_retries=MESSAGE_QUEUE_MAX_RETRIES
 )
 
-# Funciones wrapper para usar la cola de mensajes
-async def safe_edit(message, *args, wait_for_result=False, **kwargs):
-    """Edita un mensaje usando la cola para evitar rate limiting"""
-    return await message_queue.add_message(message.edit, *args, wait_for_result=wait_for_result, **kwargs)
-
-async def safe_reply(event, *args, wait_for_result=False, **kwargs):
-    """Responde a un evento usando la cola para evitar rate limiting"""
-    return await message_queue.add_message(event.reply, *args, wait_for_result=wait_for_result, **kwargs)
-
-async def safe_respond(event, *args, wait_for_result=False, **kwargs):
-    """Responde a un evento usando event.respond y la cola para evitar rate limiting"""
-    return await message_queue.add_message(event.respond, *args, wait_for_result=wait_for_result, **kwargs)
-
-async def safe_answer(event, *args, wait_for_result=False, **kwargs):
-    """Responde a un callback query usando event.answer y la cola para evitar rate limiting"""
-    return await message_queue.add_message(event.answer, *args, wait_for_result=wait_for_result, **kwargs)
-
-async def safe_delete(message, *args, wait_for_result=False, **kwargs):
-    """Elimina un mensaje usando la cola para evitar rate limiting"""
-    return await message_queue.add_message(message.delete, *args, wait_for_result=wait_for_result, **kwargs)
-
-async def safe_send_message(chat_id, *args, wait_for_result=False, **kwargs):
-    """Envía un mensaje usando la cola para evitar rate limiting"""
-    return await message_queue.add_message(bot.send_message, chat_id, *args, wait_for_result=wait_for_result, **kwargs)
-
-async def safe_send_file(chat_id, *args, wait_for_result=False, **kwargs):
-    """Envía un archivo usando la cola para evitar rate limiting"""
-    return await message_queue.add_message(bot.send_file, chat_id, *args, wait_for_result=wait_for_result, **kwargs)
-
-async def get_array_donors_online():
-    """Obtiene la lista de donantes desde el servidor"""
-    headers = {
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
-    }
-
-    try:
-        response = requests.get(DONORS_URL, headers=headers, timeout=10)
-        if response.status_code == 200:
-            try:
-                data = response.json()
-                if isinstance(data, list):
-                    data.sort()
-                    return data
-                else:
-                    error(f"Error getting donors list: data is not a list [{str(data)}]")
-                    return []
-            except ValueError:
-                error(f"Error getting donors list: data is not a json [{response.text}]")
-                return []
-        else:
-            error(f"Error getting donors list: error code [{response.status_code}]")
-            return []
-    except Exception as e:
-        error(f"[DONORS] Error getting donors list: {str(e)}")
-        return []
-
-async def print_donors(chat_id):
-    """Muestra la lista de donantes"""
-    donors = await get_array_donors_online()
-    if donors:
-        result = ""
-        for donor in donors:
-            result += f"· {donor}\n"
-        await safe_send_message(chat_id, get_text("donors_list", result), parse_mode="HTML")
-    else:
-        await safe_send_message(chat_id, get_text("error_getting_donors"), parse_mode=PARSE_MODE)
+# Inyectar dependencias (cola + bot) en el módulo de helpers
+telegram_helpers.init(message_queue, bot)
 
 async def handle_list_files(event):
     """Lista los archivos descargados en el servidor"""
@@ -334,59 +304,6 @@ async def handle_list_files(event):
     except Exception as e:
         error(f"[FILE_LIST] Error listing files: {e}")
         await safe_reply(event, get_text("error_list_files"), parse_mode=PARSE_MODE)
-
-def get_directory_size(directory):
-    """Calcula el tamaño total de una carpeta recursivamente"""
-    total_size = 0
-    try:
-        for dirpath, _, filenames in os.walk(directory):
-            for filename in filenames:
-                filepath = os.path.join(dirpath, filename)
-                if os.path.exists(filepath):
-                    total_size += os.path.getsize(filepath)
-    except Exception as e:
-        warning(f"[FILE_SIZE] Error calculating folder size {directory}: {e}")
-    return total_size
-
-def get_unique_filename(directory, filename):
-    """
-    Genera un nombre de archivo único en el directorio especificado.
-    Si el archivo existe, agrega un sufijo (1), (2), etc.
-    """
-    file_path = os.path.join(directory, filename)
-
-    # Si no existe, retornar el nombre original
-    if not os.path.exists(file_path):
-        return filename
-
-    # Separar nombre base y extensión
-    base_name, extension = os.path.splitext(filename)
-    counter = 1
-
-    # Buscar un nombre único
-    while True:
-        new_filename = f"{base_name} ({counter}){extension}"
-        new_path = os.path.join(directory, new_filename)
-        if not os.path.exists(new_path):
-            return new_filename
-        counter += 1
-
-def get_file_icon(file_extension):
-    """Determina el icono según la extensión del archivo usando las constantes de config.py"""
-    if file_extension in EXTENSIONS_TORRENT:
-        return TOR_ICO
-    elif file_extension in EXTENSIONS_EBOOK:
-        return BOO_ICO
-    elif file_extension in EXTENSIONS_VIDEO:
-        return VID_ICO
-    elif file_extension in EXTENSIONS_AUDIO:
-        return AUD_ICO
-    elif file_extension in EXTENSIONS_IMAGE:
-        return IMG_ICO
-    elif file_extension in EXTENSIONS_COMPRESSED:
-        return ZIP_ICO
-    else:
-        return DEF_ICO
 
 def get_download_path(event):
     message = event.message
@@ -929,119 +846,6 @@ async def download_media(event):
     # Limpiar tareas activas
     active_tasks.pop(event.id, None)
     debug(f"[DOWNLOAD] Cleaned up active task for event.id={event.id}")
-
-def extract_file(file_path, extract_to):
-    try:
-        filename = os.path.basename(file_path)
-        if file_path.lower().endswith('.zip'):
-            debug(f"[EXTRACT] Extracting ZIP file: {filename}")
-            with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                file_count = len(zip_ref.namelist())
-                debug(f"[EXTRACT] ZIP contains {file_count} files")
-                zip_ref.extractall(extract_to)
-            debug(f"[EXTRACT] ZIP extraction completed: {filename}")
-        elif any(file_path.lower().endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz']):
-            debug(f"[EXTRACT] Extracting TAR file: {filename}")
-            with tarfile.open(file_path, 'r:*') as tar_ref:
-                file_count = len(tar_ref.getmembers())
-                debug(f"[EXTRACT] TAR contains {file_count} files")
-                tar_ref.extractall(extract_to)
-            debug(f"[EXTRACT] TAR extraction completed: {filename}")
-        elif rarfile.is_rarfile(file_path):
-            try:
-                debug(f"[EXTRACT] Extracting RAR file: {filename}")
-                with rarfile.RarFile(file_path) as rar_ref:
-                    file_count = len(rar_ref.namelist())
-                    debug(f"[EXTRACT] RAR contains {file_count} files")
-                    rar_ref.extractall(extract_to)
-                debug(f"[EXTRACT] RAR extraction completed: {filename}")
-            except rarfile.RarCannotExec as e:
-                error(f"[EXTRACT] RAR extraction tool not found: {e}")
-                return False
-            except Exception as e:
-                msg = str(e).lower()
-                if ("need to start from first volume" in msg or
-                    "need first volume" in msg or
-                    "missing volume" in msg or
-                    "unexpected end of archive" in msg):
-                    warning(f"[EXTRACT] File {file_path} - Missing RAR parts")
-                    # Eliminar carpeta vacía creada
-                    if os.path.exists(extract_to):
-                        try:
-                            shutil.rmtree(extract_to)
-                            debug(f"[EXTRACT] Deleted empty folder after missing parts error: {extract_to}")
-                        except Exception as cleanup_error:
-                            warning(f"[EXTRACT] Error deleting empty folder {extract_to}: {cleanup_error}")
-                    return "missing_parts"
-                elif ("failed the read enough data" in msg):
-                    # Este error puede ocurrir en archivos RAR válidos cuando 7z intenta leer más datos
-                    # de los disponibles al final del archivo. Verificamos si la extracción fue completa.
-                    if os.path.exists(extract_to) and os.listdir(extract_to):
-                        # Verificar si hay archivos de 0 bytes (señal de extracción incompleta)
-                        has_zero_byte_files = False
-                        zero_byte_count = 0
-                        total_files = 0
-
-                        for root, dirs, files in os.walk(extract_to):
-                            for filename in files:
-                                total_files += 1
-                                file_full_path = os.path.join(root, filename)
-                                if os.path.getsize(file_full_path) == 0:
-                                    has_zero_byte_files = True
-                                    zero_byte_count += 1
-                                    debug(f"[EXTRACT] Found zero-byte file: {file_full_path}")
-
-                        if has_zero_byte_files:
-                            warning(f"[EXTRACT] File {file_path} - Partial extraction: {zero_byte_count}/{total_files} files are empty or incomplete")
-                            # Borrar la carpeta parcialmente extraída
-                            try:
-                                shutil.rmtree(extract_to)
-                                debug(f"[EXTRACT] Deleted partially extracted folder: {extract_to}")
-                            except Exception as cleanup_error:
-                                warning(f"[EXTRACT] Error deleting partially extracted folder {extract_to}: {cleanup_error}")
-                            return "partial"
-                        else:
-                            debug(f"[EXTRACT] File {file_path} - Extraction completed despite read warning")
-                            return True
-                    else:
-                        error(f"[EXTRACT] File {file_path} - Corrupted or incomplete RAR file: {e}")
-                        # Eliminar carpeta vacía creada
-                        if os.path.exists(extract_to):
-                            try:
-                                shutil.rmtree(extract_to)
-                                debug(f"[EXTRACT] Deleted empty folder after corruption error: {extract_to}")
-                            except Exception as cleanup_error:
-                                warning(f"[EXTRACT] Error deleting empty folder {extract_to}: {cleanup_error}")
-                        return "corrupted"
-                elif ("corrupt" in msg or
-                      "damaged" in msg or
-                      "bad rar file" in msg or
-                      "crc failed" in msg or
-                      "checksum error" in msg):
-                    error(f"[EXTRACT] File {file_path} - Corrupted or incomplete RAR file: {e}")
-                    # Eliminar carpeta vacía creada
-                    if os.path.exists(extract_to):
-                        try:
-                            shutil.rmtree(extract_to)
-                            debug(f"[EXTRACT] Deleted empty folder after corruption error: {extract_to}")
-                        except Exception as cleanup_error:
-                            warning(f"[EXTRACT] Error deleting empty folder {extract_to}: {cleanup_error}")
-                    return "corrupted"
-                else:
-                    raise
-        else:
-            return False
-        return True
-
-    except Exception as e:
-        error(f"[EXTRACT] Error extracting file {file_path}: {e}")
-        if os.path.exists(extract_to):
-            try:
-                shutil.rmtree(extract_to)
-                debug(f"[EXTRACT] Deleted folder: {extract_to}")
-            except Exception as cleanup_error:
-                warning(f"[EXTRACT] Error deleting folder {extract_to}: {cleanup_error}")
-        return False
 
 def get_extraction_message_and_buttons(extract_result, filename, extracted_path, file_path, file_id=None, from_manage=False):
     """
@@ -2718,53 +2522,6 @@ def extract_file_paths(stdout_lines):
 
     return final_paths
 
-async def get_video_metadata(file_path):
-    """Obtiene metadatos del video usando ffprobe"""
-    try:
-        debug(f"[METADATA] Getting metadata from: {file_path}")
-
-        cmd = [
-            "ffprobe",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            file_path
-        ]
-
-        debug(f"[METADATA] Running ffprobe...")
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        stdout, stderr = await proc.communicate()
-
-        if proc.returncode == 0:
-            import json
-            data = json.loads(stdout.decode())
-
-            # Buscar el stream de video
-            for stream in data.get("streams", []):
-                if stream.get("codec_type") == "video":
-                    duration = int(float(data.get("format", {}).get("duration", 0)))
-                    width = stream.get("width", 0)
-                    height = stream.get("height", 0)
-                    debug(f"[METADATA] ✅ Metadata obtained: {duration}s, {width}x{height}")
-                    return duration, width, height
-
-            warning(f"[METADATA] ⚠️ Video stream not found")
-        else:
-            error_msg = stderr.decode() if stderr else "Unknown error"
-            error(f"[METADATA] ❌ Error running ffprobe (code {proc.returncode}): {error_msg[:200]}")
-
-        return None, None, None
-    except Exception as e:
-        warning(f"[METADATA] ❌ Exception getting video metadata: {e}")
-        return None, None, None
-
 async def get_file_info(file_path):
     """
     Obtiene información detallada de un archivo (tamaño, duración, resolución, formato).
@@ -2855,75 +2612,6 @@ async def get_file_info(file_path):
             "extension": os.path.splitext(file_path)[1].lower(),
             "type": "document"
         }
-
-def format_file_size(size_bytes):
-    """Formatea el tamaño del archivo en formato legible"""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.2f} PB"
-
-def format_duration(seconds):
-    """Formatea la duración en formato HH:MM:SS o MM:SS"""
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
-
-    if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    else:
-        return f"{minutes:02d}:{secs:02d}"
-
-async def generate_video_thumbnail(video_path, output_path=None, timestamp="00:00:03"):
-    """
-    Genera una miniatura de un video en el segundo especificado.
-    Retorna la ruta del thumbnail generado o None si falla.
-    """
-    try:
-        debug(f"[THUMBNAIL] Generating thumbnail for: {video_path}")
-
-        if output_path is None:
-            # Generar thumbnail en /tmp
-            video_filename = os.path.basename(video_path)
-            base_name = os.path.splitext(video_filename)[0]
-            timestamp_ms = int(time.time() * 1000)
-            output_path = os.path.join(TEMP_DIR, f"{base_name}_{timestamp_ms}_thumb.jpg")
-
-        debug(f"[THUMBNAIL] Output path: {output_path}")
-        debug(f"[THUMBNAIL] Timestamp: {timestamp}")
-
-        cmd = [
-            "ffmpeg",
-            "-i", video_path,
-            "-ss", timestamp,  # Segundo del video para capturar
-            "-vframes", "1",   # Solo 1 frame
-            "-vf", "scale=320:-1",  # Escalar a 320px de ancho manteniendo aspecto
-            "-y",  # Sobrescribir sin preguntar
-            output_path
-        ]
-
-        debug(f"[THUMBNAIL] Running ffmpeg command...")
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        _, stderr = await proc.communicate()
-
-        if proc.returncode == 0 and os.path.exists(output_path):
-            thumb_size = os.path.getsize(output_path)
-            debug(f"[THUMBNAIL] ✅ Thumbnail generated successfully: {output_path} ({thumb_size} bytes)")
-            return output_path
-        else:
-            error_msg = stderr.decode() if stderr else "Unknown error"
-            warning(f"[THUMBNAIL] ❌ Error generating thumbnail (code {proc.returncode}): {error_msg[:200]}")
-            return None
-    except Exception as e:
-        warning(f"[THUMBNAIL] ❌ Exception generating thumbnail: {e}")
-        return None
 
 async def convert_video_to_telegram_compatible(input_path, status_message=None):
     """
@@ -4597,15 +4285,26 @@ async def check_admin_and_warn(event):
         return True
     return False
 
+async def heartbeat_writer():
+    while True:
+        try:
+            with open(HEARTBEAT_FILE, "w") as f:
+                f.write(str(int(time.time())))
+        except Exception as e:
+            error(f"[HEARTBEAT] Failed to write {HEARTBEAT_FILE}: {e}")
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
 async def main():
     debug(f"[STARTUP] DropBot v{VERSION}")
     await bot.start()
     await message_queue.start()  # Iniciar la cola de mensajes
     await set_commands()
     await send_startup_message()
+    heartbeat_task = asyncio.create_task(heartbeat_writer())
     try:
         await bot.run_until_disconnected()
     finally:
+        heartbeat_task.cancel()
         await message_queue.shutdown()  # Detener la cola al finalizar
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ logger = log_module.setup_logger(
 # Mantener compatibilidad con debug.py
 from debug import debug, info, warning, error, critical
 
-VERSION = "3.2.1"
+VERSION = "3.2.1a"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -1815,6 +1815,10 @@ async def handle_playlist_selection(event):
         if not download_full_playlist:
             cmd.insert(1, "--no-playlist")
             debug(f"[PLAYLIST] Added --no-playlist flag")
+        else:
+            # En playlists completas, omitir vídeos no disponibles para no abortar el resto
+            cmd.insert(1, "--ignore-errors")
+            debug(f"[PLAYLIST] Added --ignore-errors flag for full playlist")
 
         # Calcular delay automático basado en el número de vídeos
         # Si download_full_playlist es False, solo descarga 1 vídeo
@@ -1906,6 +1910,10 @@ async def handle_playlist_format_selection(event):
     if not download_full_playlist:
         cmd.insert(1, "--no-playlist")
         debug(f"[PLAYLIST] Added --no-playlist flag")
+    else:
+        # En playlists completas, omitir vídeos no disponibles para no abortar el resto
+        cmd.insert(1, "--ignore-errors")
+        debug(f"[PLAYLIST] Added --ignore-errors flag for full playlist")
 
     # Calcular delay automático basado en el número de vídeos
     # Si download_full_playlist es False, solo descarga 1 vídeo
@@ -2350,8 +2358,15 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
 
         if status_message:
             await safe_delete(status_message)
-        if proc.returncode == 0:
-            temp_file_paths = extract_file_paths(stdout_lines)
+        # yt-dlp devuelve código != 0 si algún vídeo de una playlist no está
+        # disponible, aunque el resto se hayan descargado correctamente.
+        # Recuperamos los archivos realmente descargados y solo reportamos
+        # error si no hay ninguno (descarga parcial = éxito parcial).
+        temp_file_paths = extract_file_paths(stdout_lines)
+
+        if proc.returncode == 0 or temp_file_paths:
+            if proc.returncode != 0:
+                warning(f"[URL_DOWNLOAD] yt-dlp exited with code {proc.returncode} but {len(temp_file_paths)} file(s) downloaded. Processing partial result.")
 
             if temp_file_paths:
                 # Si es playlist completa con múltiples archivos, solo almacenar sin mostrar botones
@@ -2380,12 +2395,14 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                     if stored_files:
                         file_ext = os.path.splitext(stored_files[0])[1].lower()
                         icon = get_file_icon(file_ext)
-                        message = get_text("playlist_stored", icon, len(stored_files))
+                        # Si se descargaron menos vídeos de los esperados (algún
+                        # ítem no disponible), mostrar el conteo parcial X/Y
+                        if total_videos and len(stored_files) < total_videos:
+                            message = get_text("playlist_stored_partial", icon, len(stored_files), total_videos)
+                        else:
+                            message = get_text("playlist_stored", icon, len(stored_files))
                         await safe_reply(event, message, parse_mode=PARSE_MODE)
 
-                    # Limpiar información de playlist
-                    if event.id in playlist_downloads:
-                        playlist_downloads.pop(event.id, None)
                     # Limpiar información de playlist
                     if event.id in playlist_downloads:
                         playlist_downloads.pop(event.id, None)

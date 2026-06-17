@@ -68,6 +68,7 @@
     "list_category_video": "📽️ Videos",
     "playlist_detected": "📋 **Playlist detected**\n\n📝 **Title:** $1\n🔢 **Videos:** $2\n\nWhat do you want to download?",
     "playlist_stored": "$1 **Playlist stored**\n\n✅ **$2 files** have been downloaded and stored successfully.",
+    "playlist_stored_partial": "$1 **Playlist stored (partial)**\n\n⚠️ **$2/$3 files** have been downloaded. The rest were unavailable and were skipped.",
     "list_category_audio": "🎶 Audios",
     "list_category_photo": "🌅 Photos",
     "list_category_document": "📄 Documents",

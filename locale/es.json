@@ -113,6 +113,7 @@
     "list_category_photo": "🌅 Fotos",
     "playlist_detected": "📋 **Playlist detectada**\n\n📝 **Título:** $1\n🔢 **Videos:** $2\n\n¿Qué deseas descargar?",
     "playlist_stored": "$1 **Playlist almacenada**\n\n✅ Se han descargado y almacenado **$2 archivos** correctamente.",
+    "playlist_stored_partial": "$1 **Playlist almacenada (parcial)**\n\n⚠️ Se han descargado **$2/$3 archivos**. El resto no estaban disponibles y se omitieron.",
     "list_category_video": "📽️ Videos",
     "list_empty": "📂 **No hay archivos en esta categoría**\n\nPrueba descargando algo primero.",
     "list_files_header": "📂 **Archivos en el servidor**\n\n$1\n\n**Total:** $2 archivos | **Espacio:** $3",

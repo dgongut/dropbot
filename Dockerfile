@@ -1,8 +1,8 @@
 # Dockerfile optimizado para producción
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 # Build argument
-ARG VERSION=3.2.0
+ARG VERSION=3.2.1
 
 # Metadata
 LABEL maintainer="dgongut"
@@ -19,6 +19,7 @@ WORKDIR /app
 
 # Instalar dependencias del sistema, descargar código e instalar dependencias Python en una sola capa
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         wget \
         ca-certificates \
@@ -44,7 +45,7 @@ RUN apt-get update && \
     # Esto permite que yt-dlp descargue automáticamente los scripts EJS necesarios para YouTube
     mv /app/yt-dlp.conf /etc/yt-dlp.conf && \
     # Instalar dependencias de Python antes de limpiar pip
-    # En Ubuntu 24.04 con Python 3.12, necesitamos --break-system-packages para pip en contenedores
+    # En Ubuntu 26.04 con Python 3.14, necesitamos --break-system-packages para pip en contenedores
     pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt && \
     # Limpiar archivos temporales y cache (mantener wget y ca-certificates para descargas HTTPS)
     rm -rf /tmp/* /root/.deno && \

@@ -1,5 +1,5 @@
 # Dockerfile optimizado para desarrollo/testing local
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 # Metadata
 LABEL maintainer="dgongut"
@@ -19,6 +19,7 @@ COPY yt-dlp.conf /etc/yt-dlp.conf
 
 # Instalar dependencias del sistema
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
@@ -46,7 +47,7 @@ RUN apt-get update && \
 COPY . .
 
 # Instalar dependencias de Python
-# En Ubuntu 24.04 con Python 3.12, necesitamos --break-system-packages para pip en contenedores
+# En Ubuntu 26.04 con Python 3.14, necesitamos --break-system-packages para pip en contenedores
 RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
 
 VOLUME /downloads

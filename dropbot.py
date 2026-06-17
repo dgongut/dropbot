@@ -56,7 +56,7 @@ logger = log_module.setup_logger(
 # Mantener compatibilidad con debug.py
 from debug import debug, info, warning, error, critical
 
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -1767,8 +1767,10 @@ async def handle_playlist_selection(event):
         # Simular selección de formato automática
         format_type = AUTO_DOWNLOAD_FORMAT.lower()
 
-        # Llamar directamente a la lógica de descarga
-        pending_urls.pop(url_id, None)
+        # Reclamar atómicamente para evitar doble descarga por doble click:
+        # el segundo click obtiene None y sale (el branch ASK no necesita esto)
+        if pending_urls.pop(url_id, None) is None:
+            return
         is_audio = format_type == "audio"
         download_full_playlist = playlist_mode == "full"
 
@@ -1852,14 +1854,14 @@ async def handle_playlist_format_selection(event):
     format_type = event.pattern_match.group(2).decode()  # "audio" o "video"
     url_id = event.pattern_match.group(3).decode()
 
-    url_data = pending_urls.get(url_id)
+    # pop atómico para evitar dobles ejecuciones por doble click (doble descarga)
+    url_data = pending_urls.pop(url_id, None)
     if not url_data:
         await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
         return
 
     url = url_data["url"]
     playlist_count = url_data.get("playlist_count", 1)
-    pending_urls.pop(url_id, None)
     is_audio = format_type == "audio"
     download_full_playlist = playlist_mode == "full"
 
@@ -1931,14 +1933,14 @@ async def handle_format_selection(event):
     format_type = event.pattern_match.group(1).decode()
     url_id = event.pattern_match.group(2).decode()
 
-    url_data = pending_urls.get(url_id)
+    # pop atómico para evitar dobles ejecuciones por doble click (doble descarga)
+    url_data = pending_urls.pop(url_id, None)
     if not url_data:
         await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
         return
 
     url = url_data["url"]
     playlist_count = url_data.get("playlist_count", 1)
-    pending_urls.pop(url_id, None)
     is_audio = format_type == "audio"
 
     format_flag = "bestaudio" if is_audio else "bv*+ba/best"
@@ -4078,7 +4080,14 @@ async def handle_send_choice(event):
     await safe_answer(event)
     action = event.pattern_match.group(1).decode()
     file_id = int(event.pattern_match.group(2).decode())
-    file_path = pending_files.get(file_id)
+
+    # Extraer y eliminar atómicamente la entrada para evitar dobles ejecuciones
+    # por doble click (condición de carrera): el segundo click obtiene None y sale
+    file_path = pending_files.pop(file_id, None)
+
+    if file_path is None:
+        # Ya procesado por otro click (doble click) o entrada inexistente
+        return
 
     if not os.path.exists(file_path):
         await safe_edit(event, get_text("error_file_does_not_exist_user"), parse_mode=PARSE_MODE)

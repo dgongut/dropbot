@@ -35,7 +35,8 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | TELEGRAM_API_HASH              | ✅           | Hash de la API de Telegram (obtenido al crear tu aplicación en https://my.telegram.org) |
 | TELEGRAM_API_ID                | ✅           | ID de la API de Telegram (obtenido al crear tu aplicación en https://my.telegram.org)   |
 | LANGUAGE                       | ✅           | Idioma del bot (por defecto "ES" para español o "EN" para inglés)                       |
-| PARALLEL_DOWNLOADS             | ❌           | Especifica el número de descargas paralelas que permite el sistema (por defecto 2)      |
+| PARALLEL_DOWNLOADS             | ❌           | Número de ficheros que se transfieren a la vez (descargas/subidas simultáneas). Por defecto 2 |
+| FAST_CONNECTIONS               | ❌           | Número de conexiones paralelas por fichero para acelerar la transferencia (estilo FastTelethon). 1 = desactivado (método estándar de Telethon). Recomendado 4-8. Por defecto 8 |
 | FILTER_PHOTO                   | ❌           | Especifica si los archivos de imagen deben almacenarse en una carpeta separada `/photo` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)   |
 | FILTER_AUDIO                   | ❌           | Especifica si los archivos de audio deben almacenarse en una carpeta separada `/audio` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_VIDEO                   | ❌           | Especifica si los archivos de video deben almacenarse en una carpeta separada `/video` en lugar de la carpeta `/downloads`. 0 = no, 1 = sí (por defecto 0)    |
@@ -57,6 +58,7 @@ services:
       - TELEGRAM_API_ID=
       - LANGUAGE=ES
       #- PARALLEL_DOWNLOADS=2
+      #- FAST_CONNECTIONS=8
       #- FILTER_PHOTO=0
       #- FILTER_AUDIO=0
       #- FILTER_VIDEO=0

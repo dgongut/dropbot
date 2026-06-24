@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import asyncio
+import mimetypes
 import rarfile
 import shutil
 import glob
@@ -22,6 +23,7 @@ from message_queue import TelegramMessageQueue
 from utils.file_helpers import (
     format_file_size, get_directory_size, get_unique_filename, get_file_icon
 )
+from utils import fast_telethon
 from utils import telegram_helpers
 from utils.telegram_helpers import (
     safe_edit, safe_reply, safe_respond, safe_answer,
@@ -56,7 +58,7 @@ logger = log_module.setup_logger(
 # Mantener compatibilidad con debug.py
 from debug import debug, info, warning, error, critical
 
-VERSION = "3.2.1a"
+VERSION = "3.3.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -344,10 +346,14 @@ async def limited_download(event):
         error(f"[DOWNLOAD] Traceback: {traceback.format_exc()}")
         # No re-lanzar para evitar que Telethon capture silenciosamente
 
-def create_upload_progress_callback(status_message, file_name):
+def _make_transfer_progress_callback(status_message, file_name, text_key, log_tag, buttons=None):
     """
-    Crea un callback de progreso para envíos a Telegram.
-    Actualiza el mensaje cada PROGRESS_UPDATE_INTERVAL segundos para evitar anti-spam.
+    Crea un callback de progreso reutilizable para descargas y subidas.
+
+    Actualiza `status_message` cada PROGRESS_UPDATE_INTERVAL segundos (y siempre
+    al llegar al 100%) para evitar anti-spam. `text_key` selecciona el texto
+    ("downloading_progress"/"uploading_progress"), `log_tag` el prefijo de logs
+    y `buttons` los botones a mostrar en cada edición (None = sin botones).
     """
     last_update_time = [0]  # Lista para poder modificar en closure
     message_deleted = [False]  # Flag para detectar si el mensaje fue eliminado
@@ -357,102 +363,14 @@ def create_upload_progress_callback(status_message, file_name):
         if status_message is None or message_deleted[0]:
             return
         try:
-            current_time = asyncio.get_event_loop().time()
-            # Siempre actualizar si llegamos al 100%, sin importar el intervalo
-            is_complete = (current >= total)
-            should_update = (current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL) or is_complete
-
-            if should_update:
-                last_update_time[0] = current_time
-
-                # Calcular progreso
-                percent = (current / total) * 100
-
-                # Convertir bytes a formato legible
-                def format_bytes(bytes_val):
-                    for unit in ['B', 'KB', 'MB', 'GB']:
-                        if bytes_val < 1024.0:
-                            return f"{bytes_val:.1f}{unit}"
-                        bytes_val /= 1024.0
-                    return f"{bytes_val:.1f}TB"
-
-                size_current = format_bytes(current)
-                size_total = format_bytes(total)
-
-                # Calcular velocidad (aproximada basada en el intervalo)
-                if last_update_time[0] > 0:
-                    bytes_diff = current - getattr(progress_callback, 'last_current', 0)
-                    time_diff = current_time - getattr(progress_callback, 'last_time', current_time)
-                    if time_diff > 0:
-                        speed = format_bytes(bytes_diff / time_diff) + "/s"
-                    else:
-                        speed = "N/A"
-                else:
-                    speed = "N/A"
-
-                progress_callback.last_current = current
-                progress_callback.last_time = current_time
-
-                # Calcular ETA
-                if hasattr(progress_callback, 'last_current') and speed != "N/A":
-                    remaining_bytes = total - current
-                    if bytes_diff > 0 and time_diff > 0:
-                        eta_seconds = int(remaining_bytes / (bytes_diff / time_diff))
-                        eta_minutes = eta_seconds // 60
-                        eta_secs = eta_seconds % 60
-                        eta = f"{eta_minutes:02d}:{eta_secs:02d}"
-                    else:
-                        eta = "N/A"
-                else:
-                    eta = "N/A"
-
-                # Crear barra de progreso visual
-                bar_length = 20
-                filled = int(bar_length * percent / 100)
-                bar = "█" * filled + "░" * (bar_length - filled)
-
-                message = get_text("uploading_progress", bar, f"{percent:.1f}", f"{size_current}/{size_total}", speed, eta, file_name)
-
-                # Usar edición directa sin cola para actualizaciones de progreso (más rápido)
-                try:
-                    await status_message.edit(message, parse_mode=PARSE_MODE)
-                except Exception as edit_error:
-                    # Si el mensaje fue eliminado o es inválido, marcar como eliminado y dejar de intentar
-                    error_msg = str(edit_error)
-                    if "message ID is invalid" in error_msg or "MESSAGE_ID_INVALID" in error_msg:
-                        debug(f"[UPLOAD PROGRESS] Message was deleted, stopping progress updates")
-                        message_deleted[0] = True
-                    else:
-                        # Otros errores (FloodWaitError, mensaje no modificado, etc.) - solo log
-                        warning(f"[UPLOAD] Error editing progress message: {edit_error}")
-        except Exception as e:
-            # Ignorar errores de actualización (FloodWaitError, etc.)
-            warning(f"[UPLOAD] Error updating upload progress: {e}")
-
-    return progress_callback
-
-def create_progress_callback(status_message, event, file_name):
-    """
-    Crea un callback de progreso para descargas desde Telegram.
-    Actualiza el mensaje cada PROGRESS_UPDATE_INTERVAL segundos para evitar anti-spam.
-    """
-    last_update_time = [0]  # Lista para poder modificar en closure
-    message_deleted = [False]  # Flag para detectar si el mensaje fue eliminado
-
-    async def progress_callback(current, total):
-        # Si no hay mensaje de estado o fue eliminado, no hacer nada
-        if status_message is None or message_deleted[0]:
-            return
-
-        try:
-            current_time = asyncio.get_event_loop().time()
+            current_time = asyncio.get_running_loop().time()
             # Siempre actualizar si llegamos al 100%, sin importar el intervalo
             is_complete = (current >= total)
             should_update = (current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL) or is_complete
 
             # Log cuando llegamos al 100%
             if is_complete and not hasattr(progress_callback, 'logged_100'):
-                debug(f"[DOWNLOAD PROGRESS] Reached 100% ({current}/{total} bytes)")
+                debug(f"[{log_tag} PROGRESS] Reached 100% ({current}/{total} bytes)")
                 progress_callback.logged_100 = True
 
             if should_update:
@@ -472,14 +390,13 @@ def create_progress_callback(status_message, event, file_name):
                 size_current = format_bytes(current)
                 size_total = format_bytes(total)
 
-                # Calcular velocidad (aproximada basada en el intervalo)
-                if last_update_time[0] > 0:
-                    bytes_diff = current - getattr(progress_callback, 'last_current', 0)
-                    time_diff = current_time - getattr(progress_callback, 'last_time', current_time)
-                    if time_diff > 0:
-                        speed = format_bytes(bytes_diff / time_diff) + "/s"
-                    else:
-                        speed = "N/A"
+                # Calcular velocidad (aproximada basada en el intervalo).
+                # Se ignora un bytes_diff negativo (p. ej. al pasar de descarga
+                # rápida a estándar, que reinicia el contador en 0).
+                bytes_diff = current - getattr(progress_callback, 'last_current', 0)
+                time_diff = current_time - getattr(progress_callback, 'last_time', current_time)
+                if bytes_diff >= 0 and time_diff > 0:
+                    speed = format_bytes(bytes_diff / time_diff) + "/s"
                 else:
                     speed = "N/A"
 
@@ -487,15 +404,10 @@ def create_progress_callback(status_message, event, file_name):
                 progress_callback.last_time = current_time
 
                 # Calcular ETA
-                if hasattr(progress_callback, 'last_current') and speed != "N/A":
+                if speed != "N/A" and bytes_diff > 0 and time_diff > 0:
                     remaining_bytes = total - current
-                    if bytes_diff > 0 and time_diff > 0:
-                        eta_seconds = int(remaining_bytes / (bytes_diff / time_diff))
-                        eta_minutes = eta_seconds // 60
-                        eta_secs = eta_seconds % 60
-                        eta = f"{eta_minutes:02d}:{eta_secs:02d}"
-                    else:
-                        eta = "N/A"
+                    eta_seconds = int(remaining_bytes / (bytes_diff / time_diff))
+                    eta = f"{eta_seconds // 60:02d}:{eta_seconds % 60:02d}"
                 else:
                     eta = "N/A"
 
@@ -504,38 +416,135 @@ def create_progress_callback(status_message, event, file_name):
                 filled = int(bar_length * percent / 100)
                 bar = "█" * filled + "░" * (bar_length - filled)
 
-                message = get_text("downloading_progress", bar, f"{percent:.1f}", f"{size_current}/{size_total}", speed, eta, file_name)
+                message = get_text(text_key, bar, f"{percent:.1f}", f"{size_current}/{size_total}", speed, eta, file_name)
 
                 # Usar edición directa sin cola para actualizaciones de progreso (más rápido)
                 try:
-                    # Log cuando actualizamos al 100%
-                    if is_complete:
-                        debug(f"[DOWNLOAD PROGRESS] Updating message to 100%")
-
-                    await status_message.edit(
-                        message,
-                        buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-                        parse_mode=PARSE_MODE
-                    )
-
-                    # Log cuando se actualiza exitosamente al 100%
-                    if is_complete:
-                        debug(f"[DOWNLOAD PROGRESS] ✅ Message updated to 100% successfully")
-
+                    if buttons is not None:
+                        await status_message.edit(message, buttons=buttons, parse_mode=PARSE_MODE)
+                    else:
+                        await status_message.edit(message, parse_mode=PARSE_MODE)
                 except Exception as edit_error:
                     # Si el mensaje fue eliminado o es inválido, marcar como eliminado y dejar de intentar
                     error_msg = str(edit_error)
                     if "message ID is invalid" in error_msg or "MESSAGE_ID_INVALID" in error_msg:
-                        debug(f"[DOWNLOAD PROGRESS] Message was deleted, stopping progress updates")
+                        debug(f"[{log_tag} PROGRESS] Message was deleted, stopping progress updates")
                         message_deleted[0] = True
                     else:
                         # Otros errores (FloodWaitError, mensaje no modificado, etc.) - solo log
-                        warning(f"[DOWNLOAD] Error editing progress message: {edit_error}")
+                        warning(f"[{log_tag}] Error editing progress message: {edit_error}")
         except Exception as e:
             # Ignorar errores de actualización (FloodWaitError, etc.)
-            warning(f"[DOWNLOAD] Error updating Telegram progress: {e}")
+            warning(f"[{log_tag}] Error updating progress: {e}")
 
     return progress_callback
+
+def create_upload_progress_callback(status_message, file_name):
+    """Callback de progreso para envíos a Telegram (sin botones)."""
+    return _make_transfer_progress_callback(
+        status_message, file_name, "uploading_progress", "UPLOAD"
+    )
+
+def create_progress_callback(status_message, event, file_name):
+    """Callback de progreso para descargas desde Telegram (con botón Cancelar)."""
+    buttons = [Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")]
+    return _make_transfer_progress_callback(
+        status_message, file_name, "downloading_progress", "DOWNLOAD", buttons=buttons
+    )
+
+async def _download_to_file(message, temp_file_path, progress_callback):
+    """
+    Descarga el media del mensaje a `temp_file_path`.
+
+    Intenta primero la descarga paralela (FastTelethon) para ficheros grandes;
+    si falla por cualquier motivo, recurre al método estándar de Telethon.
+    """
+    document = message.document
+    file_size = message.file.size if message.file and message.file.size else 0
+    use_fast = (
+        FAST_CONNECTIONS > 1
+        and document is not None
+        and file_size > FAST_TRANSFER_MIN_BYTES
+    )
+
+    if use_fast:
+        try:
+            conns = fast_telethon.connection_count(file_size, FAST_CONNECTIONS)
+            debug(f"[DOWNLOAD] Parallel download: {conns} connection(s) for this file")
+            with open(temp_file_path, "wb") as out:
+                await fast_telethon.download_file(
+                    bot, document, out, FAST_CONNECTIONS, progress_callback
+                )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as fast_err:
+            warning(f"[DOWNLOAD] ⚠️ Parallel download failed ({fast_err}); falling back to standard download")
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except Exception:
+                    pass
+
+    await bot.download_media(message, file=temp_file_path, progress_callback=progress_callback)
+
+
+async def _send_file_fast(entity, file_path, filename, attributes, thumb_path, is_video, progress_callback):
+    """
+    Envía un fichero a Telegram.
+
+    Para ficheros grandes usa subida paralela (FastTelethon) y, si falla por
+    cualquier motivo, recurre al método estándar de Telethon. Devuelve el
+    mensaje enviado.
+    """
+    file_size = os.path.getsize(file_path)
+
+    # Parámetros de envío comunes a ambas rutas (rápida y estándar) para que el
+    # fichero llegue idéntico a Telegram independientemente de por dónde se envíe.
+    ext = os.path.splitext(filename)[1].lower()
+    is_audio = ext in EXTENSIONS_AUDIO
+    mime_type = mimetypes.guess_type(filename)[0]
+    if not mime_type:
+        mime_type = "video/mp4" if is_video else "application/octet-stream"
+    force_document = not (is_video or is_audio)
+    supports_streaming = True if is_video else None
+
+    use_fast = FAST_CONNECTIONS > 1 and file_size > FAST_TRANSFER_MIN_BYTES
+
+    if use_fast:
+        try:
+            conns = fast_telethon.connection_count(file_size, FAST_CONNECTIONS)
+            debug(f"[UPLOAD] Parallel upload: {conns} connection(s) for {filename}")
+            with open(file_path, "rb") as f:
+                handle = await fast_telethon.upload_file(
+                    bot, f, file_size, FAST_CONNECTIONS, progress_callback
+                )
+            return await bot.send_file(
+                entity,
+                file=handle,
+                attributes=attributes,
+                thumb=thumb_path if thumb_path else None,
+                mime_type=mime_type,
+                supports_streaming=supports_streaming,
+                force_document=force_document,
+                progress_callback=None,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as fast_err:
+            warning(f"[UPLOAD] ⚠️ Parallel upload failed ({fast_err}); falling back to standard send")
+
+    return await bot.send_file(
+        entity,
+        file_path,
+        attributes=attributes,
+        thumb=thumb_path if thumb_path else None,
+        mime_type=mime_type,
+        supports_streaming=supports_streaming,
+        force_document=force_document,
+        progress_callback=progress_callback,
+    )
+
 
 async def download_media(event):
     debug(f"[DOWNLOAD] download_media() called for event.id={event.id}")
@@ -592,7 +601,7 @@ async def download_media(event):
             debug(f"[DOWNLOAD] Progress callback enabled: {progress_callback is not None}")
 
             await asyncio.wait_for(
-                bot.download_media(message, file=temp_file_path, progress_callback=progress_callback),
+                _download_to_file(message, temp_file_path, progress_callback),
                 timeout=download_timeout
             )
 
@@ -640,7 +649,7 @@ async def download_media(event):
                 # Usar copyfile + remove en lugar de move/copy para evitar problemas de permisos
                 # copyfile() solo copia el contenido, NO intenta copiar permisos/metadata
                 debug(f"[DOWNLOAD] Copying file asynchronously (content only, no metadata)...")
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
 
                 # Copiar solo el contenido del archivo (sin permisos/metadata)
                 await loop.run_in_executor(None, shutil.copyfile, temp_file_path, final_file_path)
@@ -2311,7 +2320,7 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
 
                 # Detectar líneas de progreso: [download]  45.2% of 123.45MiB at 1.23MiB/s ETA 00:30
                 if "[download]" in line_str and "%" in line_str:
-                    current_time = asyncio.get_event_loop().time()
+                    current_time = asyncio.get_running_loop().time()
                     time_diff = current_time - last_update_time
                     debug(f"[URL_DOWNLOAD] Progress detected. Time since last update: {time_diff:.2f}s (interval: {update_interval}s)")
 
@@ -3560,13 +3569,14 @@ async def handle_download_file(event):
         # Enviar archivo con progreso
         # NO usar wait_for_result=True para no bloquear el event loop
         # Esto permite que el bot siga respondiendo a otros comandos mientras envía
-        await bot.send_file(
+        await _send_file_fast(
             event.chat_id,
             file_path,
-            attributes=attributes,
-            thumb=thumb_path if thumb_path else None,
-            supports_streaming=True if is_video else None,
-            progress_callback=upload_progress
+            filename,
+            attributes,
+            thumb_path,
+            is_video,
+            upload_progress
         )
 
         debug(f"[SEND /manage] ✅ File sent successfully")
@@ -3958,7 +3968,7 @@ async def handle_extract_file(event):
     debug(f"[EXTRACT] Starting extraction of {filename} to {extracted_path}")
 
     # Extraer archivo en un executor para no bloquear (archivos grandes pueden tardar mucho)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     # Tarea para actualizar progreso cada 10 segundos
     extraction_done = asyncio.Event()
@@ -4198,13 +4208,14 @@ async def handle_send_choice(event):
 
             # NO usar wait_for_result=True para no bloquear el event loop
             # Esto permite que el bot siga respondiendo a otros comandos mientras envía
-            message = await bot.send_file(
+            message = await _send_file_fast(
                 event.chat_id,
                 file_path,
-                attributes=attributes,
-                thumb=thumb_path if thumb_path else None,
-                supports_streaming=True if is_video else None,
-                progress_callback=upload_progress
+                display_filename,
+                attributes,
+                thumb_path,
+                is_video,
+                upload_progress
             )
 
             debug(f"[SEND BUTTON] ✅ File sent successfully")

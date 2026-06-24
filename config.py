@@ -62,6 +62,15 @@ FILTER_TORRENT = bool(int(os.environ.get("FILTER_TORRENT", 0)))
 FILTER_EBOOK = bool(int(os.environ.get("FILTER_EBOOK", 0)))
 PARALLEL_DOWNLOADS = int(os.environ.get("PARALLEL_DOWNLOADS", 2))
 
+# Transferencia paralela (estilo FastTelethon): número de conexiones simultáneas
+# por fichero para acelerar descargas y subidas con Telegram. 1 = desactivado
+# (usa el método estándar de Telethon). Recomendado 4-8 para cuentas de bot.
+FAST_CONNECTIONS = int(os.environ.get("FAST_CONNECTIONS", 8))
+
+# Tamaño mínimo (bytes) para activar la transferencia paralela. Por debajo de
+# este umbral el coste de abrir varias conexiones no compensa.
+FAST_TRANSFER_MIN_BYTES = 10 * 1024 * 1024  # 10 MB
+
 # Rutas y filtros para descargas desde URLs (YouTube, Instagram, TikTok, etc.)
 DOWNLOAD_URL_VIDEO = os.environ.get("DOWNLOAD_URL_VIDEO", "/url_video")
 DOWNLOAD_URL_AUDIO = os.environ.get("DOWNLOAD_URL_AUDIO", "/url_audio")

@@ -58,7 +58,7 @@ logger = log_module.setup_logger(
 # Mantener compatibilidad con debug.py
 from debug import debug, info, warning, error, critical
 
-VERSION = "3.3.1"
+VERSION = "3.3.2"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -4331,8 +4331,48 @@ async def heartbeat_writer():
             error(f"[HEARTBEAT] Failed to write {HEARTBEAT_FILE}: {e}")
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
+async def start_pot_provider():
+    """Arranca el servidor local de PO Token que yt-dlp usa para YouTube.
+
+    Sin este proveedor, YouTube devuelve HTTP 403 en los formatos de alta calidad.
+    Devuelve el proceso lanzado, o None si no está disponible o no arrancó.
+    """
+    node_modules = os.path.join(POT_PROVIDER_DIR, "node_modules")
+    if not os.path.isdir(node_modules):
+        warning(f"[POT] Provider not found at {POT_PROVIDER_DIR}, YouTube downloads may fail with HTTP 403")
+        return None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "deno", "run", "--allow-env", "--allow-net", "--allow-ffi=.", "--allow-read=.",
+            os.path.join("..", "src", "main.ts"), "--port", str(POT_PROVIDER_PORT),
+            cwd=node_modules,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+    except Exception as e:
+        error(f"[POT] Failed to launch PO Token provider: {e}")
+        return None
+
+    ping_url = f"http://127.0.0.1:{POT_PROVIDER_PORT}/ping"
+    deadline = time.time() + POT_PROVIDER_STARTUP_TIMEOUT
+    while time.time() < deadline:
+        if proc.returncode is not None:
+            error(f"[POT] PO Token provider exited with code {proc.returncode}")
+            return None
+        try:
+            await asyncio.to_thread(requests.get, ping_url, timeout=2)
+            debug(f"[POT] PO Token provider ready on port {POT_PROVIDER_PORT}")
+            return proc
+        except Exception:
+            await asyncio.sleep(1)
+
+    warning(f"[POT] PO Token provider did not respond in {POT_PROVIDER_STARTUP_TIMEOUT}s")
+    return proc
+
 async def main():
     debug(f"[STARTUP] DropBot v{VERSION}")
+    pot_proc = await start_pot_provider()
     await bot.start()
     await message_queue.start()  # Iniciar la cola de mensajes
     await set_commands()
@@ -4343,6 +4383,8 @@ async def main():
     finally:
         heartbeat_task.cancel()
         await message_queue.shutdown()  # Detener la cola al finalizar
+        if pot_proc and pot_proc.returncode is None:
+            pot_proc.terminate()
 
 if __name__ == "__main__":
     bot.loop.run_until_complete(main())

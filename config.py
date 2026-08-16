@@ -50,6 +50,12 @@ TEMP_DIR = "/tmp/dropbot_conversions"
 HEARTBEAT_FILE = "/tmp/dropbot_heartbeat"
 HEARTBEAT_INTERVAL = 15  # segundos entre escrituras
 
+# Proveedor de PO Token (bgutil) que yt-dlp necesita para descargar de YouTube
+# sin recibir HTTP 403. Se arranca como servidor HTTP local dentro del contenedor
+POT_PROVIDER_DIR = "/opt/bgutil-ytdlp-pot-provider/server"
+POT_PROVIDER_PORT = 4416
+POT_PROVIDER_STARTUP_TIMEOUT = 30  # segundos máximos de espera a que responda
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", DEFAULT_EMPTY_STR)
 TELEGRAM_ADMIN = os.environ.get("TELEGRAM_ADMIN", DEFAULT_EMPTY_STR)
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", DEFAULT_EMPTY_STR)

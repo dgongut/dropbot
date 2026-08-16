@@ -1,8 +1,9 @@
 # Dockerfile optimizado para producción
 FROM ubuntu:26.04
 
-# Build argument
-ARG VERSION=3.3.1
+# Build arguments
+ARG VERSION=3.3.2
+ARG POT_PROVIDER_VERSION=1.3.1
 
 # Metadata
 LABEL maintainer="dgongut"
@@ -37,6 +38,15 @@ RUN apt-get update && \
     chmod +x /usr/local/bin/deno && \
     # Verificar instalación de Deno
     deno --version && \
+    # Instalar el proveedor de PO Token (bgutil), necesario para que YouTube no
+    # devuelva HTTP 403 en los formatos de alta calidad. Se ejecuta como servidor
+    # HTTP local junto al bot, usando el mismo Deno ya instalado
+    wget -q https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${POT_PROVIDER_VERSION}.zip -O /tmp/pot.zip && \
+    unzip -q /tmp/pot.zip -d /tmp && \
+    mv /tmp/bgutil-ytdlp-pot-provider-${POT_PROVIDER_VERSION} /opt/bgutil-ytdlp-pot-provider && \
+    cd /opt/bgutil-ytdlp-pot-provider/server && \
+    deno install --allow-scripts=npm:canvas --frozen && \
+    cd /app && \
     # Descargar y extraer código
     # Se usa el .zip en lugar del .tar.gz porque GNU tar falla al extraer bajo
     # emulación amd64 (los syscalls de creación de ficheros devuelven ENOSYS)

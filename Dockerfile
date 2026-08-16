@@ -38,8 +38,10 @@ RUN apt-get update && \
     # Verificar instalación de Deno
     deno --version && \
     # Descargar y extraer código
-    wget -q https://github.com/dgongut/dropbot/archive/refs/tags/v${VERSION}.tar.gz -O /tmp/dropbot.tar.gz && \
-    tar -xzf /tmp/dropbot.tar.gz -C /tmp && \
+    # Se usa el .zip en lugar del .tar.gz porque GNU tar falla al extraer bajo
+    # emulación amd64 (los syscalls de creación de ficheros devuelven ENOSYS)
+    wget -q https://github.com/dgongut/dropbot/archive/refs/tags/v${VERSION}.zip -O /tmp/dropbot.zip && \
+    unzip -q /tmp/dropbot.zip -d /tmp && \
     mv /tmp/dropbot-${VERSION}/* /app/ && \
     # Mover archivo de configuración de yt-dlp para habilitar EJS
     # Esto permite que yt-dlp descargue automáticamente los scripts EJS necesarios para YouTube

@@ -2,12 +2,44 @@
 Servicio de descompresión de archivos (ZIP, TAR, RAR).
 """
 import os
+import stat
 import shutil
 import zipfile
 import tarfile
 import rarfile
 
 from debug import debug, warning, error
+
+
+def _safe_member_path(extract_to, member_name):
+    """Devuelve la ruta destino si el miembro no puede escapar del destino."""
+    destination = os.path.abspath(extract_to)
+    target = os.path.abspath(os.path.join(destination, member_name))
+
+    try:
+        is_inside = os.path.commonpath((destination, target)) == destination
+    except ValueError:
+        # Puede ocurrir en Windows si las rutas están en unidades distintas.
+        is_inside = False
+
+    if not is_inside:
+        raise ValueError(f"Unsafe archive member path: {member_name!r}")
+    return target
+
+
+def _validate_zip_members(zip_ref, extract_to):
+    for member in zip_ref.infolist():
+        _safe_member_path(extract_to, member.filename)
+        mode = (member.external_attr >> 16) & 0o170000
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"Symbolic links are not allowed in ZIP files: {member.filename!r}")
+
+
+def _validate_tar_members(tar_ref, extract_to):
+    for member in tar_ref.getmembers():
+        _safe_member_path(extract_to, member.name)
+        if member.issym() or member.islnk():
+            raise ValueError(f"Links are not allowed in TAR files: {member.name!r}")
 
 
 def extract_file(file_path, extract_to):
@@ -18,6 +50,7 @@ def extract_file(file_path, extract_to):
             with zipfile.ZipFile(file_path, 'r') as zip_ref:
                 file_count = len(zip_ref.namelist())
                 debug(f"[EXTRACT] ZIP contains {file_count} files")
+                _validate_zip_members(zip_ref, extract_to)
                 zip_ref.extractall(extract_to)
             debug(f"[EXTRACT] ZIP extraction completed: {filename}")
         elif any(file_path.lower().endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz']):
@@ -25,7 +58,13 @@ def extract_file(file_path, extract_to):
             with tarfile.open(file_path, 'r:*') as tar_ref:
                 file_count = len(tar_ref.getmembers())
                 debug(f"[EXTRACT] TAR contains {file_count} files")
-                tar_ref.extractall(extract_to)
+                _validate_tar_members(tar_ref, extract_to)
+                # `filter="data"` añade protección contra archivos
+                # especiales en las versiones de Python que lo soportan.
+                try:
+                    tar_ref.extractall(extract_to, filter="data")
+                except TypeError:
+                    tar_ref.extractall(extract_to)
             debug(f"[EXTRACT] TAR extraction completed: {filename}")
         elif rarfile.is_rarfile(file_path):
             try:

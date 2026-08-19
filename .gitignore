@@ -3,3 +3,5 @@
 
 # Local development files and folders
 .env
+cookies/
+downloads/

@@ -1327,10 +1327,20 @@ def calculate_ytdlp_sleep_interval(playlist_count):
     else:
         return 25
 
+
+def add_ytdlp_cookies(cmd):
+    """Añade cookies al comando yt-dlp si existe el fichero configurado."""
+    if os.path.isfile(YTDLP_COOKIES_FILE):
+        debug(f"[YT-DLP] Using cookies file: {YTDLP_COOKIES_FILE}")
+        return [cmd[0], "--cookies", YTDLP_COOKIES_FILE, *cmd[1:]]
+
+    return cmd
+
 async def detect_playlist(url):
     """Detecta si una URL es una playlist y retorna (is_playlist, playlist_count, playlist_title)"""
     try:
         cmd = ["yt-dlp", "--flat-playlist", "--dump-json", "--no-warnings", url]
+        cmd = add_ytdlp_cookies(cmd)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1377,6 +1387,7 @@ async def detect_content_type(url):
     """Detecta el tipo de contenido sin descargarlo usando yt-dlp --dump-json"""
     try:
         cmd = ["yt-dlp", "--dump-json", "--no-warnings", "--skip-download", "--playlist-items", "1", url]
+        cmd = add_ytdlp_cookies(cmd)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1536,6 +1547,7 @@ async def handle_url_link(event):
             "-o", os.path.join(TEMP_DIR, temp_template),  # Descargar a /tmp
             url
         ]
+        cmd = add_ytdlp_cookies(cmd)
 
         # Calcular delay automático basado en el número de vídeos
         sleep_interval = calculate_ytdlp_sleep_interval(playlist_count)
@@ -1819,6 +1831,7 @@ async def handle_playlist_selection(event):
             "-o", os.path.join(TEMP_DIR, temp_template),
             url
         ]
+        cmd = add_ytdlp_cookies(cmd)
 
         # Si solo quiere el primer video, agregar --no-playlist
         if not download_full_playlist:
@@ -1914,6 +1927,7 @@ async def handle_playlist_format_selection(event):
         "-o", os.path.join(TEMP_DIR, temp_template),
         url
     ]
+    cmd = add_ytdlp_cookies(cmd)
 
     # Si solo quiere el primer video, agregar --no-playlist
     if not download_full_playlist:
@@ -1995,6 +2009,7 @@ async def handle_format_selection(event):
         "-o", os.path.join(TEMP_DIR, temp_template),  # Descargar a /tmp
         url
     ]
+    cmd = add_ytdlp_cookies(cmd)
 
     # Calcular delay automático basado en el número de vídeos (siempre 1 en este caso)
     sleep_interval = calculate_ytdlp_sleep_interval(playlist_count)

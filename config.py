@@ -83,6 +83,9 @@ DOWNLOAD_URL_AUDIO = os.environ.get("DOWNLOAD_URL_AUDIO", "/url_audio")
 FILTER_URL_VIDEO = bool(int(os.environ.get("FILTER_URL_VIDEO", 0)))
 FILTER_URL_AUDIO = bool(int(os.environ.get("FILTER_URL_AUDIO", 0)))
 
+# Cookies opcionales para sitios que requieren una sesión autenticada
+YTDLP_COOKIES_FILE = "/app/cookies/cookies.txt"
+
 # Descarga automática de URLs sin preguntar
 # Valores posibles: "ASK" (preguntar), "VIDEO" (descargar video automáticamente), "AUDIO" (descargar audio automáticamente)
 AUTO_DOWNLOAD_FORMAT = os.environ.get("AUTO_DOWNLOAD_FORMAT", "ASK").upper()

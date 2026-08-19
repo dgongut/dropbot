@@ -10,3 +10,6 @@ services:
         restart: unless-stopped
         volumes:
           - ./downloads:/downloads
+          # Opcional: montar cookies de yt-dlp para sitios que requieren sesión.
+          # Debe ser escribible porque yt-dlp actualiza el cookie jar.
+          - ./cookies:/app/cookies

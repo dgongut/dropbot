@@ -49,8 +49,9 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 ### Cookies opcionales para yt-dlp
 
 Para sitios que requieren una sesión autenticada, crea `cookies/cookies.txt` y
-monta la carpeta en `/app/cookies`. Si el fichero no existe, DropBot continúa
-usando yt-dlp sin cookies.
+monta la carpeta en `/app/cookies`. El volumen debe ser escribible porque
+yt-dlp puede actualizar el cookie jar. Si el fichero no existe, DropBot
+continúa usando yt-dlp sin cookies.
 
 ### Ejemplo de Docker-Compose para su ejecución normal
 
@@ -75,7 +76,7 @@ services:
       #- AUTO_DOWNLOAD_FORMAT=ASK
     volumes:
       - /ruta/para/descargar/general:/downloads
-      #- /ruta/para/cookies:/app/cookies:ro
+      #- /ruta/para/cookies:/app/cookies
       #- /ruta/para/descargar/audio:/audio
       #- /ruta/para/descargar/video:/video
       #- /ruta/para/descargar/foto:/photo

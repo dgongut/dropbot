@@ -2,7 +2,6 @@
 Servicio de descompresión de archivos (ZIP, TAR, RAR).
 """
 import os
-import stat
 import shutil
 import zipfile
 import tarfile
@@ -27,14 +26,6 @@ def _safe_member_path(extract_to, member_name):
     return target
 
 
-def _validate_zip_members(zip_ref, extract_to):
-    for member in zip_ref.infolist():
-        _safe_member_path(extract_to, member.filename)
-        mode = (member.external_attr >> 16) & 0o170000
-        if stat.S_ISLNK(mode):
-            raise ValueError(f"Symbolic links are not allowed in ZIP files: {member.filename!r}")
-
-
 def _validate_tar_members(tar_ref, extract_to):
     for member in tar_ref.getmembers():
         _safe_member_path(extract_to, member.name)
@@ -50,7 +41,6 @@ def extract_file(file_path, extract_to):
             with zipfile.ZipFile(file_path, 'r') as zip_ref:
                 file_count = len(zip_ref.namelist())
                 debug(f"[EXTRACT] ZIP contains {file_count} files")
-                _validate_zip_members(zip_ref, extract_to)
                 zip_ref.extractall(extract_to)
             debug(f"[EXTRACT] ZIP extraction completed: {filename}")
         elif any(file_path.lower().endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz']):

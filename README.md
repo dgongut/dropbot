@@ -46,6 +46,12 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | FILTER_URL_AUDIO               | ❌           | Especifica si los archivos de audio descargados desde URLs deben almacenarse en una carpeta separada `/url_audio` en lugar de donde van los audios. 0 = no, 1 = sí (por defecto 0)    |
 | AUTO_DOWNLOAD_FORMAT           | ❌           | Descarga automática de URLs sin preguntar. Valores: `ASK` (preguntar, por defecto), `VIDEO` (descargar siempre como video), `AUDIO` (descargar siempre como audio)    |
 
+### Cookies opcionales para yt-dlp
+
+Para sitios que requieren una sesión autenticada, crea `cookies/cookies.txt` y
+monta la carpeta en `/app/cookies`. Si el fichero no existe, DropBot continúa
+usando yt-dlp sin cookies.
+
 ### Ejemplo de Docker-Compose para su ejecución normal
 
 ```yaml
@@ -69,6 +75,7 @@ services:
       #- AUTO_DOWNLOAD_FORMAT=ASK
     volumes:
       - /ruta/para/descargar/general:/downloads
+      #- /ruta/para/cookies:/app/cookies:ro
       #- /ruta/para/descargar/audio:/audio
       #- /ruta/para/descargar/video:/video
       #- /ruta/para/descargar/foto:/photo

@@ -10,3 +10,5 @@ services:
         restart: unless-stopped
         volumes:
           - ./downloads:/downloads
+          # Opcional: montar cookies de yt-dlp para sitios que requieren sesión
+          - ./cookies:/app/cookies:ro

@@ -64,3 +64,6 @@ downloads/
 .env
 .env.*
 
+# Cookies (información sensible; se montan en runtime)
+cookies/
+downloads/

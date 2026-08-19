@@ -16,6 +16,7 @@ from config import LANGUAGE
 
 # Constante para el parse_mode por defecto
 PARSE_MODE = "markdown"
+LOCALE_DIR = Path(__file__).resolve().parent / "locale"
 
 
 @lru_cache(maxsize=4)
@@ -36,7 +37,7 @@ def load_locale(locale: str) -> dict:
 		FileNotFoundError: Si el archivo de locale no existe
 		json.JSONDecodeError: Si el archivo no es JSON válido
 	"""
-	locale_path = Path(f"/app/locale/{locale}.json")
+	locale_path = LOCALE_DIR / f"{locale}.json"
 
 	if not locale_path.exists():
 		raise FileNotFoundError(f"Locale file not found: {locale_path}")

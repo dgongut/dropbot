@@ -71,6 +71,10 @@ if LANGUAGE.lower() not in ("es", "en"):
     error("[CONFIG] LANGUAGE only can be ES/EN")
     sys.exit(1)
 
+if AUTO_SEND not in ("ASK", "SEND", "SEND_DELETE", "STORE"):
+    error("[CONFIG] AUTO_SEND only can be ASK/SEND/SEND_DELETE/STORE")
+    sys.exit(1)
+
 load_locale(LANGUAGE.lower())
 
 if DEFAULT_EMPTY_STR == TELEGRAM_TOKEN:
@@ -2913,6 +2917,139 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
         debug(f"[CONVERSION] Returning original unconverted file after exception: {input_path}")
         return input_path
 
+async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after=False):
+    """Envía un archivo a Telegram (convirtiendo vídeo si hace falta).
+
+    Si delete_after=True, elimina el original del servidor tras un envío correcto.
+    Devuelve el mensaje enviado, o None si falló o se canceló la conversión.
+    """
+    thumb_path = None
+    original_file_path = file_path
+    converted_file_path = None
+
+    try:
+        debug(f"[SEND] Preparing file send: {file_path}")
+
+        is_video = file_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'))
+        original_filename = os.path.basename(file_path)
+        display_filename = original_filename
+        attributes = [DocumentAttributeFilename(file_name=original_filename)]
+
+        debug(f"[SEND] File type: {'video' if is_video else 'document'}")
+
+        if is_video:
+            debug(f"[SEND] Starting video conversion...")
+            converted_file_path = await convert_video_to_telegram_compatible(file_path, sending_msg)
+
+            if converted_file_path is None:
+                debug("[SEND] ❌ Conversion cancelled, aborting send")
+                if sending_msg:
+                    await safe_delete(sending_msg)
+                return None
+
+            if converted_file_path != file_path:
+                debug(f"[SEND] Using converted file: {converted_file_path}")
+                file_path = converted_file_path
+                display_filename = os.path.splitext(original_filename)[0] + ".mp4"
+                debug(f"[SEND] Name updated to: {display_filename}")
+                attributes = [DocumentAttributeFilename(file_name=display_filename)]
+            else:
+                debug(f"[SEND] Video already compatible, using original")
+
+            debug(f"[SEND] Getting video metadata...")
+            duration, width, height = await get_video_metadata(file_path)
+            if duration and width and height:
+                debug(f"[SEND] Metadata: {duration}s, {width}x{height}")
+                from telethon.tl.types import DocumentAttributeVideo
+                attributes.append(DocumentAttributeVideo(
+                    duration=duration,
+                    w=width,
+                    h=height,
+                    supports_streaming=True
+                ))
+            else:
+                debug(f"[SEND] ⚠️ Could not get video metadata")
+
+            debug(f"[SEND] Generating thumbnail...")
+            thumb_path = await generate_video_thumbnail(file_path)
+            if thumb_path:
+                debug(f"[SEND] Thumbnail generated: {thumb_path}")
+            else:
+                debug(f"[SEND] ⚠️ Could not generate thumbnail")
+
+        upload_progress = create_upload_progress_callback(sending_msg, display_filename)
+
+        debug(f"[SEND] Starting send to Telegram...")
+        file_size = os.path.getsize(file_path)
+        debug(f"[SEND] File size: {file_size} bytes")
+
+        message = await _send_file_fast(
+            event.chat_id,
+            file_path,
+            display_filename,
+            attributes,
+            thumb_path,
+            is_video,
+            upload_progress
+        )
+
+        debug(f"[SEND] ✅ File sent successfully")
+
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                debug(f"[SEND] Deleting temporary thumbnail: {thumb_path}")
+                os.remove(thumb_path)
+            except Exception as e:
+                warning(f"[SEND] ⚠️ Error deleting temporary thumbnail: {e}")
+
+        if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
+            try:
+                debug(f"[SEND] Deleting temporary converted file: {converted_file_path}")
+                os.remove(converted_file_path)
+                debug(f"[SEND] ✅ Temporary converted file deleted")
+            except Exception as e:
+                warning(f"[SEND] ⚠️ Error deleting temporary converted file: {e}")
+
+        debug(f"[SEND] ✅ File sent to Telegram: {original_file_path}")
+        if sending_msg:
+            await safe_delete(sending_msg)
+
+        if delete_after:
+            debug(f"[SEND] Deleting original file from server: {original_file_path}")
+            os.remove(original_file_path)
+            debug(f"[SEND] ✅ File sent to Telegram and deleted from server: {original_file_path}")
+            await safe_respond(event, get_text("deleted_from_server"), reply_to=message.id, parse_mode=PARSE_MODE)
+
+        return message
+    except Exception as e:
+        error(f"[SEND] ❌ Error sending file {file_path}: {e}")
+
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                debug(f"[SEND] Deleting thumbnail after error: {thumb_path}")
+                os.remove(thumb_path)
+            except Exception as cleanup_error:
+                warning(f"[SEND] ⚠️ Error deleting thumbnail after error: {cleanup_error}")
+
+        if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
+            try:
+                debug(f"[SEND] Deleting converted file after error: {converted_file_path}")
+                os.remove(converted_file_path)
+                debug(f"[SEND] ✅ Temporary converted file deleted after error")
+            except Exception as cleanup_error:
+                warning(f"[SEND] ⚠️ Error deleting temporary converted file after error: {cleanup_error}")
+
+        if sending_msg:
+            try:
+                await safe_delete(sending_msg)
+            except Exception as delete_error:
+                warning(f"[SEND] ⚠️ Error deleting progress message: {delete_error}")
+
+        await safe_reply(event, get_text("error_sending_the_file_user"), parse_mode=PARSE_MODE)
+        error(f"[SEND] Error sending file: {e}")
+        return None
+
+
 async def handle_success(event, file_path, show_action_buttons=True, icon=None, content_type=None):
     try:
         debug(f"[SEND_FILE] handle_success called for: {file_path}")
@@ -3012,9 +3149,29 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
 
         # Solo mostrar botones de acción si se solicita (para descargas de URLs) y solo para video/audio
         debug(f"[SEND_FILE] Checking if action buttons should be shown...")
-        debug(f"[SEND_FILE] show_action_buttons={show_action_buttons}, file_type={file_type}")
+        debug(f"[SEND_FILE] show_action_buttons={show_action_buttons}, file_type={file_type}, AUTO_SEND={AUTO_SEND}")
         if show_action_buttons and file_type in ["video", "audio"]:
-            if file_size <= 2 * 1024 * 1024 * 1024:
+            max_telegram_size = 2 * 1024 * 1024 * 1024
+            too_large = file_size > max_telegram_size
+
+            if AUTO_SEND == "STORE":
+                debug("[SEND_FILE] AUTO_SEND=STORE, keeping file on server without asking")
+            elif AUTO_SEND in ("SEND", "SEND_DELETE"):
+                if too_large:
+                    debug("[SEND_FILE] File size is too large to send via Telegram. Maximum size is 2GB. Storing only.")
+                else:
+                    delete_after = AUTO_SEND == "SEND_DELETE"
+                    debug(f"[SEND_FILE] AUTO_SEND={AUTO_SEND}, sending automatically (delete_after={delete_after})")
+                    sending_msg = await safe_reply(
+                        event,
+                        get_text("sending", filename),
+                        parse_mode=PARSE_MODE,
+                        wait_for_result=True
+                    )
+                    await send_file_to_telegram(event, file_path, sending_msg, delete_after=delete_after)
+            elif too_large:
+                debug("[SEND_FILE] File size is too large to send via Telegram. Maximum size is 2GB")
+            else:
                 pending_files[event.id] = file_path
                 buttons = [
                     [
@@ -3024,8 +3181,6 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
                     [Button.inline(get_text("button_only_in_server"), data=f"nosend:{event.id}")]
                 ]
                 await safe_reply(event, get_text("upload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
-            else:
-                debug("[SEND_FILE] File size is too large to send via Telegram. Maximum size is 2GB")
     except Exception as e:
         error(f"[SEND_FILE] ❌ Error in handle_success: {e}")
         error(f"[SEND_FILE] Exception type: {type(e).__name__}")
@@ -4137,160 +4292,28 @@ async def handle_send_choice(event):
         return
 
     if action in ("send", "senddelete"):
-        try:
-            sending_msg = await safe_edit(
+        sending_msg = await safe_edit(
+            event,
+            get_text("sending", os.path.basename(file_path)),
+            parse_mode=PARSE_MODE,
+            wait_for_result=True
+        )
+
+        # Si no se pudo editar el mensaje (timeout en cola), crear uno nuevo
+        if sending_msg is None:
+            sending_msg = await safe_reply(
                 event,
                 get_text("sending", os.path.basename(file_path)),
                 parse_mode=PARSE_MODE,
-                wait_for_result=True
+                wait_for_result=False
             )
 
-            # Si no se pudo editar el mensaje (timeout en cola), crear uno nuevo
-            if sending_msg is None:
-                sending_msg = await safe_reply(
-                    event,
-                    get_text("sending", os.path.basename(file_path)),
-                    parse_mode=PARSE_MODE,
-                    wait_for_result=False
-                )
-
-            debug(f"[SEND BUTTON] Preparing file send: {file_path}")
-
-            # Detectar si es un video y obtener metadatos
-            is_video = file_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'))
-            thumb_path = None
-            original_file_path = file_path  # Guardar ruta original
-            converted_file_path = None  # Para rastrear si se creó un archivo convertido
-
-            debug(f"[SEND BUTTON] File type: {'video' if is_video else 'document'}")
-
-            # Inicializar attributes con el nombre del archivo original
-            original_filename = os.path.basename(file_path)
-            display_filename = original_filename  # Por defecto, usar el nombre original
-            attributes = [DocumentAttributeFilename(file_name=original_filename)]
-
-            if is_video:
-                debug(f"[SEND BUTTON] Starting video conversion...")
-                # Convertir el video a formato compatible con Telegram antes de enviarlo
-                converted_file_path = await convert_video_to_telegram_compatible(file_path, sending_msg)
-
-                # Si la conversión fue cancelada (retorna None), salir
-                if converted_file_path is None:
-                    debug("[SEND BUTTON] ❌ Conversion cancelled, aborting send")
-                    if sending_msg:
-                        await safe_delete(sending_msg)
-                    return
-
-                # Si la conversión creó un archivo diferente, usarlo para enviar
-                if converted_file_path != file_path:
-                    debug(f"[SEND BUTTON] Using converted file: {converted_file_path}")
-                    file_path = converted_file_path
-                    # Actualizar el nombre del archivo a .mp4 (sin _telegram)
-                    display_filename = os.path.splitext(original_filename)[0] + ".mp4"
-                    debug(f"[SEND BUTTON] Name updated to: {display_filename}")
-                    attributes = [DocumentAttributeFilename(file_name=display_filename)]
-                else:
-                    debug(f"[SEND BUTTON] Video already compatible, using original")
-
-                debug(f"[SEND BUTTON] Getting video metadata...")
-                duration, width, height = await get_video_metadata(file_path)
-                if duration and width and height:
-                    debug(f"[SEND BUTTON] Metadata: {duration}s, {width}x{height}")
-                    from telethon.tl.types import DocumentAttributeVideo
-                    attributes.append(DocumentAttributeVideo(
-                        duration=duration,
-                        w=width,
-                        h=height,
-                        supports_streaming=True
-                    ))
-                else:
-                    debug(f"[SEND BUTTON] ⚠️ Could not get video metadata")
-
-                # Generar thumbnail del video
-                debug(f"[SEND BUTTON] Generating thumbnail...")
-                thumb_path = await generate_video_thumbnail(file_path)
-                if thumb_path:
-                    debug(f"[SEND BUTTON] Thumbnail generated: {thumb_path}")
-                else:
-                    debug(f"[SEND BUTTON] ⚠️ Could not generate thumbnail")
-
-            # Crear callback de progreso para el envío
-            upload_progress = create_upload_progress_callback(sending_msg, display_filename)
-
-            debug(f"[SEND BUTTON] Starting send to Telegram...")
-            file_size = os.path.getsize(file_path)
-            debug(f"[SEND BUTTON] File size: {file_size} bytes")
-
-            # NO usar wait_for_result=True para no bloquear el event loop
-            # Esto permite que el bot siga respondiendo a otros comandos mientras envía
-            message = await _send_file_fast(
-                event.chat_id,
-                file_path,
-                display_filename,
-                attributes,
-                thumb_path,
-                is_video,
-                upload_progress
-            )
-
-            debug(f"[SEND BUTTON] ✅ File sent successfully")
-
-            # Limpiar thumbnail temporal si se generó
-            if thumb_path and os.path.exists(thumb_path):
-                try:
-                    debug(f"[SEND BUTTON] Deleting temporary thumbnail: {thumb_path}")
-                    os.remove(thumb_path)
-                except Exception as e:
-                    warning(f"[SEND BUTTON] ⚠️ Error deleting temporary thumbnail: {e}")
-
-            # Limpiar archivo convertido temporal si se generó (diferente del original)
-            if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
-                try:
-                    debug(f"[SEND BUTTON] Deleting temporary converted file: {converted_file_path}")
-                    os.remove(converted_file_path)
-                    debug(f"[SEND BUTTON] ✅ Temporary converted file deleted")
-                except Exception as e:
-                    warning(f"[SEND BUTTON] ⚠️ Error deleting temporary converted file: {e}")
-
-            debug(f"[SEND BUTTON] ✅ File sent to Telegram: {original_file_path}")
-            if sending_msg:
-                await safe_delete(sending_msg)
-
-            if action == "senddelete":
-                # Eliminar el archivo ORIGINAL, no el convertido
-                debug(f"[SEND BUTTON] Deleting original file from server: {original_file_path}")
-                os.remove(original_file_path)
-                debug(f"[SEND BUTTON] ✅ File sent to Telegram and deleted from server: {original_file_path}")
-                await safe_respond(event, get_text("deleted_from_server"), reply_to=message.id, parse_mode=PARSE_MODE)
-        except Exception as e:
-            error(f"[ENVÍO BOTÓN] ❌ Error enviando archivo {file_path}: {e}")
-
-            # Limpiar thumbnail temporal si se generó
-            if thumb_path and os.path.exists(thumb_path):
-                try:
-                    debug(f"[SEND BUTTON] Deleting thumbnail after error: {thumb_path}")
-                    os.remove(thumb_path)
-                except Exception as cleanup_error:
-                    warning(f"[SEND BUTTON] ⚠️ Error deleting thumbnail after error: {cleanup_error}")
-
-            # Limpiar archivo convertido temporal si se generó (diferente del original)
-            if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
-                try:
-                    debug(f"[SEND BUTTON] Deleting converted file after error: {converted_file_path}")
-                    os.remove(converted_file_path)
-                    debug(f"[SEND BUTTON] ✅ Temporary converted file deleted after error")
-                except Exception as cleanup_error:
-                    warning(f"[SEND BUTTON] ⚠️ Error deleting temporary converted file after error: {cleanup_error}")
-
-            # Eliminar mensaje de progreso si existe
-            if sending_msg:
-                try:
-                    await safe_delete(sending_msg)
-                except Exception as delete_error:
-                    warning(f"[SEND BUTTON] ⚠️ Error deleting progress message: {delete_error}")
-
-            await safe_reply(event, get_text("error_sending_the_file_user"), parse_mode=PARSE_MODE)
-            error(f"[SEND BUTTON] Error sending file: {e}")
+        await send_file_to_telegram(
+            event,
+            file_path,
+            sending_msg,
+            delete_after=(action == "senddelete")
+        )
     else:
         await safe_delete(event)
 
@@ -4387,6 +4410,7 @@ async def start_pot_provider():
 
 async def main():
     debug(f"[STARTUP] DropBot v{VERSION}")
+    debug(f"[STARTUP] AUTO_DOWNLOAD_FORMAT={AUTO_DOWNLOAD_FORMAT}, AUTO_SEND={AUTO_SEND}")
     pot_proc = await start_pot_provider()
     await bot.start()
     await message_queue.start()  # Iniciar la cola de mensajes

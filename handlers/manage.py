@@ -541,8 +541,7 @@ async def handle_file_action(event):
 
     # Segunda fila: Descargar (solo para archivos menores de 2GB)
     if not is_directory:
-        MAX_TELEGRAM_SIZE = 2 * 1024 * 1024 * 1024  # 2GB en bytes
-        if file_size_bytes < MAX_TELEGRAM_SIZE:
+        if file_size_bytes < MAX_TELEGRAM_FILE_SIZE:
             buttons.append([Button.inline("📥 Descargar a Telegram", data=f"download:{file_id}")])
 
         # Botón de descomprimir si es un archivo comprimido

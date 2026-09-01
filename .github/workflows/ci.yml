@@ -26,7 +26,7 @@ jobs:
       # Sin --exit-zero: aquí solo se miran los errores reales. Los avisos de
       # "may be undefined" que generaban los import * ya no deberían aparecer
       - name: pyflakes
-        run: python -m pyflakes *.py services/ utils/ tests/
+        run: python -m pyflakes *.py handlers/ services/ utils/ tests/
 
       - name: Tests
         run: python -m pytest -q

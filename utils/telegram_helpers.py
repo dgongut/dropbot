@@ -6,6 +6,9 @@ Las dependencias (message_queue y bot) deben inyectarse llamando a
 `init(message_queue, bot)` antes de usar cualquiera de las funciones safe_*.
 """
 
+from basic import is_admin
+from logger import warning
+
 _message_queue = None
 _bot = None
 
@@ -50,3 +53,17 @@ async def safe_send_message(chat_id, *args, wait_for_result=False, **kwargs):
 async def safe_send_file(chat_id, *args, wait_for_result=False, **kwargs):
     """Envía un archivo usando la cola para evitar rate limiting"""
     return await _message_queue.add_message(_bot.send_file, chat_id, *args, wait_for_result=wait_for_result, **kwargs)
+
+
+async def check_admin_and_warn(event):
+    """Devuelve True (y avisa en el log) si quien escribe no es administrador.
+
+    Vive aquí y no en dropbot.py porque no depende de nada del bot: así los
+    módulos de handlers pueden importarla sin ciclos.
+    """
+    if not is_admin(event.sender_id):
+        sender = await event.get_sender()
+        username = sender.username if sender else None
+        warning(f"[AUTH] User {event.sender_id} (@{username}) is not an admin and tried to use the bot")
+        return True
+    return False

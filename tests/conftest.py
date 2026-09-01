@@ -34,13 +34,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 # --- Punto 1: entorno mínimo -------------------------------------------------
-os.environ.setdefault("TELEGRAM_TOKEN", "123456:test-token")
-os.environ.setdefault("TELEGRAM_ADMIN", "999")
-os.environ.setdefault("TELEGRAM_API_ID", "1")
-os.environ.setdefault("TELEGRAM_API_HASH", "testhash")
-os.environ.setdefault("LANGUAGE", "ES")
-os.environ.setdefault("AUTO_DOWNLOAD_FORMAT", "ASK")
-os.environ.setdefault("AUTO_SEND", "ASK")
+ADMIN_ID = 999
+
+os.environ.update({
+    "TELEGRAM_TOKEN": "123456:test-token",
+    "TELEGRAM_ADMIN": str(ADMIN_ID),
+    "TELEGRAM_API_ID": "1",
+    "TELEGRAM_API_HASH": "testhash",
+    "LANGUAGE": "ES",
+    "AUTO_DOWNLOAD_FORMAT": "ASK",
+    "AUTO_SEND": "ASK",
+})
 
 # --- Punto 2: rutas dentro de un directorio temporal -------------------------
 _SANDBOX = Path(tempfile.mkdtemp(prefix="dropbot-tests-"))
@@ -52,6 +56,18 @@ for _name in ("DOWNLOAD_PATH", "DOWNLOAD_AUDIO", "DOWNLOAD_VIDEO", "DOWNLOAD_PHO
               "DOWNLOAD_URL_AUDIO"):
     setattr(config, _name, str(_SANDBOX / _name.lower()))
 config.TEMP_DIR = str(_SANDBOX / "temp")
+
+# DOWNLOAD_PATHS se calcula al importar config a partir de las rutas de arriba,
+# asi que hay que recalcularlo despues de sustituirlas
+config.DOWNLOAD_PATHS = {
+    "audio": config.DOWNLOAD_AUDIO if config.FILTER_AUDIO else config.DOWNLOAD_PATH,
+    "video": config.DOWNLOAD_VIDEO if config.FILTER_VIDEO else config.DOWNLOAD_PATH,
+    "photo": config.DOWNLOAD_PHOTO if config.FILTER_PHOTO else config.DOWNLOAD_PATH,
+    "torrent": config.DOWNLOAD_TORRENT if config.FILTER_TORRENT else config.DOWNLOAD_PATH,
+    "ebook": config.DOWNLOAD_EBOOK if config.FILTER_EBOOK else config.DOWNLOAD_PATH,
+    "url_video": config.DOWNLOAD_URL_VIDEO,
+    "url_audio": config.DOWNLOAD_URL_AUDIO,
+}
 
 
 # Cada `@bot.on(evento)` que se evalúe al importar deja aquí (evento, función)
@@ -105,11 +121,11 @@ def sent_messages():
     return []
 
 
-@pytest.fixture
-def quiet_bot(dropbot, sent_messages, monkeypatch):
-    """Sustituye los envíos a Telegram por capturas en `sent_messages`.
+def _patch_messaging(module, sent_messages, monkeypatch):
+    """Sustituye en `module` los envíos a Telegram por capturas.
 
-    Devuelve el propio módulo para que el test siga trabajando con él.
+    Se aplica por módulo porque cada uno importa los `safe_*` por su cuenta, así
+    que parchear uno no afecta a los demás.
     """
     async def reply(event, text=None, **kwargs):
         sent_messages.append(("reply", str(text), kwargs))
@@ -127,19 +143,46 @@ def quiet_bot(dropbot, sent_messages, monkeypatch):
         sent_messages.append(("delete", "", {}))
         return None
 
+    async def send_message(chat_id, text=None, **kwargs):
+        sent_messages.append(("send_message", str(text), kwargs))
+        return MagicMock(id=len(sent_messages))
+
     async def answer(event, *args, **kwargs):
         return None
 
-    async def allow_admin(event):
-        return False
+    for name, double in (("safe_reply", reply), ("safe_respond", respond),
+                         ("safe_edit", edit), ("safe_delete", delete),
+                         ("safe_send_message", send_message), ("safe_answer", answer)):
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, double)
+    return module
 
-    monkeypatch.setattr(dropbot, "safe_reply", reply)
-    monkeypatch.setattr(dropbot, "safe_respond", respond)
-    monkeypatch.setattr(dropbot, "safe_edit", edit)
-    monkeypatch.setattr(dropbot, "safe_delete", delete)
-    monkeypatch.setattr(dropbot, "safe_answer", answer)
-    monkeypatch.setattr(dropbot, "check_admin_and_warn", allow_admin)
-    return dropbot
+
+@pytest.fixture
+def quiet_bot(dropbot, sent_messages, monkeypatch):
+    """`dropbot` con los envíos a Telegram capturados en `sent_messages`."""
+    # La cola solo arranca en main(), así que cualquier safe_* que se escape del
+    # doble se quedaría 300s esperando su Future en lugar de fallar
+    async def unstarted_queue(*args, **kwargs):
+        raise AssertionError(
+            "un envío a Telegram se ha escapado del doble: la cola no está "
+            "arrancada en los tests y bloquearía 300s"
+        )
+
+    monkeypatch.setattr(dropbot.message_queue, "add_message", unstarted_queue)
+    return _patch_messaging(dropbot, sent_messages, monkeypatch)
+
+
+@pytest.fixture
+def quiet_manage(quiet_bot, sent_messages, monkeypatch):
+    """`handlers.manage` con sus envíos capturados y sus dependencias puestas.
+
+    Importa el módulo a través de `quiet_bot` para que dropbot ya le haya
+    inyectado el pipeline de envío con `init()`.
+    """
+    from handlers import manage
+
+    return _patch_messaging(manage, sent_messages, monkeypatch)
 
 
 @pytest.fixture
@@ -154,7 +197,7 @@ class FakeEvent:
     def __init__(self, event_id=1, chat_id=42, data=None, groups=()):
         self.id = event_id
         self.chat_id = chat_id
-        self.sender_id = 999
+        self.sender_id = ADMIN_ID
         self.data = data
         self.pattern_match = _FakeMatch(groups) if groups else None
 

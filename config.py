@@ -104,3 +104,14 @@ MAX_TELEGRAM_FILE_SIZE = 2 * 1024 * 1024 * 1024
 # Valores conservadores para evitar problemas con la API de Telegram
 MESSAGE_QUEUE_DELAY = 0.5  # Delay entre mensajes en segundos
 MESSAGE_QUEUE_MAX_RETRIES = 5  # Número máximo de reintentos
+
+# Carpeta de destino de cada tipo de contenido, segun los filtros activos
+DOWNLOAD_PATHS = {
+    "audio": DOWNLOAD_AUDIO if FILTER_AUDIO else DOWNLOAD_PATH,
+    "video": DOWNLOAD_VIDEO if FILTER_VIDEO else DOWNLOAD_PATH,
+    "photo": DOWNLOAD_PHOTO if FILTER_PHOTO else DOWNLOAD_PATH,
+    "torrent": DOWNLOAD_TORRENT if FILTER_TORRENT else DOWNLOAD_PATH,
+    "ebook": DOWNLOAD_EBOOK if FILTER_EBOOK else DOWNLOAD_PATH,
+    "url_video": DOWNLOAD_URL_VIDEO if FILTER_URL_VIDEO else (DOWNLOAD_VIDEO if FILTER_VIDEO else DOWNLOAD_PATH),
+    "url_audio": DOWNLOAD_URL_AUDIO if FILTER_URL_AUDIO else (DOWNLOAD_AUDIO if FILTER_AUDIO else DOWNLOAD_PATH)
+}

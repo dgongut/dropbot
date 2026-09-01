@@ -20,6 +20,7 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 - ✅ Descarga desde URLs (YouTube, Instagram, TikTok, Twitter, y 1800+ sitios más)
 - ✅ Detección automática de tipo de contenido (video, audio, imagen)
 - ✅ Descomprime automáticamente ficheros zip, tar y rar (y sus variantes)
+- ✅ Envío automático a Telegram de lo descargado desde URLs, sin preguntar
 - ✅ Soporte de idiomas (Spanish, English)
 
 ¿Lo buscas en [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/dropbot)?
@@ -97,7 +98,7 @@ services:
 
 ## Solo para desarrolladores - Ejecución con código local
 
-Para su ejecución en local y probar nuevos cambios de código, se necesita renombrar el fichero `.env-example` a `.env` con los valores necesarios para su ejecución.
+Para su ejecución en local y probar nuevos cambios de código, se necesita renombrar el fichero `.env_example` a `.env` con los valores necesarios para su ejecución.
 Es necesario establecer un `TELEGRAM_TOKEN` y un `TELEGRAM_ADMIN` correctos y diferentes al de la ejecución normal.
 
 La estructura de carpetas debe quedar:
@@ -107,12 +108,31 @@ dropbot/
     ├── .env
     ├── .gitignore
     ├── LICENSE
-    ├── requirements.txt
     ├── README.md
-    ├── config.py
-    ├── dropbot.py
+    ├── requirements.txt
+    ├── requirements-dev.txt
+    ├── Dockerfile
     ├── Dockerfile_local
     ├── docker-compose.yaml
+    ├── yt-dlp.conf
+    ├── dropbot.py
+    ├── config.py
+    ├── state.py
+    ├── basic.py
+    ├── logger.py
+    ├── translations.py
+    ├── message_queue.py
+    ├── handlers
+    │   └── manage.py
+    ├── services
+    │   ├── donors_service.py
+    │   ├── extraction_service.py
+    │   └── video_service.py
+    ├── utils
+    │   ├── fast_telethon.py
+    │   ├── file_helpers.py
+    │   └── telegram_helpers.py
+    ├── tests
     └── locale
         ├── en.json
         └── es.json
@@ -121,3 +141,15 @@ dropbot/
 Para levantarlo habría que ejecutar en esa ruta: `docker compose up -d`
 
 Para detenerlo y eliminarlo: `docker compose down --rmi`
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Los tests no necesitan red ni un token real: sustituyen el cliente de Telegram
+y redirigen las carpetas de descarga a un directorio temporal. Se ejecutan
+automáticamente en cada pull request, junto con el linter y la construcción de
+la imagen.

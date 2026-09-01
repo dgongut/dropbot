@@ -1399,6 +1399,17 @@ async def detect_content_type(url):
         warning(f"[YT-DLP] Error detecting content type: {e}")
         return "unknown"
 
+def ytdlp_output_template(timestamp):
+    """Plantilla `-o` para yt-dlp, con la marca temporal que se limpia después.
+
+    El índice de playlist va con la sintaxis condicional de yt-dlp
+    (`%(campo&valor|alternativa)s`): si el campo no existe no escribe nada. Con
+    `%(playlist_index)s` a secas, yt-dlp resuelve el campo ausente como "NA" y
+    cualquier vídeo suelto se descargaba como "NA-Título.mp4".
+    """
+    return f"%(playlist_index&{{}}-|)s%(title).200s_temp{timestamp}.%(ext)s"
+
+
 @bot.on(events.NewMessage(pattern=r'https?://[^\s]+'))
 async def handle_url_link(event):
     if await check_admin_and_warn(event):
@@ -1503,7 +1514,7 @@ async def handle_url_link(event):
         # Usar timestamp para evitar sobrescribir archivos durante la descarga
         timestamp = int(time.time() * 1000)  # Timestamp en milisegundos
         # Incluir índice de playlist en el template para evitar sobrescrituras
-        temp_template = f"%(playlist_index)s-%(title).200s_temp{timestamp}.%(ext)s"
+        temp_template = ytdlp_output_template(timestamp)
 
         cmd = [
             "yt-dlp",
@@ -1798,7 +1809,7 @@ async def handle_playlist_selection(event):
         # Usar timestamp para evitar sobrescribir archivos durante la descarga
         timestamp = int(time.time() * 1000)
         # Incluir índice de playlist en el template para evitar sobrescrituras
-        temp_template = f"%(playlist_index)s-%(title).200s_temp{timestamp}.%(ext)s"
+        temp_template = ytdlp_output_template(timestamp)
 
         cmd = [
             "yt-dlp",
@@ -1894,7 +1905,7 @@ async def handle_playlist_format_selection(event):
     # Usar timestamp para evitar sobrescribir archivos durante la descarga
     timestamp = int(time.time() * 1000)
     # Incluir índice de playlist en el template para evitar sobrescrituras
-    temp_template = f"%(playlist_index)s-%(title).200s_temp{timestamp}.%(ext)s"
+    temp_template = ytdlp_output_template(timestamp)
 
     cmd = [
         "yt-dlp",
@@ -1976,7 +1987,7 @@ async def handle_format_selection(event):
     # Usar timestamp para evitar sobrescribir archivos durante la descarga
     timestamp = int(time.time() * 1000)  # Timestamp en milisegundos
     # Incluir índice de playlist en el template para evitar sobrescrituras
-    temp_template = f"%(playlist_index)s-%(title).200s_temp{timestamp}.%(ext)s"
+    temp_template = ytdlp_output_template(timestamp)
 
     cmd = [
         "yt-dlp",

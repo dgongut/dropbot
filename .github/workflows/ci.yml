@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -31,15 +32,21 @@ jobs:
       - name: Tests
         run: python -m pytest -q
 
+  # El Dockerfile de produccion no copia el codigo local: descarga el zip del tag
+  # publicado en GitHub. Por eso solo se puede construir cuando el tag existe, y
+  # este job va sobre tags y no sobre cada push a main
   docker:
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
       - name: Construir la imagen
-        run: docker build -f Dockerfile -t dropbot:ci .
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          docker build -f Dockerfile --build-arg VERSION="$version" -t dropbot:ci .
 
-      - name: Arrancar sin configuración debe fallar con un mensaje claro
+      - name: Arrancar sin configuracion debe fallar con un mensaje claro
         run: |
           output=$(docker run --rm -e LANGUAGE=ES dropbot:ci 2>&1 || true)
           echo "$output"

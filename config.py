@@ -90,6 +90,11 @@ YTDLP_COOKIES_FILE = "/app/cookies/cookies.txt"
 # Valores posibles: "ASK" (preguntar), "VIDEO" (descargar video automáticamente), "AUDIO" (descargar audio automáticamente)
 AUTO_DOWNLOAD_FORMAT = os.environ.get("AUTO_DOWNLOAD_FORMAT", "ASK").upper()
 
+# Acción automática tras descargar un vídeo/audio desde URL (sin preguntar)
+# Valores posibles: "ASK" (preguntar, por defecto), "SEND" (enviar y almacenar),
+# "SEND_DELETE" (enviar y borrar), "STORE" (solo almacenar)
+AUTO_SEND = os.environ.get("AUTO_SEND", "ASK").upper()
+
 # Configuración interna de la cola de mensajes para evitar FloodWaitError
 # Valores conservadores para evitar problemas con la API de Telegram
 MESSAGE_QUEUE_DELAY = 0.5  # Delay entre mensajes en segundos

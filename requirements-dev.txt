@@ -1,0 +1,5 @@
+# Dependencias solo para desarrollo y CI. En producción basta requirements.txt.
+-r requirements.txt
+
+pytest==8.4.2
+pyflakes==3.4.0

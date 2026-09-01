@@ -7,7 +7,7 @@ from config import (
     EXTENSIONS_AUDIO, EXTENSIONS_IMAGE, EXTENSIONS_COMPRESSED,
     TOR_ICO, BOO_ICO, VID_ICO, AUD_ICO, IMG_ICO, ZIP_ICO, DEF_ICO
 )
-from debug import warning
+from logger import warning
 
 
 def format_file_size(size_bytes):

@@ -11,7 +11,7 @@ Características:
 import json
 from functools import lru_cache
 from pathlib import Path
-from debug import warning, error
+from logger import warning, error
 from config import LANGUAGE
 
 # Constante para el parse_mode por defecto

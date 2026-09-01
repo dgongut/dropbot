@@ -16,9 +16,26 @@ from telethon.tl.types import (
     BotCommand, Document, Photo,
     DocumentAttributeFilename, DocumentAttributeVideo, DocumentAttributeAudio
 )
-from config import *
+from config import (
+    ANONYMOUS_USER_ID, AUD_ICO, AUTO_DOWNLOAD_FORMAT, AUTO_SEND,
+    BOO_ICO, DEFAULT_EMPTY_STR, DEF_ICO, DOWNLOAD_AUDIO,
+    DOWNLOAD_EBOOK, DOWNLOAD_PATH, DOWNLOAD_PHOTO, DOWNLOAD_TORRENT,
+    DOWNLOAD_URL_AUDIO, DOWNLOAD_URL_VIDEO, DOWNLOAD_VIDEO, EXTENSIONS_AUDIO,
+    EXTENSIONS_EBOOK, EXTENSIONS_IMAGE, EXTENSIONS_TORRENT, EXTENSIONS_VIDEO,
+    FAST_CONNECTIONS, FAST_TRANSFER_MIN_BYTES, FILTER_AUDIO, FILTER_EBOOK,
+    FILTER_PHOTO, FILTER_TORRENT, FILTER_URL_AUDIO, FILTER_URL_VIDEO,
+    FILTER_VIDEO, HEARTBEAT_FILE, HEARTBEAT_INTERVAL, IMG_ICO,
+    LANGUAGE, MAX_DOWNLOAD_RETRIES, MAX_TELEGRAM_FILE_SIZE, MESSAGE_QUEUE_DELAY,
+    MESSAGE_QUEUE_MAX_RETRIES, PARALLEL_DOWNLOADS, POT_PROVIDER_DIR, POT_PROVIDER_PORT,
+    POT_PROVIDER_STARTUP_TIMEOUT, RETRY_DELAY_SECONDS, TELEGRAM_ADMIN, TELEGRAM_API_HASH,
+    TELEGRAM_API_ID, TELEGRAM_TOKEN, TEMP_DIR, TOR_ICO,
+    VID_ICO, YTDLP_COOKIES_FILE,
+)
 from translations import get_text, load_locale, PARSE_MODE
-from basic import *
+from basic import (
+    clean_rar_base_name, get_filename_from_path, is_admin, is_compressed_file,
+    is_split_zip, sanitize_filename,
+)
 from message_queue import TelegramMessageQueue
 from utils.file_helpers import (
     format_file_size, get_directory_size, get_unique_filename, get_file_icon
@@ -27,7 +44,7 @@ from utils import fast_telethon
 from utils import telegram_helpers
 from utils.telegram_helpers import (
     safe_edit, safe_reply, safe_respond, safe_answer,
-    safe_delete, safe_send_message, safe_send_file,
+    safe_delete, safe_send_message,
 )
 from services.extraction_service import extract_file
 from services.donors_service import print_donors
@@ -55,17 +72,16 @@ logger = log_module.setup_logger(
     use_colors=True
 )
 
-# Mantener compatibilidad con debug.py
-from debug import debug, info, warning, error, critical
+from logger import debug, warning, error
 
 VERSION = "3.4.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
 # Log inicial del sistema
-logger.info(f"=" * 60)
+logger.info("=" * 60)
 logger.info(f"DropBot v{VERSION} starting...")
-logger.info(f"=" * 60)
+logger.info("=" * 60)
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("[CONFIG] LANGUAGE only can be ES/EN")
@@ -116,11 +132,11 @@ try:
     if os.path.exists(TEMP_DIR):
         # Eliminar toda la carpeta y su contenido
         shutil.rmtree(TEMP_DIR)
-        debug(f"[STARTUP] Removed temporary directory and all contents")
+        debug("[STARTUP] Removed temporary directory and all contents")
 
     # Recrear la carpeta vacía
     os.makedirs(TEMP_DIR, exist_ok=True)
-    debug(f"[STARTUP] ✅ Temporary directory cleaned and recreated")
+    debug("[STARTUP] ✅ Temporary directory cleaned and recreated")
 except Exception as e:
     warning(f"[STARTUP] Could not clean temporary directory: {e}")
     # Si falla, al menos intentar crear la carpeta
@@ -154,6 +170,7 @@ list_messages = {}  # Para rastrear mensajes de /list y /manage que deben borrar
 # Ejemplos: 1 descarga = 10s (6 ediciones/min), 5 descargas = 10s (30 ediciones/min), 10 descargas = 15s (40 ediciones/min)
 PROGRESS_UPDATE_INTERVAL = max(10, PARALLEL_DOWNLOADS * 1.5)
 pending_files = {}
+pending_send_seq = 0  # Contador para los ids de pending_files
 pending_urls = {}
 playlist_downloads = {}  # Para rastrear descargas de playlist en progreso: {event_id: {"is_full_playlist": bool, "final_output_dir": str, "downloaded_files": []}}
 download_semaphore = asyncio.Semaphore(PARALLEL_DOWNLOADS)
@@ -251,7 +268,7 @@ async def handle_list_files(event):
         MAX_MESSAGE_LENGTH = 3800
 
         total_size_formatted = format_file_size(total_size)
-        header = f"📂 **Archivos en el servidor**\n\n"
+        header = "📂 **Archivos en el servidor**\n\n"
 
         # Contar archivos y carpetas
         file_count = sum(1 for item in files_info if item["type"] == "file")
@@ -559,7 +576,7 @@ async def download_media(event):
     message = event.message
     media = message.document or message.video or message.audio or message.photo
     if not media:
-        debug(f"[DOWNLOAD] No media found in message, returning")
+        debug("[DOWNLOAD] No media found in message, returning")
         return
     file_name = get_file_name(media)
     debug(f"[DOWNLOAD] File {file_name} - Received, starting download")
@@ -613,11 +630,11 @@ async def download_media(event):
                 timeout=download_timeout
             )
 
-            debug(f"[DOWNLOAD] ✅ bot.download_media() completed successfully")
-            debug(f"[DOWNLOAD] Checking if temp file exists...")
+            debug("[DOWNLOAD] ✅ bot.download_media() completed successfully")
+            debug("[DOWNLOAD] Checking if temp file exists...")
 
             # Mover archivo de /tmp a carpeta final
-            debug(f"[DOWNLOAD] Moving file from temp to final location...")
+            debug("[DOWNLOAD] Moving file from temp to final location...")
             debug(f"[DOWNLOAD] Source: {temp_file_path}")
             debug(f"[DOWNLOAD] Destination: {final_file_path}")
 
@@ -627,16 +644,16 @@ async def download_media(event):
                     error(f"[DOWNLOAD] ❌ Temporary file not found: {temp_file_path}")
                     raise FileNotFoundError(f"Temporary file not found: {temp_file_path}")
 
-                debug(f"[DOWNLOAD] ✅ Temporary file exists")
+                debug("[DOWNLOAD] ✅ Temporary file exists")
                 temp_size = os.path.getsize(temp_file_path)
                 debug(f"[DOWNLOAD] Temporary file size: {temp_size} bytes ({temp_size / (1024*1024):.2f} MB)")
 
                 # Verificar permisos de lectura
                 if not os.access(temp_file_path, os.R_OK):
                     error(f"[DOWNLOAD] ❌ No read permission for temp file: {temp_file_path}")
-                    raise PermissionError(f"No read permission for temp file")
+                    raise PermissionError("No read permission for temp file")
 
-                debug(f"[DOWNLOAD] ✅ Temp file is readable")
+                debug("[DOWNLOAD] ✅ Temp file is readable")
 
                 # Verificar que el directorio de destino existe
                 dest_dir = os.path.dirname(final_file_path)
@@ -649,23 +666,23 @@ async def download_media(event):
                 # Verificar permisos de escritura en destino
                 if not os.access(dest_dir, os.W_OK):
                     error(f"[DOWNLOAD] ❌ No write permission for destination directory: {dest_dir}")
-                    raise PermissionError(f"No write permission for destination directory")
+                    raise PermissionError("No write permission for destination directory")
 
-                debug(f"[DOWNLOAD] ✅ Destination directory is writable")
+                debug("[DOWNLOAD] ✅ Destination directory is writable")
 
                 # Mover archivo de forma asíncrona para no bloquear el event loop
                 # Usar copyfile + remove en lugar de move/copy para evitar problemas de permisos
                 # copyfile() solo copia el contenido, NO intenta copiar permisos/metadata
-                debug(f"[DOWNLOAD] Copying file asynchronously (content only, no metadata)...")
+                debug("[DOWNLOAD] Copying file asynchronously (content only, no metadata)...")
                 loop = asyncio.get_running_loop()
 
                 # Copiar solo el contenido del archivo (sin permisos/metadata)
                 await loop.run_in_executor(None, shutil.copyfile, temp_file_path, final_file_path)
-                debug(f"[DOWNLOAD] ✅ File content copied successfully")
+                debug("[DOWNLOAD] ✅ File content copied successfully")
 
                 # Eliminar archivo temporal
                 await loop.run_in_executor(None, os.remove, temp_file_path)
-                debug(f"[DOWNLOAD] ✅ Temporary file removed")
+                debug("[DOWNLOAD] ✅ Temporary file removed")
 
                 # Verificar que el archivo final existe
                 # Para archivos .torrent, el gestor puede procesarlos inmediatamente
@@ -674,14 +691,14 @@ async def download_media(event):
 
                 if not file_exists:
                     if is_torrent:
-                        debug(f"[DOWNLOAD] Torrent file was processed by torrent manager (expected behavior)")
+                        debug("[DOWNLOAD] Torrent file was processed by torrent manager (expected behavior)")
                         # Continuar normalmente, el archivo fue procesado correctamente
                     else:
                         error(f"[DOWNLOAD] ❌ Final file not found after move: {final_file_path}")
                         raise FileNotFoundError(f"Final file not found after move: {final_file_path}")
 
                 if file_exists:
-                    debug(f"[DOWNLOAD] ✅ Final file exists")
+                    debug("[DOWNLOAD] ✅ Final file exists")
                     final_size = os.path.getsize(final_file_path)
                     debug(f"[DOWNLOAD] Final file size: {final_size} bytes ({final_size / (1024*1024):.2f} MB)")
 
@@ -689,7 +706,7 @@ async def download_media(event):
                     if temp_size != final_size:
                         warning(f"[DOWNLOAD] ⚠️ File size mismatch! Temp: {temp_size}, Final: {final_size}")
                     else:
-                        debug(f"[DOWNLOAD] ✅ File sizes match")
+                        debug("[DOWNLOAD] ✅ File sizes match")
 
             except Exception as move_error:
                 error(f"[DOWNLOAD] ❌ Error moving file: {move_error}")
@@ -700,27 +717,27 @@ async def download_media(event):
                 raise
 
             # Descarga exitosa - borrar mensaje de progreso
-            debug(f"[DOWNLOAD] Deleting progress message...")
+            debug("[DOWNLOAD] Deleting progress message...")
             if status_message:
                 try:
-                    debug(f"[DOWNLOAD] Calling safe_delete with wait_for_result=True...")
+                    debug("[DOWNLOAD] Calling safe_delete with wait_for_result=True...")
                     delete_result = await safe_delete(status_message, wait_for_result=True)
                     debug(f"[DOWNLOAD] safe_delete returned: {delete_result}")
-                    debug(f"[DOWNLOAD] ✅ Progress message deleted successfully")
+                    debug("[DOWNLOAD] ✅ Progress message deleted successfully")
                 except asyncio.TimeoutError:
-                    warning(f"[DOWNLOAD] ⚠️ Timeout deleting progress message (waited 5 minutes)")
+                    warning("[DOWNLOAD] ⚠️ Timeout deleting progress message (waited 5 minutes)")
                 except Exception as delete_error:
                     warning(f"[DOWNLOAD] ⚠️ Could not delete progress message: {delete_error}")
                     warning(f"[DOWNLOAD] Delete error type: {type(delete_error).__name__}")
                     # Continuar aunque falle el borrado
             else:
-                debug(f"[DOWNLOAD] No status message to delete")
+                debug("[DOWNLOAD] No status message to delete")
 
             # Mostrar información detallada del archivo descargado (sin botones de acción)
             debug(f"[DOWNLOAD] Calling handle_success for: {final_file_path}")
             try:
                 await handle_success(event, final_file_path, show_action_buttons=False)
-                debug(f"[DOWNLOAD] ✅ handle_success completed")
+                debug("[DOWNLOAD] ✅ handle_success completed")
             except Exception as success_error:
                 error(f"[DOWNLOAD] ❌ Error in handle_success: {success_error}")
                 error(f"[DOWNLOAD] Success error type: {type(success_error).__name__}")
@@ -732,7 +749,7 @@ async def download_media(event):
             debug(f"[DOWNLOAD] ✅ File {file_name} - Downloaded successfully")
 
             # Salir del bucle si la descarga fue exitosa
-            debug(f"[DOWNLOAD] Breaking from retry loop")
+            debug("[DOWNLOAD] Breaking from retry loop")
             break
 
         except asyncio.CancelledError:
@@ -864,6 +881,31 @@ async def download_media(event):
     active_tasks.pop(event.id, None)
     debug(f"[DOWNLOAD] Cleaned up active task for event.id={event.id}")
 
+def register_pending_file_action(file_path):
+    """Guarda una ruta y devuelve un id corto para usarlo en un botón.
+
+    El payload de un botón inline no puede pasar de 64 bytes, así que las rutas
+    nunca viajan dentro del callback data.
+    """
+    file_id = f"a{abs(hash(file_path)) % 100000000}"
+    pending_file_actions[file_id] = file_path
+    return file_id
+
+
+def register_pending_send(file_path):
+    """Guarda una ruta pendiente de enviar y devuelve un id corto para el botón.
+
+    El id lleva un contador para que dos ficheros del mismo evento no compartan
+    clave, y un hash de la ruta para que los botones de una sesión anterior no
+    resuelvan por accidente a un fichero distinto tras reiniciar el bot.
+    """
+    global pending_send_seq
+    pending_send_seq += 1
+    file_id = f"{pending_send_seq}_{abs(hash(file_path)) % 100000}"
+    pending_files[file_id] = file_path
+    return file_id
+
+
 def get_extraction_message_and_buttons(extract_result, filename, extracted_path, file_path, file_id=None, from_manage=False):
     """
     Genera mensajes y botones consistentes para los resultados de extracción.
@@ -900,10 +942,14 @@ def get_extraction_message_and_buttons(extract_result, filename, extracted_path,
             ]
         else:
             # Botones para flujo automático
+            # El payload de un botón no puede pasar de 64 bytes, así que va un
+            # id corto y la ruta se guarda en pending_file_actions, igual que
+            # hace el flujo de /manage
+            auto_file_id = register_pending_file_action(file_path)
             buttons = [
                 [
-                    Button.inline(get_text("button_delete"), data=f"del:{file_path}"),
-                    Button.inline(get_text("button_keep"), data=f"keep:{file_path}")
+                    Button.inline(get_text("button_delete"), data=f"del:{auto_file_id}"),
+                    Button.inline(get_text("button_keep"), data=f"keep:{auto_file_id}")
                 ]
             ]
 
@@ -1054,14 +1100,14 @@ async def handle_start(event):
     elif event.raw_text == "/donors":
         await print_donors(event.chat_id)
     elif event.raw_text == "/list":
-        debug(f"[LIST] /list command received")
+        debug("[LIST] /list command received")
 
         # Mostrar menú de categorías
         buttons = get_category_buttons()
         debug(f"[LIST] Category buttons: {buttons}")
         msg = get_text("list_select_category")
         await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE)
-        debug(f"[LIST] Menu sent")
+        debug("[LIST] Menu sent")
     elif event.raw_text == "/manage":
         # Borrar el comando del usuario
         try:
@@ -1159,7 +1205,7 @@ async def cancel_download(event):
                 partial_total = total_videos
                 debug(f"[CANCEL] Successfully moved {moved_count} files before cancelling")
         else:
-            debug(f"[CANCEL] No completed files found to move")
+            debug("[CANCEL] No completed files found to move")
 
         # Limpiar información de playlist
         playlist_downloads.pop(msg_id, None)
@@ -1381,7 +1427,7 @@ async def detect_playlist(url):
                 return True, len(lines), playlist_title
             elif len(lines) == 1:
                 # Una sola línea = video individual
-                debug(f"[YT-DLP] Single video detected")
+                debug("[YT-DLP] Single video detected")
                 return False, 1, None
         else:
             warning(f"[YT-DLP] Playlist detect failed with code {proc.returncode}")
@@ -1650,7 +1696,7 @@ async def handle_cancel_conversion(event):
 
             # Limpiar el proceso de active_tasks
             active_tasks.pop(conversion_id, None)
-            debug(f"[CANCEL] Process removed from active_tasks")
+            debug("[CANCEL] Process removed from active_tasks")
         except Exception as e:
             error(f"[CANCELAR] ❌ Error cancelando conversión {conversion_id}: {e}")
             await safe_edit(
@@ -1660,7 +1706,7 @@ async def handle_cancel_conversion(event):
             )
     else:
         # La conversión ya terminó o no existe
-        debug(f"[CANCEL] ⚠️ Process not found in active_tasks (already finished or does not exist)")
+        debug("[CANCEL] ⚠️ Process not found in active_tasks (already finished or does not exist)")
         await safe_edit(
             event,
             get_text("conversion_not_found"),
@@ -1691,7 +1737,7 @@ async def handle_send_original(event):
         try:
             debug(f"[SEND_ORIGINAL] Terminating conversion process (PID: {proc.pid})...")
             proc.terminate()
-            debug(f"[SEND_ORIGINAL] ✅ Process terminated")
+            debug("[SEND_ORIGINAL] ✅ Process terminated")
         except Exception as e:
             warning(f"[SEND_ORIGINAL] Error terminating process: {e}")
 
@@ -1708,16 +1754,27 @@ async def handle_keep_file(event):
         return
 
     await safe_answer(event)
-    file_path = event.pattern_match.group(1).decode()
+    file_id = event.pattern_match.group(1).decode()
+    file_path = pending_file_actions.pop(file_id, None)
+
+    if file_path is None:
+        await safe_edit(event, get_text("error_item_not_found_short"), buttons=None, parse_mode=PARSE_MODE)
+        return
+
     await safe_edit(event, get_text("extracted", file_path), buttons=None, parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(pattern=b"del:(.+)"))
-async def handle_delete_file(event):
+async def handle_extracted_delete_compressed(event):
     if await check_admin_and_warn(event):
         return
 
     await safe_answer(event)
-    file_path = event.pattern_match.group(1).decode()
+    file_id = event.pattern_match.group(1).decode()
+    file_path = pending_file_actions.pop(file_id, None)
+
+    if file_path is None:
+        await safe_edit(event, get_text("error_item_not_found_short"), buttons=None, parse_mode=PARSE_MODE)
+        return
 
     try:
         if os.path.isfile(file_path):
@@ -1844,11 +1901,11 @@ async def handle_playlist_selection(event):
         # Si solo quiere el primer video, agregar --no-playlist
         if not download_full_playlist:
             cmd.insert(1, "--no-playlist")
-            debug(f"[PLAYLIST] Added --no-playlist flag")
+            debug("[PLAYLIST] Added --no-playlist flag")
         else:
             # En playlists completas, omitir vídeos no disponibles para no abortar el resto
             cmd.insert(1, "--ignore-errors")
-            debug(f"[PLAYLIST] Added --ignore-errors flag for full playlist")
+            debug("[PLAYLIST] Added --ignore-errors flag for full playlist")
 
         # Calcular delay automático basado en el número de vídeos
         # Si download_full_playlist es False, solo descarga 1 vídeo
@@ -1940,11 +1997,11 @@ async def handle_playlist_format_selection(event):
     # Si solo quiere el primer video, agregar --no-playlist
     if not download_full_playlist:
         cmd.insert(1, "--no-playlist")
-        debug(f"[PLAYLIST] Added --no-playlist flag")
+        debug("[PLAYLIST] Added --no-playlist flag")
     else:
         # En playlists completas, omitir vídeos no disponibles para no abortar el resto
         cmd.insert(1, "--ignore-errors")
-        debug(f"[PLAYLIST] Added --ignore-errors flag for full playlist")
+        debug("[PLAYLIST] Added --ignore-errors flag for full playlist")
 
     # Calcular delay automático basado en el número de vídeos
     # Si download_full_playlist es False, solo descarga 1 vídeo
@@ -2412,7 +2469,7 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                             filename = os.path.basename(temp_file_path)
                             final_file_path = os.path.join(final_output_dir, filename)
 
-                            debug(f"[URL DOWNLOAD] Moving file from temp to final location...")
+                            debug("[URL DOWNLOAD] Moving file from temp to final location...")
                             debug(f"[URL DOWNLOAD] Temp: {temp_file_path}")
                             debug(f"[URL DOWNLOAD] Final: {final_file_path}")
 
@@ -2460,7 +2517,7 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                             filename = os.path.basename(temp_file_path)
                             final_file_path = os.path.join(final_output_dir, filename)
 
-                            debug(f"[URL DOWNLOAD] Moving file from temp to final location...")
+                            debug("[URL DOWNLOAD] Moving file from temp to final location...")
                             debug(f"[URL DOWNLOAD] Temp: {temp_file_path}")
                             debug(f"[URL DOWNLOAD] Final: {final_file_path}")
 
@@ -2699,7 +2756,7 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
         # Obtener duración del video para calcular progreso
         duration_seconds = 0
         try:
-            debug(f"[CONVERSION] Getting video metadata...")
+            debug("[CONVERSION] Getting video metadata...")
             duration, _, _ = await get_video_metadata(input_path)
             duration_seconds = duration if duration else 0
             debug(f"[CONVERSION] Video duration: {duration_seconds}s")
@@ -2729,7 +2786,7 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
                 buttons = [Button.inline(get_text("button_cancel_conversion"), data=f"cancelconv:{conversion_id}")]
                 msg = get_text("converting_video_progress")
 
-            debug(f"[CONVERSION] Updating status message with cancel button" + (" and send original button" if is_long_video else ""))
+            debug("[CONVERSION] Updating status message with cancel button" + (" and send original button" if is_long_video else ""))
             await safe_edit(
                 status_message,
                 msg,
@@ -2764,11 +2821,11 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
 
         # Leer progreso en tiempo real
         last_update = 0
-        debug(f"[CONVERSION] Starting progress reading...")
+        debug("[CONVERSION] Starting progress reading...")
         while True:
             # Verificar si la conversión fue cancelada o si se solicitó enviar original
             if conversion_id in cancelled_conversions or conversion_id in send_original_requests:
-                debug(f"[CONVERSION] Conversion cancelled or send original requested during progress reading, stopping...")
+                debug("[CONVERSION] Conversion cancelled or send original requested during progress reading, stopping...")
                 break
 
             line = await proc.stdout.readline()
@@ -2825,12 +2882,12 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
                                 # Si falla la edición, puede ser que el mensaje fue eliminado/editado
                                 # Verificar si fue cancelado o se solicitó enviar original
                                 if conversion_id in cancelled_conversions or conversion_id in send_original_requests:
-                                    debug(f"[CONVERSION] Message edit failed because conversion was cancelled or send original requested")
+                                    debug("[CONVERSION] Message edit failed because conversion was cancelled or send original requested")
                                     break
                 except Exception as e:
                     warning(f"[CONVERSION] Error processing progress line: {e}")
 
-        debug(f"[CONVERSION] Waiting for process completion...")
+        debug("[CONVERSION] Waiting for process completion...")
         await proc.wait()
 
         debug(f"[CONVERSION] Process finished with code: {proc.returncode}")
@@ -2838,11 +2895,11 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
         # Limpiar el proceso de active_tasks
         active_tasks.pop(conversion_id, None)
         active_tasks.pop(f"{conversion_id}_original_path", None)
-        debug(f"[CONVERSION] Process removed from active_tasks")
+        debug("[CONVERSION] Process removed from active_tasks")
 
         # Verificar si el usuario eligió enviar el archivo original
         if conversion_id in send_original_requests:
-            debug(f"[CONVERSION] ✅ User chose to send original file")
+            debug("[CONVERSION] ✅ User chose to send original file")
             send_original_requests.discard(conversion_id)
             cancelled_conversions.discard(conversion_id)
             # Eliminar archivo de salida parcial si existe
@@ -2857,7 +2914,7 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
 
         # Verificar si la conversión fue cancelada por el usuario
         if conversion_id in cancelled_conversions:
-            debug(f"[CONVERSION] ❌ Conversion was cancelled by user")
+            debug("[CONVERSION] ❌ Conversion was cancelled by user")
             # Eliminar de la lista de canceladas
             cancelled_conversions.discard(conversion_id)
             # Eliminar archivo de salida parcial si existe
@@ -2884,7 +2941,7 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
                         get_text("preparing_send"),
                         parse_mode=PARSE_MODE
                     )
-                    debug(f"[CONVERSION] Status message updated to 'preparing send'")
+                    debug("[CONVERSION] Status message updated to 'preparing send'")
                 except Exception as e:
                     debug(f"[CONVERSION] Could not update status message: {e}")
 
@@ -2906,10 +2963,10 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
 
     except asyncio.CancelledError:
         # La tarea fue cancelada (por ejemplo, el usuario canceló la conversión)
-        debug(f"[CONVERSION] ❌ Conversion task cancelled")
+        debug("[CONVERSION] ❌ Conversion task cancelled")
         # Limpiar el proceso de active_tasks
         active_tasks.pop(conversion_id, None)
-        debug(f"[CONVERSION] Process removed from active_tasks after cancellation")
+        debug("[CONVERSION] Process removed from active_tasks after cancellation")
         # Eliminar archivo de salida parcial si existe
         if os.path.exists(output_path):
             debug(f"[CONVERSION] Deleting partial file: {output_path}")
@@ -2923,7 +2980,7 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
         error(f"[CONVERSION] ❌ Exception during video conversion: {e}")
         # Limpiar el proceso de active_tasks
         active_tasks.pop(conversion_id, None)
-        debug(f"[CONVERSION] Process removed from active_tasks after exception")
+        debug("[CONVERSION] Process removed from active_tasks after exception")
         # Eliminar archivo de salida parcial si existe
         if os.path.exists(output_path):
             debug(f"[CONVERSION] Deleting partial file after exception: {output_path}")
@@ -2963,7 +3020,7 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
             try:
                 debug(f"[SEND] Deleting temporary converted file: {converted_file_path}")
                 os.remove(converted_file_path)
-                debug(f"[SEND] ✅ Temporary converted file deleted")
+                debug("[SEND] ✅ Temporary converted file deleted")
             except Exception as cleanup_error:
                 warning(f"[SEND] ⚠️ Error deleting temporary converted file: {cleanup_error}")
 
@@ -2979,7 +3036,7 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
         debug(f"[SEND] File type: {'video' if is_video else 'audio' if is_audio else 'document'}")
 
         if is_video:
-            debug(f"[SEND] Starting video conversion...")
+            debug("[SEND] Starting video conversion...")
             converted_file_path = await convert_video_to_telegram_compatible(file_path, sending_msg)
 
             if converted_file_path is None:
@@ -2995,9 +3052,9 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
                 debug(f"[SEND] Name updated to: {display_filename}")
                 attributes = [DocumentAttributeFilename(file_name=display_filename)]
             else:
-                debug(f"[SEND] Video already compatible, using original")
+                debug("[SEND] Video already compatible, using original")
 
-            debug(f"[SEND] Getting video metadata...")
+            debug("[SEND] Getting video metadata...")
             duration, width, height = await get_video_metadata(file_path)
             if duration and width and height:
                 debug(f"[SEND] Metadata: {duration}s, {width}x{height}")
@@ -3008,27 +3065,27 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
                     supports_streaming=True
                 ))
             else:
-                debug(f"[SEND] ⚠️ Could not get video metadata")
+                debug("[SEND] ⚠️ Could not get video metadata")
 
-            debug(f"[SEND] Generating thumbnail...")
+            debug("[SEND] Generating thumbnail...")
             thumb_path = await generate_video_thumbnail(file_path)
             if thumb_path:
                 debug(f"[SEND] Thumbnail generated: {thumb_path}")
             else:
-                debug(f"[SEND] ⚠️ Could not generate thumbnail")
+                debug("[SEND] ⚠️ Could not generate thumbnail")
         elif is_audio:
             # Sin la duración, Telegram muestra el audio sin barra de reproducción
-            debug(f"[SEND] Getting audio metadata...")
+            debug("[SEND] Getting audio metadata...")
             duration, _, _ = await get_video_metadata(file_path)
             if duration:
                 debug(f"[SEND] Audio duration: {duration}s")
                 attributes.append(DocumentAttributeAudio(duration=duration))
             else:
-                debug(f"[SEND] ⚠️ Could not get audio duration")
+                debug("[SEND] ⚠️ Could not get audio duration")
 
         upload_progress = create_upload_progress_callback(sending_msg, display_filename)
 
-        debug(f"[SEND] Starting send to Telegram...")
+        debug("[SEND] Starting send to Telegram...")
         file_size = os.path.getsize(file_path)
         debug(f"[SEND] File size: {file_size} bytes")
 
@@ -3129,12 +3186,12 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
         if file_exists:
             file_size = os.path.getsize(file_path)
             debug(f"[SEND_FILE] File size: {file_size} bytes")
-            debug(f"[SEND_FILE] Getting file info...")
+            debug("[SEND_FILE] Getting file info...")
             file_info = await get_file_info(file_path)
             debug(f"[SEND_FILE] File type: {file_info.get('type', 'unknown')}")
         else:
             # Archivo .torrent ya procesado por el gestor
-            debug(f"[SEND_FILE] Torrent file already processed by torrent manager (expected behavior)")
+            debug("[SEND_FILE] Torrent file already processed by torrent manager (expected behavior)")
             file_info = {
                 'type': 'torrent',
                 'size_formatted': 'Unknown',
@@ -3192,15 +3249,15 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
 
         info_message = "\n".join(info_lines)
         debug(f"[SEND_FILE] Message prepared, length: {len(info_message)} chars")
-        debug(f"[SEND_FILE] Sending success message to user...")
-        debug(f"[SEND_FILE] Calling safe_reply with wait_for_result=True...")
+        debug("[SEND_FILE] Sending success message to user...")
+        debug("[SEND_FILE] Calling safe_reply with wait_for_result=True...")
 
         try:
             reply_result = await safe_reply(event, info_message, parse_mode=PARSE_MODE, wait_for_result=True)
             debug(f"[SEND_FILE] safe_reply returned: {reply_result}")
-            debug(f"[SEND_FILE] ✅ Success message sent")
+            debug("[SEND_FILE] ✅ Success message sent")
         except asyncio.TimeoutError:
-            error(f"[SEND_FILE] ❌ Timeout sending success message (waited 5 minutes)")
+            error("[SEND_FILE] ❌ Timeout sending success message (waited 5 minutes)")
             raise
         except Exception as reply_error:
             error(f"[SEND_FILE] ❌ Error sending success message: {reply_error}")
@@ -3208,7 +3265,7 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
             raise
 
         # Solo mostrar botones de acción si se solicita (para descargas de URLs) y solo para video/audio
-        debug(f"[SEND_FILE] Checking if action buttons should be shown...")
+        debug("[SEND_FILE] Checking if action buttons should be shown...")
         debug(f"[SEND_FILE] show_action_buttons={show_action_buttons}, file_type={file_type}, AUTO_SEND={AUTO_SEND}")
         if show_action_buttons and file_type in ["video", "audio"]:
             if AUTO_SEND == "STORE":
@@ -3218,13 +3275,16 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
             elif file_size >= MAX_TELEGRAM_FILE_SIZE:
                 debug("[SEND_FILE] File size is too large to send via Telegram. Maximum size is 2GB")
             else:
-                pending_files[event.id] = file_path
+                # Indexado por fichero y no por evento: una sola URL puede
+                # producir varios ficheros y con la clave del evento cada vuelta
+                # sobrescribía la anterior, dejando botones muertos
+                send_id = register_pending_send(file_path)
                 buttons = [
                     [
-                        Button.inline(get_text("button_send"), data=f"send:{event.id}"),
-                        Button.inline(get_text("button_send_and_delete"), data=f"senddelete:{event.id}"),
+                        Button.inline(get_text("button_send"), data=f"send:{send_id}"),
+                        Button.inline(get_text("button_send_and_delete"), data=f"senddelete:{send_id}"),
                     ],
-                    [Button.inline(get_text("button_only_in_server"), data=f"nosend:{event.id}")]
+                    [Button.inline(get_text("button_only_in_server"), data=f"nosend:{send_id}")]
                 ]
                 await safe_reply(event, get_text("upload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
     except Exception as e:
@@ -3239,10 +3299,10 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
 @bot.on(events.CallbackQuery(pattern=b"listcat:(.+)"))
 async def handle_list_category(event):
     """Maneja los botones de categorías en /list"""
-    debug(f"[LIST] handle_list_category called")
+    debug("[LIST] handle_list_category called")
 
     if await check_admin_and_warn(event):
-        debug(f"[LIST] User is not admin, returning")
+        debug("[LIST] User is not admin, returning")
         return
 
     await safe_answer(event)
@@ -3351,7 +3411,7 @@ async def handle_list_category(event):
         MAX_MESSAGE_LENGTH = 3800
 
         total_size_formatted = format_file_size(total_size)
-        header = f"📂 **Archivos en el servidor**\n\n"
+        header = "📂 **Archivos en el servidor**\n\n"
 
         # Contar archivos y carpetas
         file_count = sum(1 for item in files_info if item["type"] == "file")
@@ -3715,7 +3775,7 @@ async def handle_download_file(event):
         converted_file_path = None  # Para rastrear si se creó un archivo convertido
 
         if is_video:
-            debug(f"[SEND /manage] Starting video conversion...")
+            debug("[SEND /manage] Starting video conversion...")
             # Convertir el video a formato compatible con Telegram antes de enviarlo
             converted_file_path = await convert_video_to_telegram_compatible(file_path, sending_msg)
 
@@ -3736,10 +3796,10 @@ async def handle_download_file(event):
                 # Actualizar el atributo de nombre de archivo
                 attributes = [DocumentAttributeFilename(file_name=filename)]
             else:
-                debug(f"[SEND /manage] Video already compatible, using original")
+                debug("[SEND /manage] Video already compatible, using original")
 
             # Obtener metadatos del video
-            debug(f"[SEND /manage] Getting video metadata...")
+            debug("[SEND /manage] Getting video metadata...")
             duration, width, height = await get_video_metadata(file_path)
             if duration and width and height:
                 debug(f"[SEND /manage] Metadata: {duration}s, {width}x{height}")
@@ -3751,18 +3811,18 @@ async def handle_download_file(event):
                     supports_streaming=True
                 ))
             else:
-                debug(f"[SEND /manage] ⚠️ Could not get video metadata")
+                debug("[SEND /manage] ⚠️ Could not get video metadata")
 
             # Generar thumbnail
-            debug(f"[SEND /manage] Generating thumbnail...")
+            debug("[SEND /manage] Generating thumbnail...")
             thumb_path = await generate_video_thumbnail(file_path)
             if thumb_path:
                 debug(f"[SEND /manage] Thumbnail generated: {thumb_path}")
             else:
-                debug(f"[SEND /manage] ⚠️ Could not generate thumbnail")
+                debug("[SEND /manage] ⚠️ Could not generate thumbnail")
 
         elif is_audio:
-            debug(f"[SEND /manage] Getting audio metadata...")
+            debug("[SEND /manage] Getting audio metadata...")
             # Obtener metadatos del audio
             duration, _, _ = await get_video_metadata(file_path)
             if duration:
@@ -3772,12 +3832,12 @@ async def handle_download_file(event):
                     duration=duration
                 ))
             else:
-                debug(f"[SEND /manage] ⚠️ Could not get audio duration")
+                debug("[SEND /manage] ⚠️ Could not get audio duration")
 
         # Crear callback de progreso para el envío
         upload_progress = create_upload_progress_callback(sending_msg, filename)
 
-        debug(f"[SEND /manage] Starting send to Telegram...")
+        debug("[SEND /manage] Starting send to Telegram...")
         file_size = os.path.getsize(file_path)
         debug(f"[SEND /manage] File size: {file_size} bytes")
 
@@ -3794,7 +3854,7 @@ async def handle_download_file(event):
             upload_progress
         )
 
-        debug(f"[SEND /manage] ✅ File sent successfully")
+        debug("[SEND /manage] ✅ File sent successfully")
 
         # Limpiar thumbnail temporal
         if thumb_path and os.path.exists(thumb_path):
@@ -3809,7 +3869,7 @@ async def handle_download_file(event):
             try:
                 debug(f"[SEND /manage] Deleting temporary converted file: {converted_file_path}")
                 os.remove(converted_file_path)
-                debug(f"[SEND /manage] ✅ Temporary converted file deleted")
+                debug("[SEND /manage] ✅ Temporary converted file deleted")
             except Exception as e:
                 warning(f"[SEND /manage] ⚠️ Error deleting temporary converted file: {e}")
 
@@ -3847,7 +3907,7 @@ async def handle_download_file(event):
             try:
                 debug(f"[SEND /manage] Deleting converted file after error: {converted_file_path}")
                 os.remove(converted_file_path)
-                debug(f"[SEND /manage] ✅ Temporary converted file deleted after error")
+                debug("[SEND /manage] ✅ Temporary converted file deleted after error")
             except Exception as cleanup_error:
                 warning(f"[SEND /manage] ⚠️ Error deleting temporary converted file after error: {cleanup_error}")
 
@@ -4007,7 +4067,7 @@ async def handle_rename_file(event):
     msg += get_text('rename_reply_with_new_name', item_type)
     if not is_directory:
         msg += get_text('rename_include_extension')
-    msg += f".\n\n"
+    msg += ".\n\n"
     msg += get_text('rename_example', 'my_new_folder' if is_directory else 'my_new_video.mp4')
 
     buttons = [[Button.inline(get_text("button_cancel"), data=f"fileact:{file_id}")]]
@@ -4321,7 +4381,7 @@ async def handle_send_choice(event):
 
     await safe_answer(event)
     action = event.pattern_match.group(1).decode()
-    file_id = int(event.pattern_match.group(2).decode())
+    file_id = event.pattern_match.group(2).decode()
 
     # Extraer y eliminar atómicamente la entrada para evitar dobles ejecuciones
     # por doble click (condición de carrera): el segundo click obtiene None y sale

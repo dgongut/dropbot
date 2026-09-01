@@ -4,7 +4,7 @@ Servicio para obtener y mostrar la lista de donantes.
 import requests
 
 from config import DONORS_URL
-from debug import error
+from logger import error
 from translations import get_text, PARSE_MODE
 from utils.telegram_helpers import safe_send_message
 

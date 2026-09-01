@@ -8,14 +8,46 @@ def is_admin(id):
     admins = TELEGRAM_ADMIN.split(',')
     return str(id) in admins
 
+# Caracteres que no pueden aparecer en un nombre de fichero: separadores de
+# ruta, los reservados por Windows/SMB y los de control
+FORBIDDEN_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+
+# Los sistemas de ficheros limitan el nombre en bytes, no en caracteres
+MAX_FILENAME_BYTES = 255
+
+
+def _truncate_to_bytes(text, max_bytes):
+    """Recorta `text` para que quepa en `max_bytes` codificado en UTF-8.
+
+    El recorte se hace sobre los bytes porque es lo que limita el sistema de
+    ficheros: un nombre en japonés ocupa hasta 3 bytes por carácter. El
+    `errors="ignore"` del decode descarta el carácter que quede partido.
+    """
+    encoded = text.encode('utf-8')
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode('utf-8', 'ignore')
+
+
 def sanitize_filename(filename):
+    """Deja un nombre de fichero seguro conservando el nombre original.
+
+    Solo se quitan los caracteres que no puede haber en un nombre. Los acentos
+    y los alfabetos no latinos se conservan: los sistemas de ficheros y Telegram
+    manejan UTF-8, y romperlos convertía "Canción.mp3" en "Cancion.mp3" y un
+    título en japonés entero en "archivo.mp3".
+    """
+    # Se sanea la cadena completa antes de separar la extensión: os.path.splitext
+    # puede dejar separadores dentro de `ext`, que así se quedaban sin sanear
+    filename = FORBIDDEN_FILENAME_CHARS.sub('_', filename)
+    # NFC deja una forma canónica única para los acentos (macOS usa NFD)
+    filename = unicodedata.normalize('NFC', filename)
+
     base, ext = os.path.splitext(filename)
-    base = unicodedata.normalize('NFKD', base).encode('ascii', 'ignore').decode('ascii')
-    base = re.sub(r'[<>:"/\\|?*\x00-\x1F]', '_', base)
     base = re.sub(r'_+', '_', base)
     base = base.strip('_') or 'archivo'
-    base = base[:255 - len(ext)]
-    return base + ext
+    base = _truncate_to_bytes(base, MAX_FILENAME_BYTES - len(ext.encode('utf-8')))
+    return (base or 'archivo') + ext
 
 def clean_youtube_link(url):
     if 'youtu.be/' in url:

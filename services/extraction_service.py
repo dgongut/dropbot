@@ -7,7 +7,7 @@ import zipfile
 import tarfile
 import rarfile
 
-from debug import debug, warning, error
+from logger import debug, warning, error
 
 
 def _safe_member_path(extract_to, member_name):

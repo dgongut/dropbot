@@ -7,7 +7,7 @@ import json
 import asyncio
 
 from config import TEMP_DIR
-from debug import debug, warning, error
+from logger import debug, warning, error
 
 
 async def get_video_metadata(file_path):
@@ -24,7 +24,7 @@ async def get_video_metadata(file_path):
             file_path
         ]
 
-        debug(f"[METADATA] Running ffprobe...")
+        debug("[METADATA] Running ffprobe...")
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -46,7 +46,7 @@ async def get_video_metadata(file_path):
                     debug(f"[METADATA] ✅ Metadata obtained: {duration}s, {width}x{height}")
                     return duration, width, height
 
-            warning(f"[METADATA] ⚠️ Video stream not found")
+            warning("[METADATA] ⚠️ Video stream not found")
         else:
             error_msg = stderr.decode() if stderr else "Unknown error"
             error(f"[METADATA] ❌ Error running ffprobe (code {proc.returncode}): {error_msg[:200]}")
@@ -97,7 +97,7 @@ async def generate_video_thumbnail(video_path, output_path=None, timestamp="00:0
             output_path
         ]
 
-        debug(f"[THUMBNAIL] Running ffmpeg command...")
+        debug("[THUMBNAIL] Running ffmpeg command...")
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,

@@ -1,5 +1,5 @@
 import asyncio
-from debug import debug, error, warning
+from logger import debug, error, warning
 
 class TelegramMessageQueue:
     """

@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # La misma versión que usa la imagen (ubuntu:26.04)
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements-dev.txt
+
+      - name: Comprobar sintaxis
+        run: python -m compileall -q .
+
+      # Sin --exit-zero: aquí solo se miran los errores reales. Los avisos de
+      # "may be undefined" que generaban los import * ya no deberían aparecer
+      - name: pyflakes
+        run: python -m pyflakes *.py services/ utils/ tests/
+
+      - name: Tests
+        run: python -m pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Construir la imagen
+        run: docker build -f Dockerfile -t dropbot:ci .
+
+      - name: Arrancar sin configuración debe fallar con un mensaje claro
+        run: |
+          output=$(docker run --rm -e LANGUAGE=ES dropbot:ci 2>&1 || true)
+          echo "$output"
+          echo "$output" | grep -q "TELEGRAM_TOKEN"
+
+      - name: Un AUTO_SEND invalido debe abortar el arranque
+        run: |
+          output=$(docker run --rm -e LANGUAGE=ES -e AUTO_SEND=NO_EXISTE dropbot:ci 2>&1 || true)
+          echo "$output"
+          echo "$output" | grep -q "AUTO_SEND only can be"

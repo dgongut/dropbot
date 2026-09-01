@@ -93,7 +93,8 @@ AUTO_DOWNLOAD_FORMAT = os.environ.get("AUTO_DOWNLOAD_FORMAT", "ASK").upper()
 # Acción automática tras descargar un vídeo/audio desde URL (sin preguntar)
 # Valores posibles: "ASK" (preguntar, por defecto), "SEND" (enviar y almacenar),
 # "SEND_DELETE" (enviar y borrar), "STORE" (solo almacenar)
-AUTO_SEND = os.environ.get("AUTO_SEND", "ASK").upper()
+# Un valor vacio (AUTO_SEND= en el .env) equivale a no configurarlo
+AUTO_SEND = (os.environ.get("AUTO_SEND") or "ASK").upper()
 
 # Configuración interna de la cola de mensajes para evitar FloodWaitError
 # Valores conservadores para evitar problemas con la API de Telegram

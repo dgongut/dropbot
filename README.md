@@ -45,7 +45,7 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | FILTER_URL_VIDEO               | ❌           | Especifica si los archivos de vídeo descargados desde URLs deben almacenarse en una carpeta separada `/url_video` en lugar de donde van los vídeos. 0 = no, 1 = sí (por defecto 0)    |
 | FILTER_URL_AUDIO               | ❌           | Especifica si los archivos de audio descargados desde URLs deben almacenarse en una carpeta separada `/url_audio` en lugar de donde van los audios. 0 = no, 1 = sí (por defecto 0)    |
 | AUTO_DOWNLOAD_FORMAT           | ❌           | Descarga automática de URLs sin preguntar. Valores: `ASK` (preguntar, por defecto), `VIDEO` (descargar siempre como video), `AUDIO` (descargar siempre como audio)    |
-| AUTO_SEND                      | ❌           | Acción automática tras descargar vídeo/audio desde una URL. Valores: `ASK` (preguntar, por defecto), `SEND` (enviar y almacenar), `SEND_DELETE` (enviar y borrar del servidor), `STORE` (solo almacenar) |
+| AUTO_SEND                      | ❌           | Acción automática tras descargar vídeo/audio desde una URL, incluidas las playlists completas. No afecta a los ficheros que envías al bot desde Telegram. Valores: `ASK` (preguntar, por defecto), `SEND` (enviar y almacenar), `SEND_DELETE` (enviar y borrar del servidor), `STORE` (solo almacenar). Los ficheros de más de 2 GB no caben en Telegram y se quedan solo en el servidor. En vídeos largos se sigue ofreciendo cancelar la conversión o enviar el original |
 
 ### Cookies opcionales para yt-dlp
 

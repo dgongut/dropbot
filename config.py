@@ -88,13 +88,17 @@ YTDLP_COOKIES_FILE = "/app/cookies/cookies.txt"
 
 # Descarga automática de URLs sin preguntar
 # Valores posibles: "ASK" (preguntar), "VIDEO" (descargar video automáticamente), "AUDIO" (descargar audio automáticamente)
-AUTO_DOWNLOAD_FORMAT = os.environ.get("AUTO_DOWNLOAD_FORMAT", "ASK").upper()
+# Un valor vacío (AUTO_DOWNLOAD_FORMAT= en el .env) equivale a no configurarlo
+AUTO_DOWNLOAD_FORMAT = (os.environ.get("AUTO_DOWNLOAD_FORMAT") or "ASK").upper()
 
 # Acción automática tras descargar un vídeo/audio desde URL (sin preguntar)
 # Valores posibles: "ASK" (preguntar, por defecto), "SEND" (enviar y almacenar),
 # "SEND_DELETE" (enviar y borrar), "STORE" (solo almacenar)
-# Un valor vacio (AUTO_SEND= en el .env) equivale a no configurarlo
+# Un valor vacío (AUTO_SEND= en el .env) equivale a no configurarlo
 AUTO_SEND = (os.environ.get("AUTO_SEND") or "ASK").upper()
+
+# Tamaño máximo que Telegram acepta en una subida (2 GiB)
+MAX_TELEGRAM_FILE_SIZE = 2 * 1024 * 1024 * 1024
 
 # Configuración interna de la cola de mensajes para evitar FloodWaitError
 # Valores conservadores para evitar problemas con la API de Telegram

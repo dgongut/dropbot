@@ -58,7 +58,7 @@ logger = log_module.setup_logger(
 # Mantener compatibilidad con debug.py
 from debug import debug, info, warning, error, critical
 
-VERSION = "3.3.3"
+VERSION = "3.4.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -69,6 +69,10 @@ logger.info(f"=" * 60)
 
 if LANGUAGE.lower() not in ("es", "en"):
     error("[CONFIG] LANGUAGE only can be ES/EN")
+    sys.exit(1)
+
+if AUTO_DOWNLOAD_FORMAT not in ("ASK", "VIDEO", "AUDIO"):
+    error("[CONFIG] AUTO_DOWNLOAD_FORMAT only can be ASK/VIDEO/AUDIO")
     sys.exit(1)
 
 if AUTO_SEND not in ("ASK", "SEND", "SEND_DELETE", "STORE"):
@@ -2401,6 +2405,7 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                 if is_full_playlist and len(temp_file_paths) > 1:
                     debug(f"[URL_DOWNLOAD] Full playlist detected with {len(temp_file_paths)} files. Storing without action buttons.")
                     stored_files = []
+                    stored_paths = []
                     for temp_file_path in temp_file_paths:
                         if os.path.exists(temp_file_path):
                             # Mover archivo de /tmp a carpeta final
@@ -2416,6 +2421,7 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                             os.remove(temp_file_path)
                             debug(f"[URL DOWNLOAD] ✅ File moved to: {final_file_path}")
                             stored_files.append(filename)
+                            stored_paths.append(final_file_path)
                         else:
                             warning(f"[URL_DOWNLOAD] Output file not found: {temp_file_path}")
 
@@ -2430,6 +2436,18 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                         else:
                             message = get_text("playlist_stored", icon, len(stored_files))
                         await safe_reply(event, message, parse_mode=PARSE_MODE)
+
+                        # Esta rama no pasa por handle_success, así que AUTO_SEND
+                        # hay que aplicarlo aquí o las playlists se quedarían
+                        # siempre almacenadas sin enviar
+                        if AUTO_SEND in ("SEND", "SEND_DELETE"):
+                            debug(f"[URL_DOWNLOAD] AUTO_SEND={AUTO_SEND}, sending {len(stored_paths)} playlist file(s)")
+                            for stored_path in stored_paths:
+                                stored_ext = os.path.splitext(stored_path)[1].lower()
+                                if stored_ext not in EXTENSIONS_VIDEO and stored_ext not in EXTENSIONS_AUDIO:
+                                    debug(f"[URL_DOWNLOAD] Skipping non media file: {stored_path}")
+                                    continue
+                                await send_file_automatically(event, stored_path)
 
                     # Limpiar información de playlist
                     if event.id in playlist_downloads:
@@ -2927,15 +2945,38 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
     original_file_path = file_path
     converted_file_path = None
 
+    def cleanup_temp_files():
+        """Borra el thumbnail y el fichero convertido temporales.
+
+        Se llama desde un `finally` para que los temporales no se queden en
+        TEMP_DIR ni cuando la tarea se cancela a mitad del envío (CancelledError
+        no lo captura el `except Exception`).
+        """
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                debug(f"[SEND] Deleting temporary thumbnail: {thumb_path}")
+                os.remove(thumb_path)
+            except Exception as cleanup_error:
+                warning(f"[SEND] ⚠️ Error deleting temporary thumbnail: {cleanup_error}")
+
+        if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
+            try:
+                debug(f"[SEND] Deleting temporary converted file: {converted_file_path}")
+                os.remove(converted_file_path)
+                debug(f"[SEND] ✅ Temporary converted file deleted")
+            except Exception as cleanup_error:
+                warning(f"[SEND] ⚠️ Error deleting temporary converted file: {cleanup_error}")
+
     try:
         debug(f"[SEND] Preparing file send: {file_path}")
 
         is_video = file_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'))
+        is_audio = os.path.splitext(file_path)[1].lower() in EXTENSIONS_AUDIO
         original_filename = os.path.basename(file_path)
         display_filename = original_filename
         attributes = [DocumentAttributeFilename(file_name=original_filename)]
 
-        debug(f"[SEND] File type: {'video' if is_video else 'document'}")
+        debug(f"[SEND] File type: {'video' if is_video else 'audio' if is_audio else 'document'}")
 
         if is_video:
             debug(f"[SEND] Starting video conversion...")
@@ -2960,7 +3001,6 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
             duration, width, height = await get_video_metadata(file_path)
             if duration and width and height:
                 debug(f"[SEND] Metadata: {duration}s, {width}x{height}")
-                from telethon.tl.types import DocumentAttributeVideo
                 attributes.append(DocumentAttributeVideo(
                     duration=duration,
                     w=width,
@@ -2976,6 +3016,15 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
                 debug(f"[SEND] Thumbnail generated: {thumb_path}")
             else:
                 debug(f"[SEND] ⚠️ Could not generate thumbnail")
+        elif is_audio:
+            # Sin la duración, Telegram muestra el audio sin barra de reproducción
+            debug(f"[SEND] Getting audio metadata...")
+            duration, _, _ = await get_video_metadata(file_path)
+            if duration:
+                debug(f"[SEND] Audio duration: {duration}s")
+                attributes.append(DocumentAttributeAudio(duration=duration))
+            else:
+                debug(f"[SEND] ⚠️ Could not get audio duration")
 
         upload_progress = create_upload_progress_callback(sending_msg, display_filename)
 
@@ -2993,51 +3042,26 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
             upload_progress
         )
 
-        debug(f"[SEND] ✅ File sent successfully")
-
-        if thumb_path and os.path.exists(thumb_path):
-            try:
-                debug(f"[SEND] Deleting temporary thumbnail: {thumb_path}")
-                os.remove(thumb_path)
-            except Exception as e:
-                warning(f"[SEND] ⚠️ Error deleting temporary thumbnail: {e}")
-
-        if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
-            try:
-                debug(f"[SEND] Deleting temporary converted file: {converted_file_path}")
-                os.remove(converted_file_path)
-                debug(f"[SEND] ✅ Temporary converted file deleted")
-            except Exception as e:
-                warning(f"[SEND] ⚠️ Error deleting temporary converted file: {e}")
-
         debug(f"[SEND] ✅ File sent to Telegram: {original_file_path}")
         if sending_msg:
             await safe_delete(sending_msg)
 
         if delete_after:
             debug(f"[SEND] Deleting original file from server: {original_file_path}")
-            os.remove(original_file_path)
-            debug(f"[SEND] ✅ File sent to Telegram and deleted from server: {original_file_path}")
-            await safe_respond(event, get_text("deleted_from_server"), reply_to=message.id, parse_mode=PARSE_MODE)
+            # En su propio try: el fichero ya está enviado, así que un fallo al
+            # borrarlo no debe reportarse como error de envío
+            try:
+                os.remove(original_file_path)
+            except Exception as delete_error:
+                error(f"[SEND] ❌ File sent but could not be deleted from server: {delete_error}")
+                await safe_respond(event, get_text("error_deleting_after_send", str(delete_error)), reply_to=message.id, parse_mode=PARSE_MODE)
+            else:
+                debug(f"[SEND] ✅ File sent to Telegram and deleted from server: {original_file_path}")
+                await safe_respond(event, get_text("deleted_from_server"), reply_to=message.id, parse_mode=PARSE_MODE)
 
         return message
     except Exception as e:
         error(f"[SEND] ❌ Error sending file {file_path}: {e}")
-
-        if thumb_path and os.path.exists(thumb_path):
-            try:
-                debug(f"[SEND] Deleting thumbnail after error: {thumb_path}")
-                os.remove(thumb_path)
-            except Exception as cleanup_error:
-                warning(f"[SEND] ⚠️ Error deleting thumbnail after error: {cleanup_error}")
-
-        if converted_file_path and converted_file_path != original_file_path and os.path.exists(converted_file_path):
-            try:
-                debug(f"[SEND] Deleting converted file after error: {converted_file_path}")
-                os.remove(converted_file_path)
-                debug(f"[SEND] ✅ Temporary converted file deleted after error")
-            except Exception as cleanup_error:
-                warning(f"[SEND] ⚠️ Error deleting temporary converted file after error: {cleanup_error}")
 
         if sending_msg:
             try:
@@ -3046,8 +3070,44 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
                 warning(f"[SEND] ⚠️ Error deleting progress message: {delete_error}")
 
         await safe_reply(event, get_text("error_sending_the_file_user"), parse_mode=PARSE_MODE)
-        error(f"[SEND] Error sending file: {e}")
         return None
+    finally:
+        cleanup_temp_files()
+
+
+async def send_file_automatically(event, file_path):
+    """Envía un fichero sin preguntar, según AUTO_SEND (SEND o SEND_DELETE).
+
+    Comprueba antes el límite de subida de Telegram: con AUTO_SEND activo el
+    usuario espera recibir el fichero, así que si no cabe hay que decírselo en
+    lugar de dejarlo pasar en silencio.
+
+    Devuelve el mensaje enviado, o None si no se pudo enviar.
+    """
+    filename = os.path.basename(file_path)
+
+    if os.path.getsize(file_path) >= MAX_TELEGRAM_FILE_SIZE:
+        debug(f"[AUTO_SEND] {filename} exceeds Telegram's upload limit, storing only")
+        await safe_reply(event, get_text("error_file_too_large"), parse_mode=PARSE_MODE)
+        return None
+
+    delete_after = AUTO_SEND == "SEND_DELETE"
+    debug(f"[AUTO_SEND] AUTO_SEND={AUTO_SEND}, sending {filename} (delete_after={delete_after})")
+
+    sending_msg = await safe_reply(
+        event,
+        get_text("sending", filename),
+        parse_mode=PARSE_MODE,
+        wait_for_result=True
+    )
+
+    # Si la cola dio timeout no tenemos el mensaje para editarlo, así que el
+    # envío va sin barra de progreso ni botón de cancelar conversión. No se
+    # reintenta porque el mensaje original sigue en la cola y saldría duplicado
+    if sending_msg is None:
+        warning(f"[AUTO_SEND] No progress message available for {filename}, sending without progress")
+
+    return await send_file_to_telegram(event, file_path, sending_msg, delete_after=delete_after)
 
 
 async def handle_success(event, file_path, show_action_buttons=True, icon=None, content_type=None):
@@ -3151,25 +3211,11 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
         debug(f"[SEND_FILE] Checking if action buttons should be shown...")
         debug(f"[SEND_FILE] show_action_buttons={show_action_buttons}, file_type={file_type}, AUTO_SEND={AUTO_SEND}")
         if show_action_buttons and file_type in ["video", "audio"]:
-            max_telegram_size = 2 * 1024 * 1024 * 1024
-            too_large = file_size > max_telegram_size
-
             if AUTO_SEND == "STORE":
                 debug("[SEND_FILE] AUTO_SEND=STORE, keeping file on server without asking")
             elif AUTO_SEND in ("SEND", "SEND_DELETE"):
-                if too_large:
-                    debug("[SEND_FILE] File size is too large to send via Telegram. Maximum size is 2GB. Storing only.")
-                else:
-                    delete_after = AUTO_SEND == "SEND_DELETE"
-                    debug(f"[SEND_FILE] AUTO_SEND={AUTO_SEND}, sending automatically (delete_after={delete_after})")
-                    sending_msg = await safe_reply(
-                        event,
-                        get_text("sending", filename),
-                        parse_mode=PARSE_MODE,
-                        wait_for_result=True
-                    )
-                    await send_file_to_telegram(event, file_path, sending_msg, delete_after=delete_after)
-            elif too_large:
+                await send_file_automatically(event, file_path)
+            elif file_size >= MAX_TELEGRAM_FILE_SIZE:
                 debug("[SEND_FILE] File size is too large to send via Telegram. Maximum size is 2GB")
             else:
                 pending_files[event.id] = file_path
@@ -3636,8 +3682,7 @@ async def handle_download_file(event):
     file_size_bytes = os.path.getsize(file_path)
 
     # Verificar tamaño
-    MAX_TELEGRAM_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
-    if file_size_bytes >= MAX_TELEGRAM_SIZE:
+    if file_size_bytes >= MAX_TELEGRAM_FILE_SIZE:
         await safe_edit(event, get_text("error_file_too_large"), parse_mode=PARSE_MODE)
         return
 
@@ -4292,21 +4337,28 @@ async def handle_send_choice(event):
         return
 
     if action in ("send", "senddelete"):
-        sending_msg = await safe_edit(
-            event,
-            get_text("sending", os.path.basename(file_path)),
-            parse_mode=PARSE_MODE,
-            wait_for_result=True
-        )
-
-        # Si no se pudo editar el mensaje (timeout en cola), crear uno nuevo
-        if sending_msg is None:
-            sending_msg = await safe_reply(
+        # El try cubre también la creación del mensaje de progreso: si la cola
+        # falla ahí, el usuario debe enterarse igual que si fallara el envío
+        try:
+            sending_msg = await safe_edit(
                 event,
                 get_text("sending", os.path.basename(file_path)),
                 parse_mode=PARSE_MODE,
-                wait_for_result=False
+                wait_for_result=True
             )
+
+            # Si no se pudo editar el mensaje (timeout en cola), crear uno nuevo
+            if sending_msg is None:
+                sending_msg = await safe_reply(
+                    event,
+                    get_text("sending", os.path.basename(file_path)),
+                    parse_mode=PARSE_MODE,
+                    wait_for_result=False
+                )
+        except Exception as e:
+            error(f"[SEND BUTTON] ❌ Error preparing the progress message: {e}")
+            await safe_reply(event, get_text("error_sending_the_file_user"), parse_mode=PARSE_MODE)
+            return
 
         await send_file_to_telegram(
             event,

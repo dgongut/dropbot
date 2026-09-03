@@ -22,6 +22,7 @@ from config import (
     DOWNLOAD_PATHS, EXTENSIONS_AUDIO, EXTENSIONS_EBOOK, EXTENSIONS_IMAGE,
     EXTENSIONS_TORRENT, EXTENSIONS_VIDEO, FAST_CONNECTIONS, FAST_TRANSFER_MIN_BYTES,
     FFMPEG_HW,
+    FFMPEG_QUALITY,
     HEARTBEAT_FILE, HEARTBEAT_INTERVAL, IMG_ICO, LANGUAGE,
     MAX_DOWNLOAD_RETRIES, MAX_TELEGRAM_FILE_SIZE, MESSAGE_QUEUE_DELAY, MESSAGE_QUEUE_MAX_RETRIES,
     PARALLEL_DOWNLOADS, POT_PROVIDER_DIR, POT_PROVIDER_PORT, POT_PROVIDER_STARTUP_TIMEOUT,
@@ -101,6 +102,16 @@ if AUTO_SEND not in ("ASK", "SEND", "SEND_DELETE", "STORE"):
 if FFMPEG_HW not in ("NONE", "VAAPI", "NVENC", "QSV"):
     error("[CONFIG] FFMPEG_HW only can be NONE/VAAPI/NVENC/QSV")
     sys.exit(1)
+
+if FFMPEG_QUALITY is not None:
+    try:
+        _ffmpeg_quality = int(FFMPEG_QUALITY)
+    except ValueError:
+        error("[CONFIG] FFMPEG_QUALITY only can be an integer from 1-51")
+        sys.exit(1)
+    if not 1 <= _ffmpeg_quality <= 51:
+        error("[CONFIG] FFMPEG_QUALITY only can be an integer from 1-51")
+        sys.exit(1)
 
 load_locale(LANGUAGE.lower())
 
@@ -1415,7 +1426,7 @@ def ytdlp_output_template(timestamp):
     return f"%(playlist_index&{{}}-|)s%(title).200s_temp{timestamp}.%(ext)s"
 
 
-def build_ffmpeg_conversion_command(input_path, output_path, hardware=None):
+def build_ffmpeg_conversion_command(input_path, output_path, hardware=None, quality=None):
     """Construye el comando FFmpeg para convertir vídeo a formato Telegram."""
     hardware = (hardware or FFMPEG_HW).upper()
     video_encoder = {
@@ -1441,6 +1452,19 @@ def build_ffmpeg_conversion_command(input_path, output_path, hardware=None):
         "-y",
         output_path,
     ])
+
+    if quality is not None:
+        quality = str(quality)
+        quality_args = {
+            "NONE": ["-crf", quality],
+            "VAAPI": ["-qp", quality],
+            "NVENC": ["-rc:v", "vbr", "-cq", quality, "-b:v", "0"],
+            "QSV": ["-global_quality", quality],
+        }[hardware]
+        # Los parámetros de calidad son opciones de salida y deben ir antes
+        # del fichero de destino.
+        command[-1:-1] = quality_args
+
     return command
 
 
@@ -2753,10 +2777,13 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
             )
 
         selected_hw = "NONE" if _force_software else FFMPEG_HW
-        cmd = build_ffmpeg_conversion_command(input_path, output_path, selected_hw)
+        cmd = build_ffmpeg_conversion_command(
+            input_path, output_path, selected_hw, FFMPEG_QUALITY
+        )
 
         encoder = cmd[cmd.index("-c:v") + 1]
         debug(f"[CONVERSION] Encoder mode: {selected_hw}; video encoder: {encoder}")
+        debug(f"[CONVERSION] Quality: {FFMPEG_QUALITY or 'encoder default'}")
         debug(f"[CONVERSION] Full FFmpeg command: {' '.join(cmd)}")
 
         proc = await asyncio.create_subprocess_exec(

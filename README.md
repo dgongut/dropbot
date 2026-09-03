@@ -48,6 +48,7 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 | AUTO_DOWNLOAD_FORMAT           | ❌           | Descarga automática de URLs sin preguntar. Valores: `ASK` (preguntar, por defecto), `VIDEO` (descargar siempre como video), `AUDIO` (descargar siempre como audio)    |
 | AUTO_SEND                      | ❌           | Acción automática tras descargar vídeo/audio desde una URL, incluidas las playlists completas. No afecta a los ficheros que envías al bot desde Telegram. Valores: `ASK` (preguntar, por defecto), `SEND` (enviar y almacenar), `SEND_DELETE` (enviar y borrar del servidor), `STORE` (solo almacenar). Los ficheros de más de 2 GB no caben en Telegram y se quedan solo en el servidor. En vídeos largos se sigue ofreciendo cancelar la conversión o enviar el original |
 | FFMPEG_HW                      | ❌           | Encoder hardware para convertir vídeos: `NONE` (por defecto, `libx264`), `VAAPI` (Intel/AMD), `NVENC` (NVIDIA) o `QSV` (Intel Quick Sync). Si el encoder hardware falla, se reintenta automáticamente con `libx264` |
+| FFMPEG_QUALITY                 | ❌           | Calidad opcional de conversión, entre `1` y `51`. Si no se configura se mantienen los valores predeterminados del encoder. Valores más altos reducen calidad y tamaño; valores más bajos aumentan calidad y tamaño. `23` es un buen valor inicial |
 
 ### Cookies opcionales para yt-dlp
 
@@ -79,6 +80,7 @@ services:
       #- AUTO_DOWNLOAD_FORMAT=ASK
       #- AUTO_SEND=ASK
       #- FFMPEG_HW=NONE
+      #- FFMPEG_QUALITY=23
     volumes:
       - /ruta/para/descargar/general:/downloads
       #- /ruta/para/cookies:/app/cookies

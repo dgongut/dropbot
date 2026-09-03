@@ -33,7 +33,8 @@ def _read_config(**overrides):
         "import json, config; "
         "print(json.dumps({'AUTO_SEND': config.AUTO_SEND, "
         "'AUTO_DOWNLOAD_FORMAT': config.AUTO_DOWNLOAD_FORMAT, "
-        "'FFMPEG_HW': config.FFMPEG_HW}))"
+        "'FFMPEG_HW': config.FFMPEG_HW, "
+        "'FFMPEG_QUALITY': config.FFMPEG_QUALITY}))"
     )
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -55,6 +56,9 @@ class TestValoresPorDefecto:
 
     def test_ffmpeg_hw_por_defecto_es_none(self):
         assert _read_config()["FFMPEG_HW"] == "NONE"
+
+    def test_ffmpeg_quality_por_defecto_no_se_configura(self):
+        assert _read_config()["FFMPEG_QUALITY"] is None
 
     @pytest.mark.parametrize("written,expected", [
         ("send", "SEND"),
@@ -80,6 +84,7 @@ class TestValidacionDeArranque:
         ("AUTO_SEND", "ASK/SEND/SEND_DELETE/STORE"),
         ("AUTO_DOWNLOAD_FORMAT", "ASK/VIDEO/AUDIO"),
         ("FFMPEG_HW", "NONE/VAAPI/NVENC/QSV"),
+        ("FFMPEG_QUALITY", "1-51"),
     ])
     def test_un_valor_invalido_aborta_con_mensaje(self, variable, valid):
         result = self._start(**{variable: "NO_EXISTE"})
@@ -97,6 +102,7 @@ class TestValidacionDeArranque:
     @pytest.mark.parametrize("variable,values", [
         ("AUTO_SEND", ["ASK", "SEND", "SEND_DELETE", "STORE", ""]),
         ("FFMPEG_HW", ["NONE", "VAAPI", "NVENC", "QSV", ""]),
+        ("FFMPEG_QUALITY", ["1", "23", "51", ""]),
     ])
     def test_los_valores_validos_pasan_la_validacion(self, variable, values):
         """Debe llegar hasta la comprobación del token, que va después."""

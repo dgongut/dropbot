@@ -101,6 +101,10 @@ AUTO_SEND = (os.environ.get("AUTO_SEND") or "ASK").upper()
 # comportamiento original y usa libx264.
 FFMPEG_HW = (os.environ.get("FFMPEG_HW") or "NONE").upper()
 
+# Calidad opcional del encoder. Si queda vacía, cada encoder usa su valor
+# predeterminado. Los valores más altos reducen calidad y tamaño.
+FFMPEG_QUALITY = os.environ.get("FFMPEG_QUALITY") or None
+
 # Tamaño máximo que Telegram acepta en una subida (2 GiB)
 MAX_TELEGRAM_FILE_SIZE = 2 * 1024 * 1024 * 1024
 

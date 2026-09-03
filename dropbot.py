@@ -21,6 +21,7 @@ from config import (
     BOO_ICO, DEFAULT_EMPTY_STR, DEF_ICO, DOWNLOAD_PATH,
     DOWNLOAD_PATHS, EXTENSIONS_AUDIO, EXTENSIONS_EBOOK, EXTENSIONS_IMAGE,
     EXTENSIONS_TORRENT, EXTENSIONS_VIDEO, FAST_CONNECTIONS, FAST_TRANSFER_MIN_BYTES,
+    FFMPEG_HW,
     HEARTBEAT_FILE, HEARTBEAT_INTERVAL, IMG_ICO, LANGUAGE,
     MAX_DOWNLOAD_RETRIES, MAX_TELEGRAM_FILE_SIZE, MESSAGE_QUEUE_DELAY, MESSAGE_QUEUE_MAX_RETRIES,
     PARALLEL_DOWNLOADS, POT_PROVIDER_DIR, POT_PROVIDER_PORT, POT_PROVIDER_STARTUP_TIMEOUT,
@@ -95,6 +96,10 @@ if AUTO_DOWNLOAD_FORMAT not in ("ASK", "VIDEO", "AUDIO"):
 
 if AUTO_SEND not in ("ASK", "SEND", "SEND_DELETE", "STORE"):
     error("[CONFIG] AUTO_SEND only can be ASK/SEND/SEND_DELETE/STORE")
+    sys.exit(1)
+
+if FFMPEG_HW not in ("NONE", "VAAPI", "NVENC", "QSV"):
+    error("[CONFIG] FFMPEG_HW only can be NONE/VAAPI/NVENC/QSV")
     sys.exit(1)
 
 load_locale(LANGUAGE.lower())
@@ -1410,6 +1415,35 @@ def ytdlp_output_template(timestamp):
     return f"%(playlist_index&{{}}-|)s%(title).200s_temp{timestamp}.%(ext)s"
 
 
+def build_ffmpeg_conversion_command(input_path, output_path, hardware=None):
+    """Construye el comando FFmpeg para convertir vídeo a formato Telegram."""
+    hardware = (hardware or FFMPEG_HW).upper()
+    video_encoder = {
+        "NONE": "libx264",
+        "VAAPI": "h264_vaapi",
+        "NVENC": "h264_nvenc",
+        "QSV": "h264_qsv",
+    }[hardware]
+
+    command = ["ffmpeg"]
+    if hardware == "VAAPI":
+        command.extend(["-vaapi_device", "/dev/dri/renderD128"])
+
+    command.extend(["-i", input_path])
+    if hardware == "VAAPI":
+        command.extend(["-vf", "format=nv12,hwupload"])
+
+    command.extend([
+        "-c:v", video_encoder,
+        "-c:a", "aac",
+        "-movflags", "+faststart",
+        "-progress", "pipe:1",
+        "-y",
+        output_path,
+    ])
+    return command
+
+
 @bot.on(events.NewMessage(pattern=r'https?://[^\s]+'))
 async def handle_url_link(event):
     if await check_admin_and_warn(event):
@@ -2659,7 +2693,7 @@ async def get_file_info(file_path):
             "type": "document"
         }
 
-async def convert_video_to_telegram_compatible(input_path, status_message=None):
+async def convert_video_to_telegram_compatible(input_path, status_message=None, _force_software=False):
     """
     Convierte un video a formato compatible con Telegram (MP4 con H.264 + AAC).
     Retorna la ruta del archivo convertido (temporal en /tmp) o el original si falla.
@@ -2718,18 +2752,12 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
                 parse_mode=PARSE_MODE
             )
 
-        cmd = [
-            "ffmpeg",
-            "-i", input_path,
-            "-c:v", "libx264",  # Codec de video H.264 (compatible con Telegram)
-            "-c:a", "aac",      # Codec de audio AAC (compatible con Telegram)
-            "-movflags", "+faststart",  # Optimizar para streaming
-            "-progress", "pipe:1",  # Reportar progreso a stdout
-            "-y",  # Sobrescribir sin preguntar
-            output_path
-        ]
+        selected_hw = "NONE" if _force_software else FFMPEG_HW
+        cmd = build_ffmpeg_conversion_command(input_path, output_path, selected_hw)
 
-        debug(f"[CONVERSIÓN] Ejecutando comando ffmpeg: {' '.join(cmd[:3])}...")
+        encoder = cmd[cmd.index("-c:v") + 1]
+        debug(f"[CONVERSION] Encoder mode: {selected_hw}; video encoder: {encoder}")
+        debug(f"[CONVERSION] Full FFmpeg command: {' '.join(cmd)}")
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -2877,10 +2905,21 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None):
             stderr = await proc.stderr.read()
             error_msg = stderr.decode() if stderr else "Unknown error"
             error(f"[CONVERSIÓN] ❌ Error convirtiendo video (código {proc.returncode}): {error_msg[:200]}")
+            debug(f"[CONVERSION] Full FFmpeg stderr: {error_msg}")
             # Si falla la conversión, eliminar el archivo de salida si existe
             if os.path.exists(output_path):
                 warning(f"[CONVERSION] Deleting failed output file: {output_path}")
                 os.remove(output_path)
+            # Si el encoder hardware no está disponible, reintentar con el
+            # encoder software original para no romper el envío.
+            if selected_hw != "NONE" and not _force_software:
+                warning(f"[CONVERSION] {selected_hw} failed; retrying with libx264")
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                return await convert_video_to_telegram_compatible(
+                    input_path, status_message, _force_software=True
+                )
+
             # Retornar el archivo original sin convertir
             debug(f"[CONVERSION] Returning original unconverted file: {input_path}")
             return input_path
@@ -3382,6 +3421,7 @@ manage_handlers.init(
 async def main():
     debug(f"[STARTUP] DropBot v{VERSION}")
     debug(f"[STARTUP] AUTO_DOWNLOAD_FORMAT={AUTO_DOWNLOAD_FORMAT}, AUTO_SEND={AUTO_SEND}")
+    debug(f"[STARTUP] FFMPEG_HW={FFMPEG_HW}")
     pot_proc = await start_pot_provider()
     await bot.start()
     await message_queue.start()  # Iniciar la cola de mensajes

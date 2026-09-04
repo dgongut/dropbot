@@ -13,7 +13,7 @@ services:
           # Opcional: montar cookies de yt-dlp para sitios que requieren sesión.
           # Debe ser escribible porque yt-dlp actualiza el cookie jar.
           #- ./cookies:/app/cookies
-          # Para VAAPI/QSV, añadir al servicio:
-          # Para NVENC se necesita NVIDIA Container Toolkit y acceso a la GPU.
+        # Para VAAPI/QSV, añadir al servicio:
+        # Para NVENC se necesita NVIDIA Container Toolkit y acceso a la GPU.
         # devices:
         #   - /dev/dri:/dev/dri

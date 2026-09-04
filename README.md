@@ -91,16 +91,25 @@ services:
       #- /ruta/para/descargar/ebook:/ebook
       #- /ruta/para/descargar/videos_desde_urls:/url_video
       #- /ruta/para/descargar/audios_desde_urls:/url_audio
-      # Para VAAPI/QSV se debe añadir el dispositivo `/dev/dri` al servicio.
-      # Para NVENC se necesita NVIDIA Container Toolkit y acceso a la GPU.
+    # Aceleración hardware (opcional): descomenta lo que necesites.
+    # Para VAAPI/QSV, da acceso al dispositivo `/dev/dri`:
+    #devices:
+    #  - /dev/dri:/dev/dri
+    # Para NVENC necesitas NVIDIA Container Toolkit y dar acceso a la GPU:
+    #deploy:
+    #  resources:
+    #    reservations:
+    #      devices:
+    #        - driver: nvidia
+    #          count: all
+    #          capabilities: [gpu]
     image: dgongut/dropbot:latest
     container_name: dropbot
     restart: always
     network_mode: host
     tty: true
-    #devices:
-    #  - /dev/dri:/dev/dri
 ```
+Puedes comprobar qué encoder se está usando en los logs (`[CONVERSION] Encoder mode: ...`).
 
 ---
 

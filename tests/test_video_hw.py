@@ -18,11 +18,30 @@ def test_build_ffmpeg_command_selects_encoder(dropbot, hardware, encoder):
     assert command[-1] == "output.mp4"
 
 
-def test_vaapi_configures_device_and_upload_filter(dropbot):
+def test_vaapi_uses_full_hardware_pipeline(dropbot):
     command = dropbot.build_ffmpeg_conversion_command("input.mkv", "output.mp4", "VAAPI")
 
+    assert command[command.index("-hwaccel") + 1] == "vaapi"
+    assert command[command.index("-hwaccel_output_format") + 1] == "vaapi"
     assert command[command.index("-vaapi_device") + 1] == "/dev/dri/renderD128"
-    assert command[command.index("-vf") + 1] == "format=nv12,hwupload"
+    # Los frames ya están en la GPU: sin filtro de subida a memoria de vídeo
+    assert "-vf" not in command
+
+
+@pytest.mark.parametrize(("hardware", "hwaccel"), [
+    ("NONE", None),
+    ("VAAPI", "vaapi"),
+    ("NVENC", "cuda"),
+    ("QSV", "qsv"),
+])
+def test_hardware_decode_flags_go_before_input(dropbot, hardware, hwaccel):
+    command = dropbot.build_ffmpeg_conversion_command("input.mkv", "output.mp4", hardware)
+
+    if hwaccel is None:
+        assert "-hwaccel" not in command
+    else:
+        assert command[command.index("-hwaccel") + 1] == hwaccel
+        assert command.index("-hwaccel") < command.index("-i")
 
 
 @pytest.mark.parametrize(("hardware", "quality_arg"), [

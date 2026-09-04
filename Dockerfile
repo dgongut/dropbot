@@ -2,7 +2,7 @@
 FROM ubuntu:26.04
 
 # Build arguments
-ARG VERSION=3.5.1
+ARG VERSION=3.6.0
 ARG POT_PROVIDER_VERSION=1.3.1
 
 # Metadata

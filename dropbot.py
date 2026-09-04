@@ -78,7 +78,7 @@ logger = log_module.setup_logger(
 
 from logger import debug, warning, error
 
-VERSION = "3.5.1"
+VERSION = "3.6.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -1427,26 +1427,36 @@ def ytdlp_output_template(timestamp):
 
 
 def build_ffmpeg_conversion_command(input_path, output_path, hardware=None, quality=None):
-    """Construye el comando FFmpeg para convertir vídeo a formato Telegram."""
+    """Construye el comando FFmpeg para convertir vídeo a formato Telegram.
+
+    Con aceleración hardware el pipeline es completo en GPU (decodificado y
+    codificado). Si la GPU no soporta el códec de entrada, ffmpeg falla y la
+    llamada se reintenta en software.
+    """
     hardware = (hardware or FFMPEG_HW).strip().upper()
-    video_encoders = {
-        "NONE": "libx264",
-        "VAAPI": "h264_vaapi",
-        "NVENC": "h264_nvenc",
-        "QSV": "h264_qsv",
+    hw_profiles = {
+        "NONE": ("libx264", []),
+        "VAAPI": ("h264_vaapi", [
+            "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
+            "-vaapi_device", "/dev/dri/renderD128",
+        ]),
+        "NVENC": ("h264_nvenc", [
+            "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        ]),
+        "QSV": ("h264_qsv", [
+            "-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
+            "-qsv_device", "/dev/dri/renderD128",
+        ]),
     }
     try:
-        video_encoder = video_encoders[hardware]
+        video_encoder, hw_decode_args = hw_profiles[hardware]
     except KeyError:
         raise ValueError(f"Unknown FFmpeg hardware mode: {hardware}")
 
     command = ["ffmpeg"]
-    if hardware == "VAAPI":
-        command.extend(["-vaapi_device", "/dev/dri/renderD128"])
+    command.extend(hw_decode_args)
 
     command.extend(["-i", input_path])
-    if hardware == "VAAPI":
-        command.extend(["-vf", "format=nv12,hwupload"])
 
     command.extend([
         "-c:v", video_encoder,

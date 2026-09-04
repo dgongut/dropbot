@@ -32,6 +32,10 @@ RUN apt-get update && \
         unrar \
         curl \
         unzip && \
+    # Driver VA-API de Intel para VAAPI/QSV (paquete solo-amd64: en arm no hay iGPU Intel)
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+        apt-get install -y --no-install-recommends intel-media-va-driver; \
+    fi && \
     # Instalar Deno (requerido por yt-dlp para descargas de YouTube)
     # Deno es el runtime de JavaScript recomendado para resolver desafíos JS de YouTube
     curl -fsSL https://deno.land/install.sh | sh && \

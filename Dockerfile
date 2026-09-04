@@ -2,7 +2,7 @@
 FROM ubuntu:26.04
 
 # Build arguments
-ARG VERSION=3.5.0
+ARG VERSION=3.5.1
 ARG POT_PROVIDER_VERSION=1.3.1
 
 # Metadata
@@ -28,6 +28,7 @@ RUN apt-get update && \
         python3-pip \
         tzdata \
         ffmpeg \
+        intel-media-va-driver \
         unrar \
         curl \
         unzip && \

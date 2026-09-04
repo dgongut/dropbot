@@ -78,7 +78,7 @@ logger = log_module.setup_logger(
 
 from logger import debug, warning, error
 
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 

@@ -1,5 +1,5 @@
 telethon==1.44.0
-yt-dlp==2026.7.4
+yt-dlp==2026.08.19
 rarfile==4.5
 curl-cffi==0.16.0
 requests==2.34.2

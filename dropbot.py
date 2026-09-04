@@ -78,7 +78,7 @@ logger = log_module.setup_logger(
 
 from logger import debug, warning, error
 
-VERSION = "3.4.1"
+VERSION = "3.5.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -1428,13 +1428,17 @@ def ytdlp_output_template(timestamp):
 
 def build_ffmpeg_conversion_command(input_path, output_path, hardware=None, quality=None):
     """Construye el comando FFmpeg para convertir vídeo a formato Telegram."""
-    hardware = (hardware or FFMPEG_HW).upper()
-    video_encoder = {
+    hardware = (hardware or FFMPEG_HW).strip().upper()
+    video_encoders = {
         "NONE": "libx264",
         "VAAPI": "h264_vaapi",
         "NVENC": "h264_nvenc",
         "QSV": "h264_qsv",
-    }[hardware]
+    }
+    try:
+        video_encoder = video_encoders[hardware]
+    except KeyError:
+        raise ValueError(f"Unknown FFmpeg hardware mode: {hardware}")
 
     command = ["ffmpeg"]
     if hardware == "VAAPI":
@@ -1453,14 +1457,18 @@ def build_ffmpeg_conversion_command(input_path, output_path, hardware=None, qual
         output_path,
     ])
 
-    if quality is not None:
-        quality = str(quality)
-        quality_args = {
+    if quality is not None and str(quality).strip() != "":
+        quality = str(quality).strip()
+        quality_args_map = {
             "NONE": ["-crf", quality],
             "VAAPI": ["-qp", quality],
             "NVENC": ["-rc:v", "vbr", "-cq", quality, "-b:v", "0"],
             "QSV": ["-global_quality", quality],
-        }[hardware]
+        }
+        try:
+            quality_args = quality_args_map[hardware]
+        except KeyError:
+            raise ValueError(f"Unknown FFmpeg hardware mode: {hardware}")
         # Los parámetros de calidad son opciones de salida y deben ir antes
         # del fichero de destino.
         command[-1:-1] = quality_args
@@ -2941,8 +2949,6 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
             # encoder software original para no romper el envío.
             if selected_hw != "NONE" and not _force_software:
                 warning(f"[CONVERSION] {selected_hw} failed; retrying with libx264")
-                if os.path.exists(output_path):
-                    os.remove(output_path)
                 return await convert_video_to_telegram_compatible(
                     input_path, status_message, _force_software=True
                 )

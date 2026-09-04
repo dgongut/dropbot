@@ -13,7 +13,7 @@ def test_un_ffmpeg_verboso_que_falla_no_bloquea(dropbot, run_async):
     async def scenario():
         code = (
             "import sys; "
-            "sys.stderr.buffer.write(b'x' * (128 * 1024)); "
+            "sys.stderr.buffer.write(b'x' * (4 * 1024 * 1024)); "
             "sys.stderr.flush(); "
             "sys.exit(1)"
         )
@@ -34,6 +34,6 @@ def test_un_ffmpeg_verboso_que_falla_no_bloquea(dropbot, run_async):
         await asyncio.wait_for(proc.wait(), timeout=30)
         await asyncio.wait_for(drain, timeout=30)
         assert proc.returncode == 1
-        assert sum(len(chunk) for chunk in chunks) == 128 * 1024
+        assert sum(len(chunk) for chunk in chunks) == 4 * 1024 * 1024
 
     run_async(scenario())

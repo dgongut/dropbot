@@ -28,7 +28,6 @@ RUN apt-get update && \
         python3-pip \
         tzdata \
         ffmpeg \
-        intel-media-va-driver \
         unrar \
         curl \
         unzip && \

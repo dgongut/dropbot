@@ -32,7 +32,9 @@ def _read_config(**overrides):
     code = (
         "import json, config; "
         "print(json.dumps({'AUTO_SEND': config.AUTO_SEND, "
-        "'AUTO_DOWNLOAD_FORMAT': config.AUTO_DOWNLOAD_FORMAT}))"
+        "'AUTO_DOWNLOAD_FORMAT': config.AUTO_DOWNLOAD_FORMAT, "
+        "'FFMPEG_HW': config.FFMPEG_HW, "
+        "'FFMPEG_QUALITY': config.FFMPEG_QUALITY}))"
     )
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -51,6 +53,12 @@ class TestValoresPorDefecto:
         """`AUTO_SEND=` en el .env devolvía cadena vacía, no el default, y la
         validación de arranque abortaba el contenedor."""
         assert _read_config(**{variable: ""})[variable] == "ASK"
+
+    def test_ffmpeg_hw_por_defecto_es_none(self):
+        assert _read_config()["FFMPEG_HW"] == "NONE"
+
+    def test_ffmpeg_quality_por_defecto_no_se_configura(self):
+        assert _read_config()["FFMPEG_QUALITY"] is None
 
     @pytest.mark.parametrize("written,expected", [
         ("send", "SEND"),
@@ -75,6 +83,8 @@ class TestValidacionDeArranque:
     @pytest.mark.parametrize("variable,valid", [
         ("AUTO_SEND", "ASK/SEND/SEND_DELETE/STORE"),
         ("AUTO_DOWNLOAD_FORMAT", "ASK/VIDEO/AUDIO"),
+        ("FFMPEG_HW", "NONE/VAAPI/NVENC/QSV"),
+        ("FFMPEG_QUALITY", "1-51"),
     ])
     def test_un_valor_invalido_aborta_con_mensaje(self, variable, valid):
         result = self._start(**{variable: "NO_EXISTE"})
@@ -89,14 +99,19 @@ class TestValidacionDeArranque:
         assert result.returncode != 0
         assert "LANGUAGE" in result.stdout + result.stderr
 
-    @pytest.mark.parametrize("value", ["ASK", "SEND", "SEND_DELETE", "STORE", ""])
-    def test_los_valores_validos_pasan_la_validacion(self, value):
+    @pytest.mark.parametrize("variable,values", [
+        ("AUTO_SEND", ["ASK", "SEND", "SEND_DELETE", "STORE", ""]),
+        ("FFMPEG_HW", ["NONE", "VAAPI", "NVENC", "QSV", ""]),
+        ("FFMPEG_QUALITY", ["1", "23", "51", ""]),
+    ])
+    def test_los_valores_validos_pasan_la_validacion(self, variable, values):
         """Debe llegar hasta la comprobación del token, que va después."""
-        result = self._start(AUTO_SEND=value)
+        for value in values:
+            result = self._start(**{variable: value})
 
-        output = result.stdout + result.stderr
-        assert "AUTO_SEND only can be" not in output
-        assert "TELEGRAM_TOKEN" in output
+            output = result.stdout + result.stderr
+            assert f"{variable} only can be" not in output
+            assert "TELEGRAM_TOKEN" in output
 
 
 class TestTraducciones:

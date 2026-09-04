@@ -98,6 +98,8 @@ services:
     restart: always
     network_mode: host
     tty: true
+    #devices:
+    #  - /dev/dri:/dev/dri
 ```
 
 ---

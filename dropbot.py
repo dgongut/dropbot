@@ -78,7 +78,7 @@ logger = log_module.setup_logger(
 
 from logger import debug, warning, error
 
-VERSION = "3.6.0"
+VERSION = "3.6.1"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -1426,6 +1426,24 @@ def ytdlp_output_template(timestamp):
     return f"%(playlist_index&{{}}-|)s%(title).200s_temp{timestamp}.%(ext)s"
 
 
+async def accumulate_process_stderr(proc, chunks):
+    """Drena el stderr de un subproceso ffmpeg en segundo plano.
+
+    Hay que llamarlo nada más crear el subproceso y esperar la tarea cuando el
+    proceso termine. Si nadie lee stderr y ffmpeg vuelca más de lo que cabe en
+    la tubería (~64 KiB), se queda bloqueado escribiendo para siempre sin
+    fallar.
+    """
+    try:
+        while True:
+            chunk = await proc.stderr.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except Exception as exc:
+        warning(f"[CONVERSION] Error draining ffmpeg stderr: {exc}")
+
+
 def build_ffmpeg_conversion_command(input_path, output_path, hardware=None, quality=None):
     """Construye el comando FFmpeg para convertir vídeo a formato Telegram.
 
@@ -2741,6 +2759,7 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
     Retorna la ruta del archivo convertido (temporal en /tmp) o el original si falla.
     IMPORTANTE: El archivo convertido debe ser eliminado después de enviarlo.
     """
+    drain_task = None
     try:
         debug(f"[CONVERSION] Starting video conversion: {input_path}")
 
@@ -2816,6 +2835,13 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
         active_tasks[conversion_id] = proc
         debug(f"[CONVERSION] Process saved in active_tasks with ID: {conversion_id}")
 
+        # Drenar stderr en paralelo: si ffmpeg vuelca mucho diagnóstico (p. ej.
+        # un decode que falla) y nadie lo lee, la tubería se llena y ffmpeg se
+        # queda bloqueado para siempre sin fallar, con lo que el reintento en
+        # software nunca saltaría.
+        stderr_chunks: list[bytes] = []
+        drain_task = asyncio.ensure_future(accumulate_process_stderr(proc, stderr_chunks))
+
         # Leer progreso en tiempo real
         last_update = 0
         debug("[CONVERSION] Starting progress reading...")
@@ -2889,6 +2915,9 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
 
         debug(f"[CONVERSION] Process finished with code: {proc.returncode}")
 
+        # El proceso ya terminó: stderr llegó a EOF y el drenado acaba solo
+        await drain_task
+
         # Limpiar el proceso de active_tasks
         active_tasks.pop(conversion_id, None)
         active_tasks.pop(f"{conversion_id}_original_path", None)
@@ -2947,8 +2976,8 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
             return output_path
         else:
             # Leer stderr para obtener mensaje de error
-            stderr = await proc.stderr.read()
-            error_msg = stderr.decode() if stderr else "Unknown error"
+            stderr = b"".join(stderr_chunks)
+            error_msg = stderr.decode(errors="replace") if stderr else "Unknown error"
             error(f"[CONVERSIÓN] ❌ Error convirtiendo video (código {proc.returncode}): {error_msg[:200]}")
             debug(f"[CONVERSION] Full FFmpeg stderr: {error_msg}")
             # Si falla la conversión, eliminar el archivo de salida si existe
@@ -2970,6 +2999,8 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
     except asyncio.CancelledError:
         # La tarea fue cancelada (por ejemplo, el usuario canceló la conversión)
         debug("[CONVERSION] ❌ Conversion task cancelled")
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
         # Limpiar el proceso de active_tasks
         active_tasks.pop(conversion_id, None)
         debug("[CONVERSION] Process removed from active_tasks after cancellation")
@@ -2984,6 +3015,8 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
         return None
     except Exception as e:
         error(f"[CONVERSION] ❌ Exception during video conversion: {e}")
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
         # Limpiar el proceso de active_tasks
         active_tasks.pop(conversion_id, None)
         debug("[CONVERSION] Process removed from active_tasks after exception")

@@ -10,6 +10,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from button_data import button_data
+
 
 @pytest.fixture
 def offer_buttons(quiet_bot, monkeypatch):
@@ -31,7 +33,7 @@ def _button_ids(sent_messages, prefix=b"send:"):
     for _, _, kwargs in sent_messages:
         for row in kwargs.get("buttons") or []:
             for button in row if isinstance(row, (list, tuple)) else [row]:
-                data = getattr(button, "data", b"")
+                data = button_data(button) or b""
                 if data.startswith(prefix):
                     ids.append(data.split(b":", 1)[1].decode())
     return ids
@@ -128,4 +130,4 @@ def test_button_payloads_fit_in_the_telegram_limit(
     for _, _, kwargs in sent_messages:
         for row in kwargs.get("buttons") or []:
             for button in row if isinstance(row, (list, tuple)) else [row]:
-                assert len(button.data) <= 64
+                assert len(button_data(button)) <= 64

@@ -2,10 +2,12 @@ import os
 import re
 import sys
 import asyncio
+import signal
 import mimetypes
 import rarfile
 import shutil
 import glob
+import itertools
 import requests
 import time
 import json
@@ -37,11 +39,12 @@ from basic import (
 from message_queue import TelegramMessageQueue
 from state import (
     active_tasks, cancelled_conversions, pending_file_actions, pending_files,
-    pending_urls, playlist_downloads, register_pending_file_action, register_pending_send,
+    pending_urls, register_pending_file_action, register_pending_send,
     send_original_requests,
 )
 from utils.file_helpers import (
-    format_file_size, get_directory_size, get_unique_filename, get_file_icon
+    format_file_size, get_directory_size, get_file_icon,
+    reserve_unique_path, copy_and_remove,
 )
 from utils import fast_telethon
 from utils import telegram_helpers
@@ -78,7 +81,7 @@ logger = log_module.setup_logger(
 
 from logger import debug, warning, error
 
-VERSION = "3.6.1"
+VERSION = "3.6.2"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -348,7 +351,19 @@ def get_download_path(event):
     return DOWNLOAD_PATH, DEF_ICO
 
 
-@bot.on(events.NewMessage(func=lambda e: e.document or e.video or e.audio or e.photo))
+def is_file_message(event):
+    """True si el mensaje trae un fichero que hay que descargar.
+
+    Telethon devuelve en .photo/.document también la imagen de la vista previa
+    de un enlace (MessageMediaWebPage): sin excluirla, pegar un enlace con
+    preview descargaba además su miniatura como si fuera una foto enviada.
+    """
+    if isinstance(event.media, types.MessageMediaWebPage):
+        return False
+    return bool(event.document or event.video or event.audio or event.photo)
+
+
+@bot.on(events.NewMessage(func=is_file_message))
 async def handle_files(event):
     if await check_admin_and_warn(event):
         return
@@ -368,6 +383,11 @@ async def limited_download(event):
         import traceback
         error(f"[DOWNLOAD] Traceback: {traceback.format_exc()}")
         # No re-lanzar para evitar que Telethon capture silenciosamente
+    finally:
+        # download_media solo la limpia si agota los reintentos; también hay que
+        # hacerlo al terminar bien, al cancelar o ante un error no reintentable
+        if active_tasks.get(event.id) is asyncio.current_task():
+            active_tasks.pop(event.id, None)
 
 def _make_transfer_progress_callback(status_message, file_name, text_key, log_tag, buttons=None):
     """
@@ -580,18 +600,14 @@ async def download_media(event):
     debug(f"[DOWNLOAD] File {file_name} - Received, starting download")
     download_path, ico = get_download_path(event)
 
-    # Generar nombre único si el archivo ya existe
-    unique_file_name = get_unique_filename(download_path, file_name)
-    if unique_file_name != file_name:
-        debug(f"[DOWNLOAD] Duplicate file detected. Renaming: {file_name} -> {unique_file_name}")
-
-    # Descargar primero a /tmp para que no aparezca en /list mientras se descarga
+    # Descargar primero a /tmp para que no aparezca en /list mientras se descarga.
+    # El nombre final no se elige hasta terminar: otra descarga con el mismo
+    # nombre puede acabar antes y ocuparlo
     timestamp_ms = int(time.time() * 1000)
-    temp_file_path = os.path.join(TEMP_DIR, f"{unique_file_name}_{timestamp_ms}_download")
-    final_file_path = os.path.join(download_path, unique_file_name)
+    temp_file_path = os.path.join(TEMP_DIR, f"{file_name}_{timestamp_ms}_download")
+    final_file_path = None
 
     debug(f"[DOWNLOAD] Temporary path: {temp_file_path}")
-    debug(f"[DOWNLOAD] Final path: {final_file_path}")
 
     status_message = await safe_reply(
         event,
@@ -634,7 +650,6 @@ async def download_media(event):
             # Mover archivo de /tmp a carpeta final
             debug("[DOWNLOAD] Moving file from temp to final location...")
             debug(f"[DOWNLOAD] Source: {temp_file_path}")
-            debug(f"[DOWNLOAD] Destination: {final_file_path}")
 
             try:
                 # Verificar que el archivo temporal existe antes de mover
@@ -654,7 +669,7 @@ async def download_media(event):
                 debug("[DOWNLOAD] ✅ Temp file is readable")
 
                 # Verificar que el directorio de destino existe
-                dest_dir = os.path.dirname(final_file_path)
+                dest_dir = download_path
                 if not os.path.exists(dest_dir):
                     error(f"[DOWNLOAD] ❌ Destination directory does not exist: {dest_dir}")
                     raise FileNotFoundError(f"Destination directory not found: {dest_dir}")
@@ -668,19 +683,14 @@ async def download_media(event):
 
                 debug("[DOWNLOAD] ✅ Destination directory is writable")
 
-                # Mover archivo de forma asíncrona para no bloquear el event loop
-                # Usar copyfile + remove en lugar de move/copy para evitar problemas de permisos
-                # copyfile() solo copia el contenido, NO intenta copiar permisos/metadata
-                debug("[DOWNLOAD] Copying file asynchronously (content only, no metadata)...")
-                loop = asyncio.get_running_loop()
-
-                # Copiar solo el contenido del archivo (sin permisos/metadata)
-                await loop.run_in_executor(None, shutil.copyfile, temp_file_path, final_file_path)
-                debug("[DOWNLOAD] ✅ File content copied successfully")
-
-                # Eliminar archivo temporal
-                await loop.run_in_executor(None, os.remove, temp_file_path)
-                debug("[DOWNLOAD] ✅ Temporary file removed")
+                # Reservar el nombre final de forma atómica y mover en un hilo
+                # para no bloquear el event loop
+                final_file_path = reserve_unique_path(dest_dir, file_name)
+                if os.path.basename(final_file_path) != file_name:
+                    debug(f"[DOWNLOAD] Duplicate file detected. Renaming: {file_name} -> {os.path.basename(final_file_path)}")
+                debug(f"[DOWNLOAD] Destination: {final_file_path}")
+                await asyncio.to_thread(copy_and_remove, temp_file_path, final_file_path)
+                debug("[DOWNLOAD] ✅ File moved successfully")
 
                 # Verificar que el archivo final existe
                 # Para archivos .torrent, el gestor puede procesarlos inmediatamente
@@ -757,8 +767,8 @@ async def download_media(event):
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
                 debug(f"[DOWNLOAD] Temporary file deleted after cancellation: {temp_file_path}")
-            # Limpiar archivo final si se movió
-            if os.path.exists(final_file_path):
+            # Limpiar archivo final si se movió (la ruta es nuestra: se reservó para esta descarga)
+            if final_file_path and os.path.exists(final_file_path):
                 os.remove(final_file_path)
                 debug(f"[DOWNLOAD] Final file deleted after cancellation: {final_file_path}")
             debug(f"[DOWNLOAD] File {file_name} - Cancelled")
@@ -1073,75 +1083,15 @@ async def cancel_download(event):
     msg_id = int(event.data.decode().split(":")[1])
     task = active_tasks.get(msg_id)
 
-    # Verificar si es una descarga de playlist en progreso
-    playlist_info = playlist_downloads.get(msg_id)
-    has_partial_playlist = False
-    partial_count = 0
-    partial_total = 0
-
-    if playlist_info and playlist_info.get("is_full_playlist"):
-        total_videos = playlist_info.get("total_videos", 0)
-        final_output_dir = playlist_info.get("final_output_dir")
-
-        debug(f"[CANCEL] Playlist download cancelled. Searching for completed files in {TEMP_DIR}")
-
-        # Buscar TODOS los archivos en /tmp
-        all_temp_files = []
+    # Solo se para la tarea: quien la lanzó ve la cancelación y limpia sus
+    # temporales (y, en una playlist, rescata los vídeos ya terminados)
+    if isinstance(task, asyncio.subprocess.Process) and task.returncode is None:
         try:
-            if os.path.exists(TEMP_DIR):
-                all_temp_files = [os.path.join(TEMP_DIR, f) for f in os.listdir(TEMP_DIR) if os.path.isfile(os.path.join(TEMP_DIR, f))]
-                debug(f"[CANCEL] Found {len(all_temp_files)} total files in /tmp")
-                for f in all_temp_files:
-                    debug(f"[CANCEL]   - {os.path.basename(f)}")
-        except Exception as e:
-            error(f"[CANCEL] Error listing /tmp directory: {e}")
-
-        # Filtrar archivos completos de vídeo/audio (no parciales de yt-dlp)
-        # Archivos parciales de yt-dlp tienen extensiones como .f137.mp4, .f140.m4a, .part
-        # Archivos completos tienen extensiones normales: .mp4, .webm, .mkv, .m4a, .mp3
-        completed_files = []
-        for f in all_temp_files:
-            basename = os.path.basename(f)
-            # Ignorar archivos parciales
-            if '.part' in basename or '.f' in basename.split('.')[-2] if len(basename.split('.')) > 2 else False:
-                debug(f"[CANCEL] Skipping partial file: {basename}")
-                continue
-            # Solo archivos de vídeo/audio completos
-            if basename.endswith(('.mp4', '.webm', '.mkv', '.m4a', '.mp3', '.opus')):
-                completed_files.append(f)
-                debug(f"[CANCEL] Found completed file: {basename}")
-
-        if len(completed_files) > 0:
-            debug(f"[CANCEL] Moving {len(completed_files)} completed files to final location...")
-
-            moved_count = 0
-            for temp_file_path in completed_files:
-                try:
-                    filename = os.path.basename(temp_file_path)
-                    final_file_path = os.path.join(final_output_dir, filename)
-
-                    # Usar copyfile + remove para evitar PermissionError en cross-device
-                    shutil.copyfile(temp_file_path, final_file_path)
-                    os.remove(temp_file_path)
-                    moved_count += 1
-                    debug(f"[CANCEL] ✅ Moved: {filename}")
-                except Exception as e:
-                    error(f"[CANCEL] Error moving file {temp_file_path}: {e}")
-
-            if moved_count > 0:
-                has_partial_playlist = True
-                partial_count = moved_count
-                partial_total = total_videos
-                debug(f"[CANCEL] Successfully moved {moved_count} files before cancelling")
-        else:
-            debug("[CANCEL] No completed files found to move")
-
-        # Limpiar información de playlist
-        playlist_downloads.pop(msg_id, None)
-
-    # Terminar el proceso
-    if isinstance(task, asyncio.subprocess.Process):
-        task.terminate()
+            task.terminate()
+        except ProcessLookupError:
+            # Terminó justo antes de llegar aquí
+            await safe_delete(event)
+            return
         await safe_answer(event, get_text("cancelling"))
     elif isinstance(task, asyncio.Task) and not task.done():
         task.cancel()
@@ -1149,16 +1099,6 @@ async def cancel_download(event):
     else:
         # Ya fue cancelada o terminada, borrar el mensaje
         await safe_delete(event)
-        return
-
-    # Esperar un momento para que el proceso termine
-    await asyncio.sleep(0.5)
-
-    # Mostrar mensaje apropiado según si hay archivos parciales
-    if has_partial_playlist and partial_count > 0:
-        message = get_text("cancelled_playlist_partial", partial_count, partial_total)
-        await safe_edit(event, message, buttons=None, parse_mode=PARSE_MODE)
-    # Si no hay archivos parciales, el mensaje normal de cancelación se mostrará en handle_cancel
 
 async def is_direct_download_url(url):
     """
@@ -1189,7 +1129,7 @@ async def is_direct_download_url(url):
         for ext in all_extensions:
             if path_lower.endswith(ext):
                 # Extraer nombre del archivo
-                filename = os.path.basename(path)
+                filename = sanitize_filename(os.path.basename(path))
 
                 # Determinar tipo de contenido, ruta de descarga e icono (igual que get_download_path)
                 if ext in EXTENSIONS_TORRENT:
@@ -1223,7 +1163,7 @@ async def is_direct_download_url(url):
 
         # Si no es directo, intentar HEAD request para verificar Content-Type
         try:
-            response = requests.head(url, allow_redirects=True, timeout=5)
+            response = await asyncio.to_thread(requests.head, url, allow_redirects=True, timeout=5)
             content_type_header = response.headers.get('Content-Type', '').lower()
             content_disposition = response.headers.get('Content-Disposition', '')
 
@@ -1235,6 +1175,9 @@ async def is_direct_download_url(url):
                     filename = filename_match.group(1).strip('\'"')
                 else:
                     filename = os.path.basename(path) or 'download'
+                # El nombre lo elige el servidor: sin sanear, "../../x" o "/x"
+                # escribirían fuera de la carpeta de descargas
+                filename = sanitize_filename(os.path.basename(filename.replace('\\', '/')) or 'download')
 
                 # Determinar tipo por Content-Type, ruta de descarga e icono
                 if 'application/x-bittorrent' in content_type_header:
@@ -1424,6 +1367,100 @@ def ytdlp_output_template(timestamp):
     cualquier vídeo suelto se descargaba como "NA-Título.mp4".
     """
     return f"%(playlist_index&{{}}-|)s%(title).200s_temp{timestamp}.%(ext)s"
+
+
+def ytdlp_temp_marker(timestamp):
+    """Marca que llevan todos los ficheros de una descarga en TEMP_DIR.
+
+    Identifica los temporales de esa descarga sin tocar los de otras que
+    estén en curso a la vez.
+    """
+    return f"_temp{timestamp}"
+
+
+# Ficheros intermedios de yt-dlp: formatos sueltos antes de mezclar, que van
+# justo tras la marca temporal (titulo_temp123.f137.mp4,
+# titulo_temp123.fdash-video=1.mp4), descargas a medias (.part, .part-Frag3),
+# estado de reanudación (.ytdl) y temporales del merger (.temp.mp4)
+YTDLP_PARTIAL_RE = re.compile(r'_temp\d+\.f[\w=+-]+\.\w+$|\.part(-Frag\d+)?$|\.ytdl$|\.temp\.\w+$')
+
+
+def is_ytdlp_partial(path):
+    return bool(YTDLP_PARTIAL_RE.search(os.path.basename(path)))
+
+
+def clean_temp_filename(filename):
+    """Quita la marca temporal del nombre: "video_temp123.mp4" -> "video.mp4"."""
+    return re.sub(r'_temp\d+\.', '.', filename)
+
+
+async def move_download_to(temp_file_path, final_output_dir):
+    """Mueve un fichero de TEMP_DIR a su carpeta final con un nombre libre.
+
+    El nombre se reserva en la carpeta final (no en TEMP_DIR) y la copia se hace
+    en un hilo: entre dispositivos copia todo el contenido y bloquearía el bot.
+    """
+    final_file_path = reserve_unique_path(final_output_dir, clean_temp_filename(os.path.basename(temp_file_path)))
+    await asyncio.to_thread(copy_and_remove, temp_file_path, final_file_path)
+    debug(f"[URL DOWNLOAD] ✅ File moved: {temp_file_path} -> {final_file_path}")
+    return final_file_path
+
+
+async def rescue_completed_playlist_files(marker, final_output_dir):
+    """Al cancelar una playlist, mueve a su destino los vídeos ya terminados.
+
+    Solo mira los ficheros de esta descarga (`marker`) y descarta los
+    intermedios de yt-dlp. Se llama con yt-dlp ya parado, para no mover nada
+    que siga escribiendo. Devuelve cuántos ficheros se han movido.
+    """
+    pattern = os.path.join(TEMP_DIR, f"*{glob.escape(marker)}*")
+    completed = sorted(
+        path for path in glob.glob(pattern)
+        if os.path.isfile(path)
+        and not is_ytdlp_partial(path)
+        and path.lower().endswith(('.mp4', '.webm', '.mkv', '.m4a', '.mp3', '.opus'))
+    )
+    moved = 0
+    for path in completed:
+        try:
+            await move_download_to(path, final_output_dir)
+            moved += 1
+        except Exception as e:
+            error(f"[CANCEL] Error moving file {path}: {e}")
+    debug(f"[CANCEL] Rescued {moved} completed playlist file(s)")
+    return moved
+
+
+def remove_temp_files(marker):
+    """Borra de TEMP_DIR los ficheros de una descarga (los que llevan `marker`)."""
+    for path in glob.glob(os.path.join(TEMP_DIR, f"*{glob.escape(marker)}*")):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                debug(f"[URL_DOWNLOAD] Temporary file removed: {path}")
+        except OSError as e:
+            warning(f"[URL_DOWNLOAD] Could not remove temporary file {path}: {e}")
+
+
+async def iter_progress_lines(stream, chunk_size=4096):
+    """Recorre la salida de un subproceso partiendo por \n y también por \r.
+
+    wget dibuja la barra de progreso reescribiendo la misma línea con \r, sin
+    saltos de línea. Leyendo con readline() el progreso no llegaba hasta el
+    final y, pasados unos minutos, la "línea" superaba el límite de 64 KB del
+    StreamReader: la lectura fallaba y wget se quedaba bloqueado.
+    """
+    pending = b""
+    while True:
+        chunk = await stream.read(chunk_size)
+        if not chunk:
+            break
+        parts = re.split(rb"[\r\n]", pending + chunk)
+        pending = parts.pop()
+        for part in parts:
+            yield part.decode(errors="replace")
+    if pending:
+        yield pending.decode(errors="replace")
 
 
 async def accumulate_process_stderr(proc, chunks):
@@ -1631,7 +1668,7 @@ async def handle_url_link(event):
         if is_audio:
             cmd.extend(["--extract-audio", "--audio-format", "mp3"])
 
-        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=playlist_count))
+        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=playlist_count, temp_marker=ytdlp_temp_marker(timestamp)))
         active_tasks[event.id] = task
         return
 
@@ -1692,13 +1729,13 @@ async def handle_cancel_conversion(event):
 
     debug(f"[CANCEL] User requested to cancel conversion: {conversion_id}")
 
-    # Marcar la conversión como cancelada ANTES de terminar el proceso
-    cancelled_conversions.add(conversion_id)
-    debug(f"[CANCEL] Conversion marked as cancelled: {conversion_id}")
-
-    # Buscar el proceso de conversión
+    # Buscar el proceso de conversión. Solo se marca si sigue en curso: una
+    # marca sin conversión que la recoja se quedaría para siempre
     proc = active_tasks.get(conversion_id)
-    if proc:
+    if proc and proc.returncode is None:
+        # Marcar la conversión como cancelada ANTES de terminar el proceso
+        cancelled_conversions.add(conversion_id)
+        debug(f"[CANCEL] Conversion marked as cancelled: {conversion_id}")
         try:
             debug(f"[CANCEL] Process found (PID: {proc.pid}), terminating...")
             # Matar el proceso de ffmpeg
@@ -1712,9 +1749,6 @@ async def handle_cancel_conversion(event):
                 parse_mode=PARSE_MODE
             )
 
-            # Limpiar el proceso de active_tasks
-            active_tasks.pop(conversion_id, None)
-            debug("[CANCEL] Process removed from active_tasks")
         except Exception as e:
             error(f"[CANCELAR] ❌ Error cancelando conversión {conversion_id}: {e}")
             await safe_edit(
@@ -1742,15 +1776,19 @@ async def handle_send_original(event):
 
     debug(f"[SEND_ORIGINAL] User requested to send original file for conversion: {conversion_id}")
 
-    # Marcar la solicitud de envío original
+    proc = active_tasks.get(conversion_id)
+    if not proc or proc.returncode is not None:
+        # La conversión ya terminó: no dejar una marca que nadie va a recoger
+        debug("[SEND_ORIGINAL] ⚠️ Conversion not found (already finished)")
+        await safe_edit(event, get_text("conversion_not_found"), parse_mode=PARSE_MODE)
+        return
+
+    # Marcar la solicitud de envío original y cancelar la conversión
     send_original_requests.add(conversion_id)
+    cancelled_conversions.add(conversion_id)
     debug(f"[SEND_ORIGINAL] Request marked: {conversion_id}")
 
-    # Cancelar la conversión si está en progreso
-    cancelled_conversions.add(conversion_id)
-
-    # Buscar el proceso de conversión y terminarlo
-    proc = active_tasks.get(conversion_id)
+    # Terminar el proceso de conversión
     if proc:
         try:
             debug(f"[SEND_ORIGINAL] Terminating conversion process (PID: {proc.pid})...")
@@ -1939,7 +1977,7 @@ async def handle_playlist_selection(event):
 
         # Pasar el número total de vídeos solo si es playlist completa
         total_vids = playlist_count if download_full_playlist else 1
-        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist, total_videos=total_vids))
+        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist, total_videos=total_vids, temp_marker=ytdlp_temp_marker(timestamp)))
         active_tasks[event.id] = task
         return
 
@@ -2035,7 +2073,7 @@ async def handle_playlist_format_selection(event):
 
     # Pasar el número total de vídeos solo si es playlist completa
     total_vids = playlist_count if download_full_playlist else 1
-    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist, total_videos=total_vids))
+    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist, total_videos=total_vids, temp_marker=ytdlp_temp_marker(timestamp)))
     active_tasks[event.id] = task
 
 @bot.on(events.CallbackQuery(pattern=b"url_(audio|video):(.+)"))
@@ -2104,7 +2142,7 @@ async def handle_format_selection(event):
     if is_audio:
         cmd.extend(["--extract-audio", "--audio-format", "mp3"])
 
-    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=playlist_count))
+    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=playlist_count, temp_marker=ytdlp_temp_marker(timestamp)))
     active_tasks[event.id] = task
 
 def parse_progress(line):
@@ -2188,15 +2226,17 @@ async def update_progress_message(status_message, progress_info, event, file_nam
 
 async def run_direct_download(event, url, filename, status_message, final_output_dir, icon, content_type):
     """Descarga un archivo directo usando wget"""
+    # Usar timestamp para evitar sobrescribir archivos durante la descarga.
+    # Fuera del try: los except limpian este fichero
+    timestamp = int(time.time() * 1000)
+    temp_filename = f"{filename}_temp{timestamp}"
+    temp_file_path = os.path.join(TEMP_DIR, temp_filename)
+    proc = None
+
     try:
         debug(f"[DIRECT_DOWNLOAD] Starting direct download: {filename}")
         debug(f"[DIRECT_DOWNLOAD] Final output directory: {final_output_dir}")
         debug(f"[DIRECT_DOWNLOAD] Content type: {content_type}, Icon: {icon}")
-
-        # Usar timestamp para evitar sobrescribir archivos durante la descarga
-        timestamp = int(time.time() * 1000)
-        temp_filename = f"{filename}_temp{timestamp}"
-        temp_file_path = os.path.join(TEMP_DIR, temp_filename)
 
         # Comando wget con progreso
         cmd = [
@@ -2223,9 +2263,11 @@ async def run_direct_download(event, url, filename, status_message, final_output
         # Leer stderr (wget muestra progreso en stderr)
         async def read_stderr():
             stderr_lines = []
-            async for line in proc.stderr:
-                line_str = line.decode().strip()
-                stderr_lines.append(line_str)
+            async for line in iter_progress_lines(proc.stderr):
+                line_str = line.strip()
+                # La barra se repite cientos de veces: solo se guarda el resto
+                if '%' not in line_str:
+                    stderr_lines.append(line_str)
 
                 # Parsear progreso de wget
                 # Formato: 45% [=====>     ] 123.45M  1.23MB/s    eta 30s
@@ -2263,7 +2305,7 @@ async def run_direct_download(event, url, filename, status_message, final_output
                         except Exception as e:
                             debug(f"[DIRECT_DOWNLOAD] Error parsing wget progress: {e}")
 
-                if line_str:
+                if line_str and '%' not in line_str:
                     debug(f"[WGET] {line_str}")
 
             return stderr_lines
@@ -2287,7 +2329,7 @@ async def run_direct_download(event, url, filename, status_message, final_output
 
         # Manejar cancelación
         if proc.returncode == -15 or proc.returncode == 143:  # SIGTERM
-            await handle_cancel(status_message)
+            await handle_cancel(status_message, temp_filename)
             return
 
         # Verificar si la descarga fue exitosa
@@ -2296,20 +2338,9 @@ async def run_direct_download(event, url, filename, status_message, final_output
             if status_message:
                 await safe_delete(status_message)
 
-            # Mover archivo a directorio final
-            final_file_path = os.path.join(final_output_dir, filename)
-
-            # Si ya existe, agregar número
-            if os.path.exists(final_file_path):
-                base, ext = os.path.splitext(filename)
-                counter = 1
-                while os.path.exists(final_file_path):
-                    final_file_path = os.path.join(final_output_dir, f"{base}_{counter}{ext}")
-                    counter += 1
-
-            # Usar copyfile + remove para evitar PermissionError en cross-device
-            shutil.copyfile(temp_file_path, final_file_path)
-            os.remove(temp_file_path)
+            # Mover archivo a directorio final con un nombre libre, fuera del event loop
+            final_file_path = reserve_unique_path(final_output_dir, filename)
+            await asyncio.to_thread(copy_and_remove, temp_file_path, final_file_path)
             debug(f"[DIRECT_DOWNLOAD] File moved to: {final_file_path}")
 
             await handle_success(event, final_file_path, icon=icon, content_type=content_type)
@@ -2326,10 +2357,10 @@ async def run_direct_download(event, url, filename, status_message, final_output
                 os.remove(temp_file_path)
 
     except asyncio.CancelledError:
-        await handle_cancel(status_message)
-        # Limpiar archivo temporal
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+        if proc is not None and proc.returncode is None:
+            _stop_process(proc)
+            await proc.wait()
+        await handle_cancel(status_message, temp_filename)
         raise
     except Exception as e:
         # Eliminar mensaje de progreso antes de mostrar error
@@ -2341,14 +2372,20 @@ async def run_direct_download(event, url, filename, status_message, final_output
         import traceback
         error(f"[DIRECT_DOWNLOAD] Traceback: {traceback.format_exc()}")
         await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
-        # Limpiar archivo temporal
-        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+        # Que wget no siga escribiendo un temporal que se va a borrar
+        _stop_process(proc)
+        remove_temp_files(temp_filename)
     finally:
         debug(f"[DIRECT_DOWNLOAD] Cleaning up. ID {event.id}")
         active_tasks.pop(event.id, None)
 
-async def run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=None):
+async def run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=None, temp_marker=None):
+    """Ejecuta yt-dlp y mueve lo descargado a `final_output_dir`.
+
+    `temp_marker` (ver ytdlp_temp_marker) identifica en TEMP_DIR los ficheros de
+    esta descarga, para limpiarlos o rescatarlos al cancelar.
+    """
+    proc = None
     try:
         debug("[URL_DOWNLOAD] Creating URL download subprocess...")
         debug(f"[URL_DOWNLOAD] Final output directory: {final_output_dir}")
@@ -2360,17 +2397,6 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
             stderr=asyncio.subprocess.PIPE
         )
         active_tasks[event.id] = proc
-
-        # Registrar información de playlist si es necesario
-        # IMPORTANTE: Usar status_message.id como clave porque el botón de cancelar usa event.id que coincide con el ID del mensaje
-        if is_full_playlist:
-            playlist_downloads[event.id] = {
-                "is_full_playlist": True,
-                "final_output_dir": final_output_dir,
-                "downloaded_files": [],
-                "total_videos": total_videos
-            }
-            debug(f"[URL_DOWNLOAD] Playlist download registered with ID {event.id}")
 
         # Variables para control de progreso
         stdout_lines = []
@@ -2412,9 +2438,8 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                 # que yt-dlp aún necesita mergear
                 if "[download] 100%" in line_str or "has already been downloaded" in line_str:
                     # Solo registrar para tracking, pero NO mover archivos
-                    if is_full_playlist and event.id in playlist_downloads:
-                        if current_filepath:
-                            debug(f"[URL_DOWNLOAD] File download completed (may need merging): {current_filepath}")
+                    if is_full_playlist and current_filepath:
+                        debug(f"[URL_DOWNLOAD] File download completed (may need merging): {current_filepath}")
 
                 # Detectar líneas de progreso: [download]  45.2% of 123.45MiB at 1.23MiB/s ETA 00:30
                 if "[download]" in line_str and "%" in line_str:
@@ -2460,7 +2485,20 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
         debug(f"[URL_DOWNLOAD] Exiting URL download subprocess. Code {proc.returncode}")
 
         if proc.returncode == -15:
-            await handle_cancel(status_message)
+            # En una playlist completa, los vídeos ya terminados se conservan
+            if is_full_playlist and temp_marker:
+                rescued = await rescue_completed_playlist_files(temp_marker, final_output_dir)
+                if rescued:
+                    remove_temp_files(temp_marker)
+                    if status_message:
+                        await safe_edit(
+                            status_message,
+                            get_text("cancelled_playlist_partial", rescued, total_videos or rescued),
+                            buttons=None,
+                            parse_mode=PARSE_MODE
+                        )
+                    return
+            await handle_cancel(status_message, temp_marker)
             return
 
         if status_message:
@@ -2483,19 +2521,8 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                     stored_paths = []
                     for temp_file_path in temp_file_paths:
                         if os.path.exists(temp_file_path):
-                            # Mover archivo de /tmp a carpeta final
-                            filename = os.path.basename(temp_file_path)
-                            final_file_path = os.path.join(final_output_dir, filename)
-
-                            debug("[URL DOWNLOAD] Moving file from temp to final location...")
-                            debug(f"[URL DOWNLOAD] Temp: {temp_file_path}")
-                            debug(f"[URL DOWNLOAD] Final: {final_file_path}")
-
-                            # Usar copyfile + remove para evitar PermissionError en cross-device
-                            shutil.copyfile(temp_file_path, final_file_path)
-                            os.remove(temp_file_path)
-                            debug(f"[URL DOWNLOAD] ✅ File moved to: {final_file_path}")
-                            stored_files.append(filename)
+                            final_file_path = await move_download_to(temp_file_path, final_output_dir)
+                            stored_files.append(os.path.basename(final_file_path))
                             stored_paths.append(final_file_path)
                         else:
                             warning(f"[URL_DOWNLOAD] Output file not found: {temp_file_path}")
@@ -2524,33 +2551,15 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                                     continue
                                 await send_file_automatically(event, stored_path)
 
-                    # Limpiar información de playlist
-                    if event.id in playlist_downloads:
-                        playlist_downloads.pop(event.id, None)
                 else:
                     # Video individual o primer video de playlist - mostrar botones normales
                     for temp_file_path in temp_file_paths:
                         if os.path.exists(temp_file_path):
-                            # Mover archivo de /tmp a carpeta final
-                            filename = os.path.basename(temp_file_path)
-                            final_file_path = os.path.join(final_output_dir, filename)
-
-                            debug("[URL DOWNLOAD] Moving file from temp to final location...")
-                            debug(f"[URL DOWNLOAD] Temp: {temp_file_path}")
-                            debug(f"[URL DOWNLOAD] Final: {final_file_path}")
-
-                            # Usar copyfile + remove para evitar PermissionError en cross-device
-                            shutil.copyfile(temp_file_path, final_file_path)
-                            os.remove(temp_file_path)
-                            debug(f"[URL DOWNLOAD] ✅ File moved to: {final_file_path}")
-
+                            final_file_path = await move_download_to(temp_file_path, final_output_dir)
                             await handle_success(event, final_file_path)
                         else:
                             warning(f"[URL_DOWNLOAD] Output file not found: {temp_file_path}")
 
-                    # Limpiar información de playlist
-                    if event.id in playlist_downloads:
-                        playlist_downloads.pop(event.id, None)
             else:
                 warning("[URL_DOWNLOAD] No downloaded files found in yt-dlp output")
                 debug(f"[URL_DOWNLOAD] Command executed: {' '.join(cmd)}")
@@ -2562,8 +2571,10 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
             await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
 
     except asyncio.CancelledError:
-        # No limpiar playlist_downloads aquí si fue cancelada - se limpia en handle_playlist_cancel_confirmation
-        await handle_cancel(status_message)
+        if proc and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        await handle_cancel(status_message, temp_marker)
         raise
     except Exception as e:
         error(f"[URL_DOWNLOAD] ❌ Error during URL download: {e}")
@@ -2580,10 +2591,9 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
     finally:
         debug(f"[URL_DOWNLOAD] Cleaning URL download subprocess. ID {event.id}")
         active_tasks.pop(event.id, None)
-        # Limpiar información de playlist si la descarga terminó exitosamente (no fue cancelada)
-        if event.id in playlist_downloads:
-            debug(f"[URL_DOWNLOAD] Cleaning playlist info for ID {event.id}")
-            playlist_downloads.pop(event.id, None)
+        # Restos que yt-dlp no llegó a mezclar o borrar (formatos sueltos, .part)
+        if temp_marker:
+            remove_temp_files(temp_marker)
 
 def extract_file_paths(stdout_lines):
     """Extrae todas las rutas de archivos descargados (soporta playlists/carruseles)"""
@@ -2600,7 +2610,7 @@ def extract_file_paths(stdout_lines):
             if possible_path:
                 current_file = possible_path
                 # Detectar si es un archivo parcial (será mergeado después)
-                is_partial = ".fdash-" in possible_path or ".f" in possible_path.split(".")[-2] if "." in possible_path else False
+                is_partial = is_ytdlp_partial(possible_path)
 
         # Detectar merge de formatos (este es el archivo final)
         elif "[Merger]" in line and "Merging formats into" in line:
@@ -2631,36 +2641,9 @@ def extract_file_paths(stdout_lines):
                 debug(f"[URL_DOWNLOAD] File added to download list: {current_file}")
                 current_file = None
 
-    # Limpiar nombres temporales y manejar duplicados
-    final_paths = []
-    for file_path in file_paths:
-        if not os.path.exists(file_path):
-            final_paths.append(file_path)
-            continue
-
-        directory = os.path.dirname(file_path)
-        filename = os.path.basename(file_path)
-
-        # Eliminar el timestamp temporal del nombre: "video_temp1234567890.mp4" -> "video.mp4"
-        clean_filename = re.sub(r'_temp\d+\.', '.', filename)
-
-        # Buscar nombre único en el directorio
-        unique_filename = get_unique_filename(directory, clean_filename)
-        unique_path = os.path.join(directory, unique_filename)
-
-        # Renombrar el archivo temporal al nombre final
-        try:
-            os.rename(file_path, unique_path)
-            if unique_filename != clean_filename:
-                debug(f"[URL_DOWNLOAD] File renamed (duplicate): {clean_filename} -> {unique_filename}")
-            else:
-                debug(f"[URL_DOWNLOAD] File renamed: {filename} -> {unique_filename}")
-            final_paths.append(unique_path)
-        except Exception as e:
-            warning(f"[URL_DOWNLOAD] Error renaming file: {e}")
-            final_paths.append(file_path)
-
-    return final_paths
+    # La marca temporal se quita al mover a la carpeta final (move_download_to),
+    # que es donde hay que buscar un nombre libre
+    return file_paths
 
 async def get_file_info(file_path):
     """
@@ -2753,6 +2736,21 @@ async def get_file_info(file_path):
             "type": "document"
         }
 
+# Ids de conversión: únicos por conversión, no por fichero. Con un hash de la
+# ruta, convertir dos veces el mismo fichero reutilizaba el id y una marca de
+# cancelación antigua cortaba la conversión nueva nada más empezar
+_conversion_ids = itertools.count(1)
+
+
+def _stop_process(proc):
+    """Mata un subproceso si sigue vivo (sin fallar si acaba de terminar)."""
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
 async def convert_video_to_telegram_compatible(input_path, status_message=None, _force_software=False):
     """
     Convierte un video a formato compatible con Telegram (MP4 con H.264 + AAC).
@@ -2760,6 +2758,9 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
     IMPORTANTE: El archivo convertido debe ser eliminado después de enviarlo.
     """
     drain_task = None
+    proc = None
+    conversion_id = f"conv_{next(_conversion_ids)}"
+    output_path = None
     try:
         debug(f"[CONVERSION] Starting video conversion: {input_path}")
 
@@ -2782,8 +2783,6 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
         except Exception as e:
             debug(f"[CONVERSION] Could not get video duration: {e}")
 
-        # Generar ID único para esta conversión
-        conversion_id = f"conv_{abs(hash(input_path)) % 1000000}"
         debug(f"[CONVERSION] Conversion ID: {conversion_id}")
 
         # Determinar si es un video largo (>300s = 5 minutos) para mostrar botón de enviar original
@@ -2849,6 +2848,9 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
             # Verificar si la conversión fue cancelada o si se solicitó enviar original
             if conversion_id in cancelled_conversions or conversion_id in send_original_requests:
                 debug("[CONVERSION] Conversion cancelled or send original requested during progress reading, stopping...")
+                # Nadie va a seguir leyendo stdout: si ffmpeg siguiera vivo,
+                # llenaría la tubería y proc.wait() no volvería nunca
+                _stop_process(proc)
                 break
 
             line = await proc.stdout.readline()
@@ -2906,6 +2908,7 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
                                 # Verificar si fue cancelado o se solicitó enviar original
                                 if conversion_id in cancelled_conversions or conversion_id in send_original_requests:
                                     debug("[CONVERSION] Message edit failed because conversion was cancelled or send original requested")
+                                    _stop_process(proc)
                                     break
                 except Exception as e:
                     warning(f"[CONVERSION] Error processing progress line: {e}")
@@ -2926,8 +2929,6 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
         # Verificar si el usuario eligió enviar el archivo original
         if conversion_id in send_original_requests:
             debug("[CONVERSION] ✅ User chose to send original file")
-            send_original_requests.discard(conversion_id)
-            cancelled_conversions.discard(conversion_id)
             # Eliminar archivo de salida parcial si existe
             if os.path.exists(output_path):
                 debug(f"[CONVERSION] Deleting partial file: {output_path}")
@@ -2941,8 +2942,6 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
         # Verificar si la conversión fue cancelada por el usuario
         if conversion_id in cancelled_conversions:
             debug("[CONVERSION] ❌ Conversion was cancelled by user")
-            # Eliminar de la lista de canceladas
-            cancelled_conversions.discard(conversion_id)
             # Eliminar archivo de salida parcial si existe
             if os.path.exists(output_path):
                 debug(f"[CONVERSION] Deleting partial file: {output_path}")
@@ -2997,31 +2996,28 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
             return input_path
 
     except asyncio.CancelledError:
-        # La tarea fue cancelada (por ejemplo, el usuario canceló la conversión)
+        # Se canceló la tarea que envía (no el botón de cancelar conversión):
+        # ffmpeg no puede quedarse vivo escribiendo un fichero que se va a borrar
         debug("[CONVERSION] ❌ Conversion task cancelled")
         if drain_task is not None and not drain_task.done():
             drain_task.cancel()
-        # Limpiar el proceso de active_tasks
-        active_tasks.pop(conversion_id, None)
-        debug("[CONVERSION] Process removed from active_tasks after cancellation")
-        # Eliminar archivo de salida parcial si existe
-        if os.path.exists(output_path):
+        if proc is not None and proc.returncode is None:
+            _stop_process(proc)
+            await proc.wait()
+        if output_path and os.path.exists(output_path):
             debug(f"[CONVERSION] Deleting partial file: {output_path}")
             try:
                 os.remove(output_path)
-            except:
+            except OSError:
                 pass
-        # Retornar None para indicar cancelación
-        return None
+        raise
     except Exception as e:
         error(f"[CONVERSION] ❌ Exception during video conversion: {e}")
         if drain_task is not None and not drain_task.done():
             drain_task.cancel()
-        # Limpiar el proceso de active_tasks
-        active_tasks.pop(conversion_id, None)
-        debug("[CONVERSION] Process removed from active_tasks after exception")
+        _stop_process(proc)
         # Eliminar archivo de salida parcial si existe
-        if os.path.exists(output_path):
+        if output_path and os.path.exists(output_path):
             debug(f"[CONVERSION] Deleting partial file after exception: {output_path}")
             try:
                 os.remove(output_path)
@@ -3030,6 +3026,11 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
         # En caso de error, retornar el archivo original
         debug(f"[CONVERSION] Returning original unconverted file after exception: {input_path}")
         return input_path
+    finally:
+        # Las marcas de esta conversión ya no sirven: el id no se reutiliza
+        active_tasks.pop(conversion_id, None)
+        cancelled_conversions.discard(conversion_id)
+        send_original_requests.discard(conversion_id)
 
 async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after=False):
     """Envía un archivo a Telegram (convirtiendo vídeo si hace falta).
@@ -3401,17 +3402,19 @@ async def handle_send_choice(event):
     else:
         await safe_delete(event)
 
-async def handle_cancel(status_message):
+async def handle_cancel(status_message, temp_marker=None):
+    """Avisa de la cancelación y borra los temporales de esa descarga.
+
+    `temp_marker` es la parte del nombre que solo llevan los ficheros de esta
+    descarga en TEMP_DIR (ver ytdlp_temp_marker). Antes se borraba `*.part*` de
+    la carpeta de destino, que no es donde se descarga y donde sí hay ficheros
+    del usuario como "Pelicula.part1.rar".
+    """
     if status_message:
         await safe_edit(status_message, get_text("cancelled"), buttons=None, parse_mode=PARSE_MODE)
     debug("[URL_DOWNLOAD] URL download cancelled")
-    cleanup_partials()
-
-def cleanup_partials():
-    pattern = os.path.join(DOWNLOAD_PATHS["url_video"], "*.part*")
-    for f in glob.glob(pattern):
-        debug(f"[URL_DOWNLOAD] Cleaning partial files from URL download: {f}")
-        os.remove(f)
+    if temp_marker:
+        remove_temp_files(temp_marker)
 
 async def send_startup_message():
     admins = TELEGRAM_ADMIN.split(',')
@@ -3504,11 +3507,25 @@ async def main():
     await set_commands()
     await send_startup_message()
     heartbeat_task = asyncio.create_task(heartbeat_writer())
+
+    # Como PID 1 del contenedor, el kernel ignora SIGTERM si no hay handler
+    # (docker stop acabaría en SIGKILL / exit 137). Al recibirlo, desconectar
+    # el bot para que run_until_disconnected() retorne y se ejecute el cierre
+    loop = asyncio.get_running_loop()
+    def request_shutdown(sig):
+        debug(f"[SHUTDOWN] {sig.name} received, stopping...")
+        asyncio.ensure_future(bot.disconnect())
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, request_shutdown, sig)
+
     try:
         await bot.run_until_disconnected()
     finally:
         heartbeat_task.cancel()
-        await message_queue.shutdown()  # Detener la cola al finalizar
+        try:
+            await asyncio.wait_for(message_queue.shutdown(), timeout=10)  # Detener la cola al finalizar
+        except asyncio.TimeoutError:
+            warning("[SHUTDOWN] Message queue did not stop in 10s")
         if pot_proc and pot_proc.returncode is None:
             pot_proc.terminate()
 

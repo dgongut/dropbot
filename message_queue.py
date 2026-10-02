@@ -1,5 +1,11 @@
 import asyncio
+from telethon.errors import BadRequestError, ForbiddenError, UnauthorizedError
 from logger import debug, error, warning
+
+# Errores de Telegram que no se arreglan reintentando: el mensaje ya no existe,
+# no ha cambiado, el callback caducó, no hay permisos... Reintentarlos solo
+# bloqueaba la cola (el worker es único) unos 10 s por cada uno
+PERMANENT_ERRORS = (BadRequestError, ForbiddenError, UnauthorizedError)
 
 class TelegramMessageQueue:
     """
@@ -58,9 +64,16 @@ class TelegramMessageQueue:
 
         # Log para debug
         func_name = getattr(func, '__name__', str(func))
-        debug(f"[QUEUE] Executing: {func_name}")
 
         for attempt in range(self.max_retries):
+            # Quien esperaba el resultado se cansó (add_message cancela el future
+            # al agotar su timeout) y ya ha seguido por su cuenta: ejecutarlo
+            # ahora duplicaría el mensaje
+            if result_future is not None and result_future.cancelled():
+                warning(f"[QUEUE] Skipping {func_name}: the caller stopped waiting for it")
+                return None
+            if attempt == 0:
+                debug(f"[QUEUE] Executing: {func_name}")
             try:
                 debug(f"[QUEUE] Attempt {attempt + 1}/{self.max_retries} for {func_name}")
                 result = await func(*args, **kwargs)
@@ -74,6 +87,11 @@ class TelegramMessageQueue:
                 error_type = type(e).__name__
 
                 error(f"[QUEUE] ❌ Error in {func_name}: {error_type} - {error_msg}")
+
+                if isinstance(e, PERMANENT_ERRORS):
+                    if result_future and not result_future.done():
+                        result_future.set_exception(e)
+                    break
 
                 # Detectar FloodWaitError de Telethon
                 if "FloodWaitError" in error_type or "flood" in error_msg.lower():

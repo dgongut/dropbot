@@ -2,6 +2,7 @@
 Funciones de utilidad para manejo de archivos.
 """
 import os
+import shutil
 from config import (
     EXTENSIONS_TORRENT, EXTENSIONS_EBOOK, EXTENSIONS_VIDEO,
     EXTENSIONS_AUDIO, EXTENSIONS_IMAGE, EXTENSIONS_COMPRESSED,
@@ -55,6 +56,46 @@ def get_unique_filename(directory, filename):
         if not os.path.exists(new_path):
             return new_filename
         counter += 1
+
+
+def reserve_unique_path(directory, filename):
+    """
+    Reserva un nombre libre en `directory` creando el fichero vacío y devuelve
+    su ruta. Si el nombre existe, prueba con sufijos (1), (2), etc.
+
+    A diferencia de get_unique_filename, la comprobación y la creación son una
+    sola operación atómica (O_EXCL): dos descargas simultáneas con el mismo
+    nombre nunca reciben la misma ruta.
+    """
+    base_name, extension = os.path.splitext(filename)
+    counter = 0
+    while True:
+        name = filename if counter == 0 else f"{base_name} ({counter}){extension}"
+        path = os.path.join(directory, name)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        except FileExistsError:
+            counter += 1
+            continue
+        os.close(fd)
+        return path
+
+
+def copy_and_remove(src, dst):
+    """
+    Mueve `src` a `dst` copiando solo el contenido (sin permisos ni metadatos,
+    que fallan entre dispositivos) y borra el origen. Si la copia falla, borra
+    el destino a medias. Es bloqueante: llamarla con asyncio.to_thread.
+    """
+    try:
+        shutil.copyfile(src, dst)
+    except BaseException:
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        raise
+    os.remove(src)
 
 
 def get_file_icon(file_extension):

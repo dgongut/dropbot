@@ -36,9 +36,6 @@ pending_files = {}
 # URLs pendientes de que el usuario elija formato: {id corto: url}
 pending_urls = {}
 
-# Descargas de playlist en curso: {id de evento: {...}}
-playlist_downloads = {}
-
 
 _pending_send_seq = 0
 

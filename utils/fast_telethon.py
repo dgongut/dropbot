@@ -115,14 +115,35 @@ class _ParallelTransferrer:
             proxy=self.client._proxy,
             local_addr=self.client._local_addr,
         ))
-        if not self.auth_key:
-            auth = await self.client(ExportAuthorizationRequest(self.dc_id))
-            self.client._init_request.query = ImportAuthorizationRequest(
-                id=auth.id, bytes=auth.bytes)
-            req = InvokeWithLayerRequest(LAYER, self.client._init_request)
-            await sender.send(req)
-            self.auth_key = sender.auth_key
+        try:
+            if not self.auth_key:
+                auth = await self.client(ExportAuthorizationRequest(self.dc_id))
+                self.client._init_request.query = ImportAuthorizationRequest(
+                    id=auth.id, bytes=auth.bytes)
+                req = InvokeWithLayerRequest(LAYER, self.client._init_request)
+                await sender.send(req)
+                self.auth_key = sender.auth_key
+        except BaseException:
+            # Conectado pero sin autorizar: nadie más lo va a desconectar
+            await sender.disconnect()
+            raise
         return sender
+
+    async def _open_senders(self, create_first, create_rest):
+        """Crea las conexiones y las deja en self.senders.
+
+        La primera va sola porque exporta la autorización que reutilizan las
+        demás. Si alguna falla, se desconectan las que sí se abrieron: antes se
+        perdían (no llegaban a self.senders y _cleanup no las veía) y cada
+        fallo dejaba conexiones MTProto vivas.
+        """
+        self.senders = [await create_first()]
+        results = await asyncio.gather(*(f() for f in create_rest), return_exceptions=True)
+        self.senders.extend(r for r in results if not isinstance(r, BaseException))
+        failures = [r for r in results if isinstance(r, BaseException)]
+        if failures:
+            await self._cleanup()
+            raise failures[0]
 
     async def _create_download_sender(self, file, index, part_size, stride, count):
         return _DownloadSender(
@@ -144,14 +165,19 @@ class _ParallelTransferrer:
                 return minimum + 1
             return minimum
 
-        first = _DownloadSender(
-            self.client, await self._create_sender(), file,
-            0, part_size, connections * part_size, get_part_count())
-        rest = await asyncio.gather(*(
-            self._create_download_sender(
-                file, i, part_size, connections * part_size, get_part_count())
-            for i in range(1, connections)))
-        self.senders = [first, *rest]
+        # Las partes de cada conexión se reparten en orden (la 0 primero)
+        counts = [get_part_count() for _ in range(connections)]
+        stride = connections * part_size
+
+        async def create_first():
+            return _DownloadSender(
+                self.client, await self._create_sender(), file,
+                0, part_size, stride, counts[0])
+
+        await self._open_senders(create_first, [
+            (lambda i=i: self._create_download_sender(file, i, part_size, stride, counts[i]))
+            for i in range(1, connections)
+        ])
 
     async def download(self, file, file_size, max_connections, part_size_kb=None):
         connections = self._connection_count(file_size, max_connections)
@@ -201,13 +227,15 @@ class _ParallelTransferrer:
         part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
         part_count = math.ceil(file_size / part_size)
         is_large = file_size > 10 * 1024 * 1024
-        first = _UploadSender(
-            self.client, await self._create_sender(), file_id,
-            part_count, is_large, 0, connections, self.loop)
-        rest = await asyncio.gather(*(
-            self._create_upload_sender(file_id, part_count, is_large, i, connections)
-            for i in range(1, connections)))
-        self.senders = [first, *rest]
+        async def create_first():
+            return _UploadSender(
+                self.client, await self._create_sender(), file_id,
+                part_count, is_large, 0, connections, self.loop)
+
+        await self._open_senders(create_first, [
+            (lambda i=i: self._create_upload_sender(file_id, part_count, is_large, i, connections))
+            for i in range(1, connections)
+        ])
         return part_size, part_count, is_large
 
     async def upload(self, part):
@@ -256,12 +284,12 @@ async def upload_file(client, file, file_size, max_connections, progress_callbac
     file_id = helpers.generate_random_long()
     hash_md5 = hashlib.md5()
     uploader = _ParallelTransferrer(client)
-    part_size, part_count, is_large = await uploader.init_upload(
-        file_id, file_size, max_connections)
     loop = asyncio.get_running_loop()
     buffer = bytearray()
     uploaded = 0
     try:
+        part_size, part_count, is_large = await uploader.init_upload(
+            file_id, file_size, max_connections)
         while True:
             # Leer en un hilo para no bloquear el event loop (importante con
             # sistemas de ficheros lentos como bind mounts en Docker/Mac).

@@ -9,6 +9,8 @@ import os
 
 import pytest
 
+from button_data import button_data
+
 CALLBACK_DATA_LIMIT = 64
 
 
@@ -20,7 +22,7 @@ def _buttons(sent_messages):
 
 
 def _payloads(sent_messages):
-    return [b.data for b in _buttons(sent_messages) if getattr(b, "data", None)]
+    return [button_data(b) for b in _buttons(sent_messages) if button_data(b)]
 
 
 @pytest.fixture

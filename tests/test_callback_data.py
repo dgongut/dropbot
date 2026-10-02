@@ -5,6 +5,8 @@ Pasarse del límite no degrada nada: Telegram rechaza el mensaje entero
 tests recorren los botones que construye el bot y comprueban el límite.
 """
 
+from button_data import button_data
+
 CALLBACK_DATA_LIMIT = 64
 
 
@@ -12,7 +14,7 @@ def _walk(buttons):
     """Aplana la matriz de botones de Telethon y devuelve los `data`."""
     for row in buttons or []:
         for button in row if isinstance(row, (list, tuple)) else [row]:
-            data = getattr(button, "data", None)
+            data = button_data(button)
             if data is not None:
                 yield data
 

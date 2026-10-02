@@ -42,6 +42,10 @@ def sanitize_filename(filename):
     filename = FORBIDDEN_FILENAME_CHARS.sub('_', filename)
     # NFC deja una forma canónica única para los acentos (macOS usa NFD)
     filename = unicodedata.normalize('NFC', filename)
+    # "." y ".." no tienen caracteres prohibidos pero, unidos a un directorio,
+    # apuntan a él mismo o a su padre
+    if filename.strip('.') == '':
+        filename = 'archivo'
 
     base, ext = os.path.splitext(filename)
     base = re.sub(r'_+', '_', base)

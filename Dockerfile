@@ -2,8 +2,8 @@
 FROM ubuntu:26.04
 
 # Build arguments
-ARG VERSION=3.6.1
-ARG POT_PROVIDER_VERSION=1.3.1
+ARG VERSION=3.6.2
+ARG POT_PROVIDER_VERSION=2.0.1
 
 # Metadata
 LABEL maintainer="dgongut"

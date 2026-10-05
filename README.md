@@ -111,6 +111,8 @@ services:
 ```
 Puedes comprobar qué encoder se está usando en los logs (`[CONVERSION] Encoder mode: ...`).
 
+Solo se convierte lo que Telegram no puede reproducir. Un MP4 con vídeo H.264 (8 bits) o HEVC (8/10 bits, lo que graban los móviles) y audio AAC/MP3 se envía tal cual; si el vídeo ya vale pero el contenedor (MKV, MOV...), el audio (Opus...) o la etiqueta HEVC (`hev1` en vez de `hvc1`, que necesitan los dispositivos Apple) no, se copia la pista de vídeo sin recodificar y la operación tarda segundos. Solo VP9, AV1 y similares pasan por la conversión completa.
+
 ---
 
 ## Solo para desarrolladores - Ejecución con código local

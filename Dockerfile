@@ -2,13 +2,17 @@
 FROM ubuntu:26.04
 
 # Build arguments
-ARG VERSION=3.6.2
+ARG VERSION=3.6.3
 ARG POT_PROVIDER_VERSION=2.0.1
 
-# Metadata
-LABEL maintainer="dgongut"
-LABEL description="DropBot - Telegram file management bot"
-LABEL version="${VERSION}"
+# Metadata (etiquetas OCI estándar: las leen herramientas como docker-controller-bot)
+LABEL org.opencontainers.image.title="dropbot" \
+      org.opencontainers.image.description="DropBot - Telegram file management bot" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.authors="dgongut" \
+      org.opencontainers.image.source="https://github.com/dgongut/dropbot" \
+      org.opencontainers.image.url="https://hub.docker.com/r/dgongut/dropbot" \
+      org.opencontainers.image.licenses="GPL-3.0"
 
 # Evitar prompts interactivos durante la instalación
 ENV DEBIAN_FRONTEND=noninteractive \

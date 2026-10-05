@@ -56,7 +56,8 @@ from handlers import manage as manage_handlers
 from handlers.manage import get_available_categories, get_category_buttons
 from services.donors_service import print_donors
 from services.video_service import (
-    get_video_metadata, generate_video_thumbnail, format_duration
+    get_video_metadata, generate_video_thumbnail, format_duration,
+    probe_media, telegram_conversion_plan, plan_is_noop
 )
 
 # Inicializar sistema de logging profesional
@@ -81,7 +82,7 @@ logger = log_module.setup_logger(
 
 from logger import debug, warning, error
 
-VERSION = "3.6.2"
+VERSION = "3.6.3"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -1481,13 +1482,37 @@ async def accumulate_process_stderr(proc, chunks):
         warning(f"[CONVERSION] Error draining ffmpeg stderr: {exc}")
 
 
-def build_ffmpeg_conversion_command(input_path, output_path, hardware=None, quality=None):
+def build_ffmpeg_conversion_command(input_path, output_path, hardware=None, quality=None, plan=None):
     """Construye el comando FFmpeg para convertir vídeo a formato Telegram.
 
     Con aceleración hardware el pipeline es completo en GPU (decodificado y
     codificado). Si la GPU no soporta el códec de entrada, ffmpeg falla y la
     llamada se reintenta en software.
+
+    Si `plan` (de telegram_conversion_plan) dice que el vídeo ya es H.264
+    válido, no se recodifica: se copia la pista de vídeo y como mucho se
+    convierte el audio a AAC, lo que tarda segundos en vez de minutos.
     """
+    if plan is not None and plan["video"] == "copy":
+        audio_codec = "aac" if plan["audio"] == "encode" else "copy"
+        command = [
+            "ffmpeg",
+            "-i", input_path,
+            "-map", "0:V:0",
+            "-map", "0:a:0?",
+            "-c:v", "copy",
+            "-c:a", audio_codec,
+        ]
+        if plan.get("hvc1"):
+            command.extend(["-tag:v", "hvc1"])
+        command.extend([
+            "-movflags", "+faststart",
+            "-progress", "pipe:1",
+            "-y",
+            output_path,
+        ])
+        return command
+
     hardware = (hardware or FFMPEG_HW).strip().upper()
     hw_profiles = {
         "NONE": ("libx264", []),
@@ -2764,6 +2789,16 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
     try:
         debug(f"[CONVERSION] Starting video conversion: {input_path}")
 
+        # Si Telegram ya puede reproducirlo, no se toca. Si solo falla el
+        # contenedor o el audio, se copia el vídeo sin recodificar.
+        plan = None
+        if not _force_software:
+            plan = telegram_conversion_plan(input_path, await probe_media(input_path))
+            debug(f"[CONVERSION] Plan: {plan}")
+            if plan_is_noop(plan):
+                debug("[CONVERSION] ✅ Video already Telegram-compatible, skipping conversion")
+                return input_path
+
         # Generar nombre de archivo temporal en /tmp para la conversión
         input_filename = os.path.basename(input_path)
         base_name = os.path.splitext(input_filename)[0]
@@ -2786,7 +2821,8 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
         debug(f"[CONVERSION] Conversion ID: {conversion_id}")
 
         # Determinar si es un video largo (>300s = 5 minutos) para mostrar botón de enviar original
-        is_long_video = duration_seconds > 300
+        # Copiar pistas tarda segundos aunque el vídeo sea largo: sin aviso
+        is_long_video = duration_seconds > 300 and not (plan and plan["video"] == "copy")
         if is_long_video:
             debug(f"[CONVERSION] Long video detected ({int(duration_seconds / 60)} minutes), will show send original button")
 
@@ -2814,8 +2850,9 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
 
         selected_hw = "NONE" if _force_software else FFMPEG_HW
         cmd = build_ffmpeg_conversion_command(
-            input_path, output_path, selected_hw, FFMPEG_QUALITY
+            input_path, output_path, selected_hw, FFMPEG_QUALITY, plan
         )
+        stream_copy = plan is not None and plan["video"] == "copy"
 
         encoder = cmd[cmd.index("-c:v") + 1]
         debug(f"[CONVERSION] Encoder mode: {selected_hw}; video encoder: {encoder}")
@@ -2983,10 +3020,12 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
             if os.path.exists(output_path):
                 warning(f"[CONVERSION] Deleting failed output file: {output_path}")
                 os.remove(output_path)
-            # Si el encoder hardware no está disponible, reintentar con el
-            # encoder software original para no romper el envío.
-            if selected_hw != "NONE" and not _force_software:
-                warning(f"[CONVERSION] {selected_hw} failed; retrying with libx264")
+            # Si la copia de pistas falla (o el encoder hardware no está
+            # disponible), reintentar con conversión completa en software
+            # para no romper el envío.
+            if (stream_copy or selected_hw != "NONE") and not _force_software:
+                failed_mode = "Stream copy" if stream_copy else selected_hw
+                warning(f"[CONVERSION] {failed_mode} failed; retrying with libx264")
                 return await convert_video_to_telegram_compatible(
                     input_path, status_message, _force_software=True
                 )

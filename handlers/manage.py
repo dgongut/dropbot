@@ -20,14 +20,14 @@ from telethon import Button, events
 from telethon.tl.types import DocumentAttributeFilename
 
 from basic import (
-    clean_rar_base_name, is_admin, is_compressed_file, is_split_zip,
+    clean_rar_base_name, is_admin, is_compressed_file, is_split_zip, md_code,
 )
+import settings
+import stats
 from config import (
     AUD_ICO, BOO_ICO, DOWNLOAD_PATH, DOWNLOAD_PATHS,
-    EXTENSIONS_AUDIO, EXTENSIONS_VIDEO, FILTER_AUDIO, FILTER_EBOOK,
-    FILTER_PHOTO, FILTER_TORRENT, FILTER_URL_AUDIO, FILTER_URL_VIDEO,
-    FILTER_VIDEO, IMG_ICO, MAX_TELEGRAM_FILE_SIZE, TOR_ICO,
-    VID_ICO,
+    EXTENSIONS_AUDIO, EXTENSIONS_VIDEO, IMG_ICO, MAX_TELEGRAM_FILE_SIZE, TOR_ICO,
+    VID_ICO, has_own_folder,
 )
 from logger import debug, error, warning
 from services.extraction_service import extract_file
@@ -76,30 +76,90 @@ def _registrations():
         (events.CallbackQuery(pattern=b"delete:(.+)"), handle_delete_file),
         (events.CallbackQuery(pattern=b"confirmdelete:(.+)"), handle_confirm_delete),
         (events.CallbackQuery(pattern=b"rename:(.+)"), handle_rename_file),
-        (events.NewMessage(func=lambda e: e.sender_id in pending_renames and len(pending_renames.get(e.sender_id, [])) > 0 and not e.raw_text.startswith('/')), handle_rename_input),
+        (events.NewMessage(func=is_rename_answer), handle_rename_input),
         (events.CallbackQuery(pattern=b"extract:(.+)"), handle_extract_file),
         (events.CallbackQuery(pattern=b"(delcompressed|keepcompressed):(.+)"), handle_compressed_file_action),
     ]
 
 
+def _utf16_len(text):
+    """Longitud tal como la cuenta Telegram: en unidades UTF-16.
+
+    Con len() un emoji cuenta 1 pero para Telegram son 2, y un listado lleno
+    de emoji pasaba del límite de 4096 y se rechazaba entero.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
+def is_rename_answer(event):
+    """Si un mensaje es la respuesta a un renombrado pendiente."""
+    if not pending_renames.get(event.sender_id):
+        return False
+    text = event.raw_text or ""
+    # Ni comandos, ni ficheros (llegan sin texto o con su pie), ni enlaces:
+    # los atienden sus handlers, y tomarlos por un nombre gastaba la petición
+    # y borraba el mensaje del usuario
+    if not text.strip() or text.startswith('/') or '://' in text:
+        return False
+    if getattr(event, "media", None):
+        return False
+    return True
+
+
+def _forget_renames(user_id, file_id):
+    """Deja de esperar el nombre nuevo de `file_id` (al cancelar o volver)."""
+    user_renames = pending_renames.get(user_id)
+    if not user_renames:
+        return
+    user_renames[:] = [data for data in user_renames if data["file_id"] != file_id]
+    if not user_renames:
+        pending_renames.pop(user_id, None)
+
+
+def _item_key(key, is_directory):
+    """La variante de una clave para carpeta o para archivo.
+
+    Son claves separadas y no un "$1" con el tipo: en español cambia el género
+    ("esta carpeta", "este archivo") y en inglés no debe colarse "archivo".
+    """
+    return f"{key}_folder" if is_directory else f"{key}_file"
+
+
+# Comprimidos con doble extensión: "copia.tar.gz" se extrae en "copia/"
+DOUBLE_EXTENSIONS = ('.tar.gz', '.tar.bz2', '.tar.xz')
+
+
+def extraction_folder_name(file_path):
+    """Nombre de la carpeta en la que se extrae un comprimido."""
+    filename = os.path.basename(file_path)
+    # Las partes de un RAR (.partN.rar, .rNN) van a la carpeta del juego
+    if rarfile.is_rarfile(file_path):
+        return clean_rar_base_name(filename)
+    lower = filename.lower()
+    for extension in DOUBLE_EXTENSIONS:
+        if lower.endswith(extension):
+            return filename[:-len(extension)]
+    return os.path.splitext(filename)[0]
+
+
 def get_available_categories():
-    """Retorna las categorías disponibles según los filtros activos"""
+    """Retorna las categorías que tienen carpeta propia (montada como volumen)"""
     categories = []
 
     # Siempre está disponible la carpeta principal
-    categories.append(("all", "📦 Todos"))
+    categories.append(("all", get_text("category_all")))
 
-    # Agregar categorías según filtros activos
-    if FILTER_VIDEO or FILTER_URL_VIDEO:
-        categories.append(("video", f"{VID_ICO} Videos"))
-    if FILTER_AUDIO or FILTER_URL_AUDIO:
-        categories.append(("audio", f"{AUD_ICO} Audios"))
-    if FILTER_PHOTO:
-        categories.append(("photo", f"{IMG_ICO} Fotos"))
-    if FILTER_TORRENT:
-        categories.append(("torrent", f"{TOR_ICO} Torrents"))
-    if FILTER_EBOOK:
-        categories.append(("ebook", f"{BOO_ICO} Ebooks"))
+    # Una categoría solo tiene sentido si su carpeta no es la general
+    if has_own_folder("video", "url_video"):
+        categories.append(("video", f"{VID_ICO} {get_text('category_video')}"))
+    if has_own_folder("audio", "url_audio"):
+        categories.append(("audio", f"{AUD_ICO} {get_text('category_audio')}"))
+    if has_own_folder("photo"):
+        categories.append(("photo", f"{IMG_ICO} {get_text('category_photo')}"))
+    if has_own_folder("torrent"):
+        categories.append(("torrent", f"{TOR_ICO} {get_text('category_torrent')}"))
+    if has_own_folder("ebook"):
+        categories.append(("ebook", f"{BOO_ICO} {get_text('category_ebook')}"))
 
     return categories
 
@@ -125,7 +185,7 @@ def get_category_buttons(exclude_category=None):
         buttons.append(row)
 
     # Agregar botón de cerrar en fila separada
-    buttons.append([Button.inline("❌ Cerrar", data="close")])
+    buttons.append([Button.inline(get_text("button_close"), data="close")])
 
     return buttons
 
@@ -155,7 +215,16 @@ async def handle_list_category(event):
     # También eliminar el mensaje actual (el que tiene los botones)
     await safe_delete(event)
 
-    # Llamar directamente a la lógica de listado con la categoría
+    await send_file_list(event, category)
+
+
+async def send_file_list(event, category):
+    """Envía el listado de una categoría ("all", "video"...) al chat de `event`.
+
+    Lo usan los botones de /list y también `/list video`, escrito a mano: una
+    sola implementación, para que los dos caminos se vean y fallen igual.
+    """
+    user_id = event.sender_id
     try:
         # Mapear categorías a directorios
         category_map = {
@@ -179,12 +248,21 @@ async def handle_list_category(event):
         total_size = 0
         seen_files = set()
 
+        unreadable = None
+        readable_dirs = 0
         for directory in directories:
             if not os.path.exists(directory):
                 debug(f"[LIST] Directory does not exist: {directory}")
                 continue
 
-            dir_files = os.listdir(directory)
+            try:
+                dir_files = os.listdir(directory)
+            except OSError as e:
+                # Una carpeta sin permisos no tira el listado de las demás
+                warning(f"[FILE_LIST] Cannot read {directory}: {e}")
+                unreadable = e
+                continue
+            readable_dirs += 1
             debug(f"[LIST] Directory {directory} contains {len(dir_files)} items: {dir_files}")
 
             for filename in dir_files:
@@ -226,6 +304,11 @@ async def handle_list_category(event):
                 except Exception as e:
                     warning(f"[FILE_LIST] Error processing {filename}: {e}")
 
+        # Si no se ha podido leer ninguna, se avisa del error en vez de
+        # decir que no hay archivos
+        if unreadable is not None and not readable_dirs:
+            raise unreadable
+
         # Ordenar alfabéticamente por nombre
         files_info.sort(key=lambda x: x["name"].lower())
 
@@ -244,7 +327,7 @@ async def handle_list_category(event):
         MAX_MESSAGE_LENGTH = 3800
 
         total_size_formatted = format_file_size(total_size)
-        header = "📂 **Archivos en el servidor**\n\n"
+        header = f"{get_text('list_title')}\n\n"
 
         # Contar archivos y carpetas
         file_count = sum(1 for item in files_info if item["type"] == "file")
@@ -266,12 +349,12 @@ async def handle_list_category(event):
                 display_name = name[:37] + "..."
 
             # Crear entrada de archivo o carpeta (sin mostrar la ruta)
-            file_entry = f"{i}. {file_info['icon']} `{display_name}`\n   💾 {file_info['size_formatted']}"
+            file_entry = f"{i}. {file_info['icon']} {md_code(display_name)}\n   💾 {file_info['size_formatted']}"
 
             # Calcular longitud del mensaje con header y footer
             test_message = header + current_message + "\n\n" + file_entry + footer
 
-            if len(test_message) > MAX_MESSAGE_LENGTH and current_message:
+            if _utf16_len(test_message) > MAX_MESSAGE_LENGTH and current_message:
                 # Guardar mensaje actual y empezar uno nuevo
                 final_message = header + current_message + footer
                 messages.append(final_message)
@@ -293,7 +376,7 @@ async def handle_list_category(event):
         for idx, msg in enumerate(messages, 1):
             if len(messages) > 1:
                 # Si hay múltiples mensajes, agregar indicador de página
-                msg = msg.replace("📂 **Archivos en el servidor**", f"📂 **Archivos en el servidor** (Parte {idx}/{len(messages)})")
+                msg = msg.replace(header, f"{get_text('list_title_part', idx, len(messages))}\n\n", 1)
 
             # Solo agregar botones de categorías al último mensaje
             buttons = category_buttons if idx == len(messages) else None
@@ -358,11 +441,18 @@ async def handle_manage_category(event):
         scanned_dirs = 0
         total_items = 0
 
+        unreadable = None
         for directory in directories:
             if not os.path.exists(directory):
                 continue
 
-            dir_files = os.listdir(directory)
+            try:
+                dir_files = os.listdir(directory)
+            except OSError as e:
+                # Una carpeta sin permisos no tira el listado de las demás
+                warning(f"[FILE_MANAGE] Cannot read {directory}: {e}")
+                unreadable = e
+                continue
             scanned_dirs += 1
             total_items += len(dir_files)
 
@@ -405,6 +495,11 @@ async def handle_manage_category(event):
                 except Exception as e:
                     warning(f"[FILE_MANAGE] Error processing {filename}: {e}")
 
+        # Si no se ha podido leer ninguna, se avisa del error en vez de
+        # decir que no hay archivos
+        if unreadable is not None and not scanned_dirs:
+            raise unreadable
+
         # Log consolidado del escaneo
         debug(f"[MANAGE] Category '{category}': scanned {scanned_dirs} directories, found {len(files_info)} items ({total_items} total including hidden/temp)")
 
@@ -427,7 +522,7 @@ async def handle_manage_category(event):
             category_buttons.append(row)
 
         # Agregar botón de cerrar
-        category_buttons.append([Button.inline("❌ Cerrar", data="close")])
+        category_buttons.append([Button.inline(get_text("button_close"), data="close")])
 
         if not files_info:
             msg = get_text("manage_no_files")
@@ -501,6 +596,10 @@ async def handle_file_action(event):
     await safe_answer(event)
     file_id = event.pattern_match.group(1).decode()
 
+    # Aquí llegan el Cancelar y el Volver del renombrado: si no se olvida la
+    # petición, el siguiente texto que escriba el usuario renombra el fichero
+    _forget_renames(event.sender_id, file_id)
+
     file_path = pending_file_actions.get(file_id)
     if not file_path or not os.path.exists(file_path):
         await safe_edit(event, get_text("error_item_not_found"), parse_mode=PARSE_MODE)
@@ -514,20 +613,18 @@ async def handle_file_action(event):
         file_size_bytes = get_directory_size(file_path)
         file_size = format_file_size(file_size_bytes)
         icon = "📁"
-        item_type = "carpeta"
     else:
         # Es un archivo
         file_size_bytes = os.path.getsize(file_path)
         file_size = format_file_size(file_size_bytes)
         file_ext = os.path.splitext(filename)[1].lower()
         icon = get_file_icon(file_ext)
-        item_type = "archivo"
 
     # Crear mensaje con información del elemento
-    msg = f"{get_text('file_actions_title', item_type)}\n\n"
-    msg += f"{icon} {get_text('file_actions_name', filename)}\n"
+    msg = f"{get_text(_item_key('file_actions_title', is_directory))}\n\n"
+    msg += f"{icon} {get_text('file_actions_name', md_code(filename))}\n"
     msg += f"{get_text('file_actions_size', file_size)}\n"
-    msg += f"{get_text('file_actions_path', os.path.dirname(file_path))}\n\n"
+    msg += f"{get_text('file_actions_path', md_code(os.path.dirname(file_path)))}\n\n"
     msg += get_text('file_actions_what_to_do')
 
     # Botones de acción
@@ -535,18 +632,18 @@ async def handle_file_action(event):
 
     # Primera fila: Renombrar y Eliminar
     buttons.append([
-        Button.inline("✏️ Renombrar", data=f"rename:{file_id}"),
-        Button.inline("🗑️ Eliminar", data=f"delete:{file_id}"),
+        Button.inline(get_text("manage_button_rename"), data=f"rename:{file_id}"),
+        Button.inline(get_text("manage_button_delete"), data=f"delete:{file_id}"),
     ])
 
     # Segunda fila: Descargar (solo para archivos menores de 2GB)
     if not is_directory:
         if file_size_bytes < MAX_TELEGRAM_FILE_SIZE:
-            buttons.append([Button.inline("📥 Descargar a Telegram", data=f"download:{file_id}")])
+            buttons.append([Button.inline(get_text("manage_button_download"), data=f"download:{file_id}")])
 
         # Botón de descomprimir si es un archivo comprimido
         if is_compressed_file(file_path):
-            buttons.append([Button.inline("📦 Descomprimir", data=f"extract:{file_id}")])
+            buttons.append([Button.inline(get_text("manage_button_extract"), data=f"extract:{file_id}")])
 
     # Última fila: Volver y Cerrar
     buttons.append([
@@ -563,6 +660,7 @@ async def handle_download_file(event):
         return
 
     await safe_answer(event)
+    stats.count("btn_manage_download")
     file_id = event.pattern_match.group(1).decode()
 
     file_path = pending_file_actions.get(file_id)
@@ -793,7 +891,6 @@ async def handle_delete_file(event):
 
     filename = os.path.basename(file_path)
     is_directory = os.path.isdir(file_path)
-    item_type = "carpeta" if is_directory else "archivo"
 
     if is_directory:
         icon = "📁"
@@ -803,8 +900,8 @@ async def handle_delete_file(event):
 
     # Pedir confirmación
     msg = f"{get_text('confirm_delete_title')}\n\n"
-    msg += f"{get_text('confirm_delete_question', item_type)}\n\n"
-    msg += f"{icon} `{filename}`\n\n"
+    msg += f"{get_text(_item_key('confirm_delete_question', is_directory))}\n\n"
+    msg += f"{icon} {md_code(filename)}\n\n"
     if is_directory:
         msg += f"{get_text('confirm_delete_folder_warning')}\n\n"
     msg += get_text('confirm_delete_no_undo')
@@ -825,6 +922,7 @@ async def handle_confirm_delete(event):
         return
 
     await safe_answer(event)
+    stats.count("btn_manage_delete")
     file_id = event.pattern_match.group(1).decode()
 
     file_path = pending_file_actions.get(file_id)
@@ -834,7 +932,7 @@ async def handle_confirm_delete(event):
 
     filename = os.path.basename(file_path)
     is_directory = os.path.isdir(file_path)
-    item_type = "carpeta" if is_directory else "archivo"
+    item_type = "folder" if is_directory else "file"
     icon = "📁" if is_directory else "📄"
 
     try:
@@ -847,9 +945,9 @@ async def handle_confirm_delete(event):
 
         pending_file_actions.pop(file_id, None)
 
-        msg = f"{get_text('item_deleted_title', item_type.capitalize())}\n\n"
-        msg += f"{icon} `{filename}`\n\n"
-        msg += get_text('item_deleted_desc', item_type)
+        msg = f"{get_text(_item_key('item_deleted_title', is_directory))}\n\n"
+        msg += f"{icon} {md_code(filename)}\n\n"
+        msg += get_text(_item_key('item_deleted_desc', is_directory))
 
         buttons = [[
             Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
@@ -860,7 +958,9 @@ async def handle_confirm_delete(event):
         debug(f"[FILE_DELETE] {item_type.capitalize()} deleted by user: {file_path}")
     except Exception as e:
         error(f"[FILE_DELETE] Error deleting {item_type} {file_path}: {e}")
-        await safe_edit(event, get_text("error_deleting_item", item_type, str(e)), parse_mode=PARSE_MODE)
+        # El error lleva la ruta: en un bloque de código, para que un "__" del
+        # nombre no se tome por cursiva
+        await safe_edit(event, get_text(_item_key("error_deleting", is_directory), md_code(e)), parse_mode=PARSE_MODE)
 
 
 async def handle_rename_file(event):
@@ -869,6 +969,7 @@ async def handle_rename_file(event):
         return
 
     await safe_answer(event)
+    stats.count("btn_manage_rename")
     file_id = event.pattern_match.group(1).decode()
 
     file_path = pending_file_actions.get(file_id)
@@ -878,11 +979,12 @@ async def handle_rename_file(event):
 
     filename = os.path.basename(file_path)
     is_directory = os.path.isdir(file_path)
-    item_type = "carpeta" if is_directory else "archivo"
     icon = "📁" if is_directory else "📄"
 
     # Guardar en pending_renames para capturar el siguiente mensaje
     # Usamos una lista para permitir múltiples renombrados simultáneos
+    # (pulsar dos veces Renombrar en el mismo elemento no lo pide dos veces)
+    _forget_renames(event.sender_id, file_id)
     if event.sender_id not in pending_renames:
         pending_renames[event.sender_id] = []
 
@@ -891,12 +993,15 @@ async def handle_rename_file(event):
         "file_path": file_path,
         "original_name": filename,
         "message": event,  # Guardar el mensaje para borrarlo después
+        # En un CallbackQuery, .id es el de la consulta: el del mensaje con
+        # el botón (al que contesta el usuario) es .message_id
+        "message_id": getattr(event, "message_id", None),
         "is_directory": is_directory
     })
 
-    msg = f"{get_text('rename_title', item_type)}\n\n"
-    msg += f"{icon} {get_text('rename_current_name', filename)}\n\n"
-    msg += get_text('rename_reply_with_new_name', item_type)
+    msg = f"{get_text(_item_key('rename_title', is_directory))}\n\n"
+    msg += f"{icon} {get_text('rename_current_name', md_code(filename))}\n\n"
+    msg += get_text(_item_key('rename_reply_with_new_name', is_directory))
     if not is_directory:
         msg += get_text('rename_include_extension')
     msg += ".\n\n"
@@ -924,7 +1029,7 @@ async def handle_rename_input(event):
     # Si el usuario está respondiendo a un mensaje, buscar ese mensaje específico
     if event.reply_to_msg_id:
         for i, data in enumerate(user_renames):
-            if data.get("message") and data["message"].id == event.reply_to_msg_id:
+            if data.get("message_id") == event.reply_to_msg_id:
                 rename_data = data
                 rename_index = i
                 break
@@ -946,7 +1051,6 @@ async def handle_rename_input(event):
     original_name = rename_data["original_name"]
     rename_message = rename_data.get("message")  # Mensaje de "Renombrar archivo/carpeta"
     is_directory = rename_data.get("is_directory", False)
-    item_type = "carpeta" if is_directory else "archivo"
     icon = "📁" if is_directory else "📄"
     new_name = event.raw_text.strip()
 
@@ -977,7 +1081,7 @@ async def handle_rename_input(event):
 
     # Verificar que el elemento aún existe
     if not os.path.exists(file_path):
-        await safe_reply(event, get_text("error_type_not_found", item_type.capitalize(), item_type), parse_mode=PARSE_MODE)
+        await safe_reply(event, get_text("error_folder_gone" if is_directory else "error_file_gone"), parse_mode=PARSE_MODE)
         return
 
     # Construir nueva ruta
@@ -986,8 +1090,10 @@ async def handle_rename_input(event):
 
     # Verificar si ya existe un elemento con ese nombre
     if os.path.exists(new_path):
-        msg = f"{get_text('rename_already_exists_title', item_type)}\n\n"
-        msg += f"{get_text('rename_already_exists_desc', item_type, new_name)}\n\n"
+        # Lo que ya existe puede ser de otro tipo (un fichero que se llama
+        # como una carpeta), así que el texto no dice cuál
+        msg = f"{get_text('rename_already_exists_title')}\n\n"
+        msg += f"{get_text('rename_already_exists_desc', md_code(new_name))}\n\n"
         msg += get_text('rename_choose_another')
         buttons = [[
             Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
@@ -1003,10 +1109,10 @@ async def handle_rename_input(event):
         # Actualizar en pending_file_actions
         pending_file_actions[file_id] = new_path
 
-        msg = f"{get_text('rename_success_title', item_type.capitalize())}\n\n"
-        msg += f"{icon} {get_text('rename_old_name', original_name)}\n"
-        msg += f"{icon} {get_text('rename_new_name', new_name)}\n\n"
-        msg += get_text('rename_success_desc', item_type)
+        msg = f"{get_text(_item_key('rename_success_title', is_directory))}\n\n"
+        msg += f"{icon} {get_text('rename_old_name', md_code(original_name))}\n"
+        msg += f"{icon} {get_text('rename_new_name', md_code(new_name))}\n\n"
+        msg += get_text(_item_key('rename_success_desc', is_directory))
 
         buttons = [[
             Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
@@ -1018,7 +1124,7 @@ async def handle_rename_input(event):
     except Exception as e:
         error(f"[FILE_RENAME] Error renaming file {file_path}: {e}")
         msg = f"{get_text('rename_error_title')}\n\n"
-        msg += get_text('rename_error_desc', str(e))
+        msg += get_text('rename_error_desc', md_code(e))
         buttons = [[
             Button.inline(get_text("button_back_to_manage"), data=f"fileact:{file_id}"),
             Button.inline(get_text("button_close"), data="close")
@@ -1032,6 +1138,7 @@ async def handle_extract_file(event):
         return
 
     await safe_answer(event)
+    stats.count("btn_manage_extract")
     file_id = event.pattern_match.group(1).decode()
 
     file_path = pending_file_actions.get(file_id)
@@ -1046,20 +1153,15 @@ async def handle_extract_file(event):
         await safe_edit(event, get_text("error_not_compressed"), parse_mode=PARSE_MODE)
         return
 
-    # Verificar si es un ZIP split (no soportado)
-    if is_split_zip(filename):
+    # Verificar si es un ZIP split (no soportado). Con la ruta completa: con
+    # el nombre suelto buscaba las partes en el directorio de trabajo
+    if is_split_zip(file_path):
         await safe_edit(event, get_text("error_split_zip_not_supported"), parse_mode=PARSE_MODE)
         return
 
     # Determinar la carpeta de extracción
     download_path = os.path.dirname(file_path)
-    base_name = os.path.splitext(file_path)[0]
-
-    # Para archivos RAR, limpiar el nombre base
-    if rarfile.is_rarfile(file_path):
-        base_name = clean_rar_base_name(filename)
-
-    extracted_path = os.path.join(download_path, os.path.basename(base_name))
+    extracted_path = os.path.join(download_path, extraction_folder_name(file_path))
 
     # Verificar si la carpeta de destino ya existe
     if os.path.exists(extracted_path):
@@ -1084,7 +1186,12 @@ async def handle_extract_file(event):
         """Actualiza el mensaje cada 10 segundos para mostrar que sigue extrayendo"""
         elapsed = 0
         while not extraction_done.is_set():
-            await asyncio.sleep(10)
+            # Esperando al evento y no con sleep(10): con un sleep, el resultado
+            # de una extracción de una décima tardaba 10 segundos en llegar
+            try:
+                await asyncio.wait_for(extraction_done.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
             if not extraction_done.is_set():
                 elapsed += 10
                 try:
@@ -1119,10 +1226,77 @@ async def handle_extract_file(event):
         from_manage=True
     )
 
+    # Con un "qué hacer después" fijo en /settings, se hace sin preguntar
+    after = settings.extract_after()
+    if extract_result == True and after != "ASK":
+        msg = msg.replace(get_text("extraction_ask_delete"), "").rstrip()
+        if after == "DELETE":
+            msg += "\n\n" + delete_compressed(file_path)
+            pending_file_actions.pop(file_id, None)
+        else:
+            msg += "\n\n" + kept_message(filename)
+        buttons = [[
+            Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
+            Button.inline(get_text("button_close"), data="close")
+        ]]
+        debug(f"[EXTRACT] extract after={after} for {filename}")
+
     await safe_edit(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
 
     if extract_result == True:
         debug(f"[EXTRACT] File {filename} - Extracted to {extracted_path}")
+
+
+def kept_message(filename):
+    return f"{get_text('file_kept_title')}\n\n📄 {md_code(filename)}\n\n{get_text('file_kept_desc')}"
+
+
+def delete_compressed(file_path):
+    """Borra un comprimido (todas sus partes, si es un RAR multiparte) y
+    devuelve el mensaje que lo cuenta."""
+    filename = os.path.basename(file_path)
+    try:
+        # Si es un archivo RAR multi-parte, eliminar todas las partes
+        if rarfile.is_rarfile(file_path):
+            dirname = os.path.dirname(file_path)
+            m = (re.fullmatch(r"(.*)\.part\d+\.rar", filename, re.IGNORECASE)
+                 or re.fullmatch(r"(.*)\.(?:rar|r\d{2,})", filename, re.IGNORECASE))
+            matched_base = m.group(1) if m else None
+
+            if matched_base:
+                # Solo las partes del mismo juego: base.rar, base.rNN y
+                # base.partN.rar. Antes bastaba con empezar igual, y al borrar
+                # "serie.rar" se iban también "serie2.rar" o "serie - extras.rar"
+                same_set = re.compile(re.escape(matched_base) + r"\.(?:rar|r\d{2,}|part\d+\.rar)",
+                                      re.IGNORECASE)
+                all_parts = []
+                for f in os.listdir(dirname):
+                    if same_set.fullmatch(f):
+                        full_path = os.path.join(dirname, f)
+                        if os.path.isfile(full_path):
+                            all_parts.append(full_path)
+
+                for part in all_parts:
+                    os.remove(part)
+                    debug(f"[FILE_DELETE] File {part} - Deleted")
+
+                msg = f"{get_text('files_deleted_title')}\n\n"
+                msg += get_text('files_deleted_count', len(all_parts))
+            else:
+                os.remove(file_path)
+                msg = f"{get_text('file_deleted_title')}\n\n"
+                msg += f"📄 {md_code(filename)}"
+                debug(f"[FILE_DELETE] File {file_path} - Deleted")
+        else:
+            os.remove(file_path)
+            msg = f"{get_text('file_deleted_title')}\n\n"
+            msg += f"📄 {md_code(filename)}"
+            debug(f"[FILE_DELETE] File {file_path} - Deleted")
+    except Exception as e:
+        error(f"[FILE_DELETE] Error deleting compressed file {file_path}: {e}")
+        msg = f"{get_text('delete_error_title')}\n\n"
+        msg += get_text('delete_error_desc', md_code(e))
+    return msg
 
 
 async def handle_compressed_file_action(event):
@@ -1142,63 +1316,10 @@ async def handle_compressed_file_action(event):
     filename = os.path.basename(file_path)
 
     if action == "delcompressed":
-        # Eliminar el archivo comprimido
-        try:
-            # Si es un archivo RAR multi-parte, eliminar todas las partes
-            if rarfile.is_rarfile(file_path):
-                dirname = os.path.dirname(file_path)
-                filename_lower = filename.lower()
-                rar_patterns = [
-                    r"(.*)\.part\d+\.rar$",
-                    r"(.*)\.r\d{2}$",
-                    r"(.*)\.rar$"
-                ]
-
-                matched_base = None
-                for pattern in rar_patterns:
-                    m = re.match(pattern, filename_lower)
-                    if m:
-                        matched_base = m.group(1)
-                        break
-
-                if matched_base:
-                    all_parts = []
-                    for f in os.listdir(dirname):
-                        f_lower = f.lower()
-                        if (f_lower.startswith(matched_base)
-                            and (f_lower.endswith(".rar") or re.match(r".*\.r\d{2}$", f_lower) or ".part" in f_lower)):
-                            full_path = os.path.join(dirname, f)
-                            if os.path.isfile(full_path):
-                                all_parts.append(full_path)
-
-                    for part in all_parts:
-                        os.remove(part)
-                        debug(f"[FILE_DELETE] File {part} - Deleted")
-
-                    msg = f"{get_text('files_deleted_title')}\n\n"
-                    msg += get_text('files_deleted_count', len(all_parts))
-                else:
-                    os.remove(file_path)
-                    msg = f"{get_text('file_deleted_title')}\n\n"
-                    msg += f"📄 `{filename}`"
-                    debug(f"[FILE_DELETE] File {file_path} - Deleted")
-            else:
-                os.remove(file_path)
-                msg = f"{get_text('file_deleted_title')}\n\n"
-                msg += f"📄 `{filename}`"
-                debug(f"[FILE_DELETE] File {file_path} - Deleted")
-
-            pending_file_actions.pop(file_id, None)
-
-        except Exception as e:
-            error(f"[FILE_DELETE] Error deleting compressed file {file_path}: {e}")
-            msg = f"{get_text('delete_error_title')}\n\n"
-            msg += get_text('delete_error_desc', str(e))
-
+        msg = delete_compressed(file_path)
+        pending_file_actions.pop(file_id, None)
     else:  # keepcompressed
-        msg = f"{get_text('file_kept_title')}\n\n"
-        msg += f"📄 `{filename}`\n\n"
-        msg += get_text('file_kept_desc')
+        msg = kept_message(filename)
 
     buttons = [[
         Button.inline(get_text("button_back_to_manage"), data="managecat:all"),

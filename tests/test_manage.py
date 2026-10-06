@@ -235,6 +235,55 @@ class TestExtraccion:
         assert os.path.exists(archive) is should_exist
 
 
+class TestTrasDescomprimir:
+    """El ajuste extract.after decide qué pasa con el comprimido."""
+
+    @pytest.fixture
+    def archive(self, managed, tmp_path, config_dir):
+        import zipfile
+
+        dropbot, _, _ = managed
+        path = tmp_path / "paquete.zip"
+        with zipfile.ZipFile(path, "w") as bundle:
+            bundle.writestr("dentro.txt", "hola")
+        dropbot.pending_file_actions["z1"] = str(path)
+        return dropbot, path
+
+    def _extract(self, dropbot, make_event, run_async):
+        run_async(dropbot.handle_extract_file(make_event(groups=(b"z1",))))
+
+    def test_preguntar_ofrece_los_botones(self, archive, sent_messages, make_event, run_async):
+        dropbot, path = archive
+
+        self._extract(dropbot, make_event, run_async)
+
+        assert path.exists()
+        assert b"delcompressed:z1" in _payloads(sent_messages)
+
+    def test_borrar_lo_borra_sin_preguntar(self, archive, sent_messages, make_event, run_async):
+        import settings
+
+        dropbot, path = archive
+        settings.put("extract.after", "DELETE")
+
+        self._extract(dropbot, make_event, run_async)
+
+        assert not path.exists()
+        assert (path.parent / "paquete" / "dentro.txt").exists()
+        assert not any(p.startswith(b"delcompressed:") for p in _payloads(sent_messages))
+
+    def test_conservar_lo_deja_sin_preguntar(self, archive, sent_messages, make_event, run_async):
+        import settings
+
+        dropbot, path = archive
+        settings.put("extract.after", "KEEP")
+
+        self._extract(dropbot, make_event, run_async)
+
+        assert path.exists()
+        assert not any(p.startswith(b"delcompressed:") for p in _payloads(sent_messages))
+
+
 class TestListados:
     @pytest.mark.parametrize("handler_name", ["handle_list_category", "handle_manage_category"])
     def test_listar_no_revienta_con_la_carpeta_vacia(

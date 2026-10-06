@@ -19,22 +19,24 @@ from telethon.tl.types import (
     DocumentAttributeFilename, DocumentAttributeVideo, DocumentAttributeAudio
 )
 from config import (
-    ANONYMOUS_USER_ID, AUD_ICO, AUTO_DOWNLOAD_FORMAT, AUTO_SEND,
+    ANONYMOUS_USER_ID, AUD_ICO,
     BOO_ICO, DEFAULT_EMPTY_STR, DEF_ICO, DOWNLOAD_PATH,
     DOWNLOAD_PATHS, EXTENSIONS_AUDIO, EXTENSIONS_EBOOK, EXTENSIONS_IMAGE,
-    EXTENSIONS_TORRENT, EXTENSIONS_VIDEO, FAST_CONNECTIONS, FAST_TRANSFER_MIN_BYTES,
-    FFMPEG_HW,
-    FFMPEG_QUALITY,
-    HEARTBEAT_FILE, HEARTBEAT_INTERVAL, IMG_ICO, LANGUAGE,
+    EXTENSIONS_TORRENT, EXTENSIONS_VIDEO, EXTENSIONS_WEBPAGE, FAST_TRANSFER_MIN_BYTES,
+    HEARTBEAT_FILE, HEARTBEAT_INTERVAL, IMG_ICO,
     MAX_DOWNLOAD_RETRIES, MAX_TELEGRAM_FILE_SIZE, MESSAGE_QUEUE_DELAY, MESSAGE_QUEUE_MAX_RETRIES,
-    PARALLEL_DOWNLOADS, POT_PROVIDER_DIR, POT_PROVIDER_PORT, POT_PROVIDER_STARTUP_TIMEOUT,
+    POT_PROVIDER_DIR, POT_PROVIDER_PORT, POT_PROVIDER_STARTUP_TIMEOUT,
     RETRY_DELAY_SECONDS, TELEGRAM_ADMIN, TELEGRAM_API_HASH, TELEGRAM_API_ID,
     TELEGRAM_TOKEN, TEMP_DIR, TOR_ICO, VID_ICO,
     YTDLP_COOKIES_FILE,
 )
-from translations import get_text, load_locale, PARSE_MODE
+import migration
+import settings
+import stats
+import store
+from translations import get_text, PARSE_MODE
 from basic import (
-    get_filename_from_path, is_admin, sanitize_filename,
+    get_filename_from_path, is_admin, md_code, sanitize_filename,
 )
 from message_queue import TelegramMessageQueue
 from state import (
@@ -43,16 +45,18 @@ from state import (
     send_original_requests,
 )
 from utils.file_helpers import (
-    format_file_size, get_directory_size, get_file_icon,
+    format_file_size, get_file_icon,
     reserve_unique_path, copy_and_remove,
 )
 from utils import fast_telethon
+from utils.limiter import ResizableLimiter
 from utils import telegram_helpers
 from utils.telegram_helpers import (
     safe_edit, safe_reply, safe_respond, safe_answer,
     safe_delete, safe_send_message, check_admin_and_warn,
 )
 from handlers import manage as manage_handlers
+from handlers import settings as settings_handlers
 from handlers.manage import get_available_categories, get_category_buttons
 from services.donors_service import print_donors
 from services.video_service import (
@@ -82,7 +86,7 @@ logger = log_module.setup_logger(
 
 from logger import debug, warning, error
 
-VERSION = "3.6.3"
+VERSION = "4.0.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -91,33 +95,9 @@ logger.info("=" * 60)
 logger.info(f"DropBot v{VERSION} starting...")
 logger.info("=" * 60)
 
-if LANGUAGE.lower() not in ("es", "en"):
-    error("[CONFIG] LANGUAGE only can be ES/EN")
-    sys.exit(1)
-
-if AUTO_DOWNLOAD_FORMAT not in ("ASK", "VIDEO", "AUDIO"):
-    error("[CONFIG] AUTO_DOWNLOAD_FORMAT only can be ASK/VIDEO/AUDIO")
-    sys.exit(1)
-
-if AUTO_SEND not in ("ASK", "SEND", "SEND_DELETE", "STORE"):
-    error("[CONFIG] AUTO_SEND only can be ASK/SEND/SEND_DELETE/STORE")
-    sys.exit(1)
-
-if FFMPEG_HW not in ("NONE", "VAAPI", "NVENC", "QSV"):
-    error("[CONFIG] FFMPEG_HW only can be NONE/VAAPI/NVENC/QSV")
-    sys.exit(1)
-
-if FFMPEG_QUALITY is not None:
-    try:
-        _ffmpeg_quality = int(FFMPEG_QUALITY)
-    except ValueError:
-        error("[CONFIG] FFMPEG_QUALITY only can be an integer from 1-51")
-        sys.exit(1)
-    if not 1 <= _ffmpeg_quality <= 51:
-        error("[CONFIG] FFMPEG_QUALITY only can be an integer from 1-51")
-        sys.exit(1)
-
-load_locale(LANGUAGE.lower())
+# Antes de leer ningún ajuste: en el primer arranque de la 4.x, settings.json
+# se siembra con las variables que hubiera en el docker-compose
+seeded = migration.run()
 
 if DEFAULT_EMPTY_STR == TELEGRAM_TOKEN:
     error("[CONFIG] Bot token needs to be configured with the TELEGRAM_TOKEN variable")
@@ -131,12 +111,12 @@ if str(ANONYMOUS_USER_ID) in str(TELEGRAM_ADMIN).split(','):
 	error("[CONFIG] You cannot be anonymous to control the bot. In the TELEGRAM_ADMIN variable, you must put your user id.")
 	sys.exit(1)
 
-if PARALLEL_DOWNLOADS < 1:
-    error("[CONFIG] The minimum number of parallel downloads is 1. An incorrect number has been configured in the PARALLEL_DOWNLOADS variable")
-    sys.exit(1)
-
 for path in DOWNLOAD_PATHS.values():
     os.makedirs(path, exist_ok=True)
+
+# Cada tipo va a su carpeta si está montada como volumen; si no, a /downloads
+for kind, path in DOWNLOAD_PATHS.items():
+    debug(f"[STARTUP] Folder for {kind}: {path}")
 
 # Limpiar TODA la carpeta temporal al arrancar (eliminar archivos huérfanos de sesiones anteriores)
 debug(f"[STARTUP] Cleaning temporary directory: {TEMP_DIR}...")
@@ -168,14 +148,19 @@ except Exception as e:
 
 bot = TelegramClient("dropbot", TELEGRAM_API_ID, TELEGRAM_API_HASH).start(bot_token=TELEGRAM_TOKEN)
 
-# Intervalo de actualización de progreso adaptativo
-# Evita anti-spam cuando hay múltiples descargas paralelas
-# Telegram permite ~20 mensajes/minuto en grupos, pero con ediciones es más restrictivo
-# Usamos un intervalo muy conservador para evitar FloodWaitError
-# Fórmula: max(10, PARALLEL_DOWNLOADS * 1.5) segundos
-# Ejemplos: 1 descarga = 10s (6 ediciones/min), 5 descargas = 10s (30 ediciones/min), 10 descargas = 15s (40 ediciones/min)
-PROGRESS_UPDATE_INTERVAL = max(10, PARALLEL_DOWNLOADS * 1.5)
-download_semaphore = asyncio.Semaphore(PARALLEL_DOWNLOADS)
+def progress_update_interval():
+    """Segundos entre ediciones de un mensaje de progreso.
+
+    Evita anti-spam cuando hay múltiples descargas paralelas: Telegram permite
+    ~20 mensajes/minuto en grupos, y con ediciones es más restrictivo. Por eso
+    es muy conservador: max(10, descargas simultáneas * 1.5). Ejemplos: 1
+    descarga = 10s, 5 descargas = 10s, 10 descargas = 15s.
+    """
+    return max(10, settings.parallel_downloads() * 1.5)
+
+
+# El límite se cambia desde /settings sin reiniciar (ver apply_setting)
+download_semaphore = ResizableLimiter(settings.parallel_downloads())
 
 # Inicializar cola de mensajes para evitar FloodWaitError
 # delay_between_messages: tiempo entre mensajes (configurable, default: 0.5s)
@@ -189,150 +174,14 @@ message_queue = TelegramMessageQueue(
 telegram_helpers.init(message_queue, bot)
 
 async def handle_list_files(event):
-    """Lista los archivos descargados en el servidor"""
-    try:
-        # Parsear el comando para obtener la categoría
-        command_parts = event.raw_text.split()
-        category = command_parts[1] if len(command_parts) > 1 else "all"
+    """`/list <categoría>`: el listado de esa categoría sin pasar por el menú.
 
-        # Mapear categorías a directorios
-        category_map = {
-            "all": list(DOWNLOAD_PATHS.values()),
-            "video": [DOWNLOAD_PATHS["video"], DOWNLOAD_PATHS["url_video"]],
-            "audio": [DOWNLOAD_PATHS["audio"], DOWNLOAD_PATHS["url_audio"]],
-            "photo": [DOWNLOAD_PATHS["photo"]],
-            "torrent": [DOWNLOAD_PATHS["torrent"]],
-            "ebook": [DOWNLOAD_PATHS["ebook"]]
-        }
+    Una categoría desconocida lista todo, como hacía siempre.
+    """
+    command_parts = event.raw_text.split()
+    category = command_parts[1].lower() if len(command_parts) > 1 else "all"
+    await manage_handlers.send_file_list(event, category)
 
-        directories = category_map.get(category, list(DOWNLOAD_PATHS.values()))
-
-        # Eliminar directorios duplicados (cuando los filtros están desactivados, todos apuntan a /downloads)
-        directories = list(set(directories))
-
-        # Recopilar archivos
-        files_info = []
-        total_size = 0
-        seen_files = set()  # Para evitar duplicados por ruta completa
-
-        for directory in directories:
-            if not os.path.exists(directory):
-                continue
-
-            for filename in os.listdir(directory):
-                file_path = os.path.join(directory, filename)
-
-                # Ignorar archivos temporales y ocultos
-                if filename.startswith('.') or '_thumb.jpg' in filename:
-                    continue
-
-                # Evitar duplicados usando la ruta completa
-                if file_path in seen_files:
-                    continue
-                seen_files.add(file_path)
-
-                try:
-                    is_directory = os.path.isdir(file_path)
-
-                    if is_directory:
-                        # Es una carpeta
-                        file_size = get_directory_size(file_path)
-                        icon = "📁"
-                        item_type = "folder"
-                    else:
-                        # Es un archivo
-                        file_size = os.path.getsize(file_path)
-                        file_ext = os.path.splitext(filename)[1].lower()
-                        icon = get_file_icon(file_ext)
-                        item_type = "file"
-
-                    files_info.append({
-                        "name": filename,
-                        "size": file_size,
-                        "size_formatted": format_file_size(file_size),
-                        "icon": icon,
-                        "path": file_path,
-                        "type": item_type
-                    })
-                    total_size += file_size
-                except Exception as e:
-                    warning(f"[FILE_LIST] Error processing {filename}: {e}")
-
-        # Ordenar alfabéticamente por nombre
-        files_info.sort(key=lambda x: x["name"].lower())
-
-        if not files_info:
-            await safe_reply(event, get_text("list_empty"), parse_mode=PARSE_MODE)
-            return
-
-        # Construir mensajes (partiendo si es necesario)
-        # Límite de Telegram: 4096 caracteres, dejamos margen de seguridad
-        MAX_MESSAGE_LENGTH = 3800
-
-        total_size_formatted = format_file_size(total_size)
-        header = "📂 **Archivos en el servidor**\n\n"
-
-        # Contar archivos y carpetas
-        file_count = sum(1 for item in files_info if item["type"] == "file")
-        folder_count = sum(1 for item in files_info if item["type"] == "folder")
-
-        if folder_count > 0:
-            footer = f"\n\n{get_text('total_files_folders_space', file_count, folder_count, total_size_formatted)}"
-        else:
-            footer = f"\n\n{get_text('total_files_space', file_count, total_size_formatted)}"
-
-        messages = []
-        current_message = ""
-        current_count = 0
-
-        for i, file_info in enumerate(files_info, 1):
-            # Truncar nombre si es muy largo
-            name = file_info["name"]
-            display_name = name
-            if len(name) > 40:
-                display_name = name[:37] + "..."
-
-            # Crear entrada de archivo o carpeta (sin mostrar la ruta)
-            file_entry = f"{i}. {file_info['icon']} `{display_name}`\n   💾 {file_info['size_formatted']}"
-
-            # Calcular longitud del mensaje con header y footer
-            test_message = header + current_message + "\n\n" + file_entry + footer
-
-            if len(test_message) > MAX_MESSAGE_LENGTH and current_message:
-                # Guardar mensaje actual y empezar uno nuevo
-                final_message = header + current_message + footer
-                messages.append(final_message)
-                current_message = file_entry
-                current_count = 0
-            else:
-                # Agregar al mensaje actual
-                if current_message:
-                    current_message += "\n\n" + file_entry
-                else:
-                    current_message = file_entry
-                current_count += 1
-
-        # Agregar el último mensaje
-        if current_message:
-            final_message = header + current_message + footer
-            messages.append(final_message)
-
-        # Crear botones de categorías (excluyendo la categoría actual)
-        category_buttons = get_category_buttons(exclude_category=category)
-
-        # Enviar mensaje principal con lista de archivos
-        for idx, msg in enumerate(messages, 1):
-            if len(messages) > 1:
-                # Si hay múltiples mensajes, agregar indicador de página
-                msg = msg.replace("📂 **Archivos en el servidor**", f"📂 **Archivos en el servidor** (Parte {idx}/{len(messages)})")
-
-            # Solo agregar botones de categorías al último mensaje
-            buttons = category_buttons if idx == len(messages) else None
-            await safe_reply(event, msg, buttons=buttons, parse_mode=PARSE_MODE)
-
-    except Exception as e:
-        error(f"[FILE_LIST] Error listing files: {e}")
-        await safe_reply(event, get_text("error_list_files"), parse_mode=PARSE_MODE)
 
 def get_download_path(event):
     message = event.message
@@ -345,7 +194,8 @@ def get_download_path(event):
         return DOWNLOAD_PATHS["ebook"], BOO_ICO
     elif file_extension in EXTENSIONS_VIDEO or message.video:
         return DOWNLOAD_PATHS["video"], VID_ICO
-    elif file_extension in EXTENSIONS_AUDIO or message.audio:
+    # Telethon devuelve None en .audio para las notas de voz: van por .voice
+    elif file_extension in EXTENSIONS_AUDIO or message.audio or message.voice:
         return DOWNLOAD_PATHS["audio"], AUD_ICO
     elif file_extension in EXTENSIONS_IMAGE or message.photo:
         return DOWNLOAD_PATHS["photo"], IMG_ICO
@@ -364,11 +214,24 @@ def is_file_message(event):
     return bool(event.document or event.video or event.audio or event.photo)
 
 
+# Para las estadísticas: qué tipo de fichero se recibió, por su icono
+FILE_KIND_BY_ICON = {
+    TOR_ICO: "torrent", BOO_ICO: "ebook", VID_ICO: "video",
+    AUD_ICO: "audio", IMG_ICO: "photo",
+}
+
+
 @bot.on(events.NewMessage(func=is_file_message))
 async def handle_files(event):
     if await check_admin_and_warn(event):
         return
-    
+
+    try:
+        _, icon = get_download_path(event)
+        stats.count(f"file_{FILE_KIND_BY_ICON.get(icon, 'other')}")
+    except Exception:
+        pass
+
     task = asyncio.create_task(limited_download(event))
     active_tasks[event.id] = task
 
@@ -394,7 +257,7 @@ def _make_transfer_progress_callback(status_message, file_name, text_key, log_ta
     """
     Crea un callback de progreso reutilizable para descargas y subidas.
 
-    Actualiza `status_message` cada PROGRESS_UPDATE_INTERVAL segundos (y siempre
+    Actualiza `status_message` cada progress_update_interval() segundos (y siempre
     al llegar al 100%) para evitar anti-spam. `text_key` selecciona el texto
     ("downloading_progress"/"uploading_progress"), `log_tag` el prefijo de logs
     y `buttons` los botones a mostrar en cada edición (None = sin botones).
@@ -410,7 +273,7 @@ def _make_transfer_progress_callback(status_message, file_name, text_key, log_ta
             current_time = asyncio.get_running_loop().time()
             # Siempre actualizar si llegamos al 100%, sin importar el intervalo
             is_complete = (current >= total)
-            should_update = (current_time - last_update_time[0] >= PROGRESS_UPDATE_INTERVAL) or is_complete
+            should_update = (current_time - last_update_time[0] >= progress_update_interval()) or is_complete
 
             # Log cuando llegamos al 100%
             if is_complete and not hasattr(progress_callback, 'logged_100'):
@@ -505,19 +368,20 @@ async def _download_to_file(message, temp_file_path, progress_callback):
     """
     document = message.document
     file_size = message.file.size if message.file and message.file.size else 0
+    connections = settings.fast_connections()
     use_fast = (
-        FAST_CONNECTIONS > 1
+        connections > 1
         and document is not None
         and file_size > FAST_TRANSFER_MIN_BYTES
     )
 
     if use_fast:
         try:
-            conns = fast_telethon.connection_count(file_size, FAST_CONNECTIONS)
+            conns = fast_telethon.connection_count(file_size, connections)
             debug(f"[DOWNLOAD] Parallel download: {conns} connection(s) for this file")
             with open(temp_file_path, "wb") as out:
                 await fast_telethon.download_file(
-                    bot, document, out, FAST_CONNECTIONS, progress_callback
+                    bot, document, out, connections, progress_callback
                 )
             return
         except asyncio.CancelledError:
@@ -553,15 +417,16 @@ async def _send_file_fast(entity, file_path, filename, attributes, thumb_path, i
     force_document = not (is_video or is_audio)
     supports_streaming = True if is_video else None
 
-    use_fast = FAST_CONNECTIONS > 1 and file_size > FAST_TRANSFER_MIN_BYTES
+    connections = settings.fast_connections()
+    use_fast = connections > 1 and file_size > FAST_TRANSFER_MIN_BYTES
 
     if use_fast:
         try:
-            conns = fast_telethon.connection_count(file_size, FAST_CONNECTIONS)
+            conns = fast_telethon.connection_count(file_size, connections)
             debug(f"[UPLOAD] Parallel upload: {conns} connection(s) for {filename}")
             with open(file_path, "rb") as f:
                 handle = await fast_telethon.upload_file(
-                    bot, f, file_size, FAST_CONNECTIONS, progress_callback
+                    bot, f, file_size, connections, progress_callback
                 )
             return await bot.send_file(
                 entity,
@@ -590,6 +455,11 @@ async def _send_file_fast(entity, file_path, filename, attributes, thumb_path, i
     )
 
 
+# Distingue los temporales de dos descargas con el mismo nombre que empiezan
+# en el mismo milisegundo (dos "video.mp4" reenviados a la vez)
+_download_ids = itertools.count(1)
+
+
 async def download_media(event):
     debug(f"[DOWNLOAD] download_media() called for event.id={event.id}")
     message = event.message
@@ -605,8 +475,9 @@ async def download_media(event):
     # El nombre final no se elige hasta terminar: otra descarga con el mismo
     # nombre puede acabar antes y ocuparlo
     timestamp_ms = int(time.time() * 1000)
-    temp_file_path = os.path.join(TEMP_DIR, f"{file_name}_{timestamp_ms}_download")
+    temp_file_path = os.path.join(TEMP_DIR, f"{file_name}_{timestamp_ms}_{next(_download_ids)}_download")
     final_file_path = None
+    downloaded = False
 
     debug(f"[DOWNLOAD] Temporary path: {temp_file_path}")
 
@@ -742,23 +613,11 @@ async def download_media(event):
             else:
                 debug("[DOWNLOAD] No status message to delete")
 
-            # Mostrar información detallada del archivo descargado (sin botones de acción)
-            debug(f"[DOWNLOAD] Calling handle_success for: {final_file_path}")
-            try:
-                await handle_success(event, final_file_path, show_action_buttons=False)
-                debug("[DOWNLOAD] ✅ handle_success completed")
-            except Exception as success_error:
-                error(f"[DOWNLOAD] ❌ Error in handle_success: {success_error}")
-                error(f"[DOWNLOAD] Success error type: {type(success_error).__name__}")
-                import traceback
-                error(f"[DOWNLOAD] Traceback: {traceback.format_exc()}")
-                # Re-lanzar para que se capture en el except general
-                raise
-
             debug(f"[DOWNLOAD] ✅ File {file_name} - Downloaded successfully")
 
             # Salir del bucle si la descarga fue exitosa
             debug("[DOWNLOAD] Breaking from retry loop")
+            downloaded = True
             break
 
         except asyncio.CancelledError:
@@ -879,12 +738,46 @@ async def download_media(event):
                         except Exception as msg_error:
                             error(f"[DOWNLOAD] Error updating status message: {msg_error}")
             else:
-                # Error que NO debe reintentar - loguear y re-lanzar
+                # Error que NO debe reintentar - limpiar, avisar y re-lanzar
                 error(f"[DOWNLOAD] ❌ Non-retryable error, re-raising: {error_type} - {error_msg}")
+                # Sin reintento nadie va a usar el temporal: si no se borra, el
+                # fichero entero se queda en TEMP_DIR hasta el siguiente arranque
+                if os.path.exists(temp_file_path):
+                    try:
+                        os.remove(temp_file_path)
+                        debug(f"[DOWNLOAD] Temp file deleted after non-retryable error: {temp_file_path}")
+                    except Exception as cleanup_error:
+                        warning(f"[DOWNLOAD] Error deleting {temp_file_path}: {cleanup_error}")
+                # Quien llama solo lo loguea: sin esto el usuario se queda con
+                # "Descargando..." y un Cancelar que ya no cancela nada
+                if status_message:
+                    try:
+                        await safe_edit(
+                            status_message,
+                            get_text("error_download_failed_user", file_name),
+                            buttons=None,
+                            parse_mode=PARSE_MODE
+                        )
+                    except Exception as msg_error:
+                        error(f"[DOWNLOAD] Error updating status message: {msg_error}")
                 raise
 
-    # Si llegamos aquí, el bucle terminó sin break (todos los intentos fallaron)
     debug(f"[DOWNLOAD] Exited retry loop for {file_name}")
+
+    # Mostrar información detallada del archivo descargado (sin botones de
+    # acción). Va fuera del bucle de reintentos: el fichero ya está en su
+    # carpeta y un fallo al avisar (p. ej. timeout de la cola) no puede
+    # volver a descargarlo
+    if downloaded:
+        debug(f"[DOWNLOAD] Calling handle_success for: {final_file_path}")
+        try:
+            await handle_success(event, final_file_path, show_action_buttons=False)
+            debug("[DOWNLOAD] ✅ handle_success completed")
+        except Exception as success_error:
+            error(f"[DOWNLOAD] ❌ Error in handle_success: {success_error}")
+            error(f"[DOWNLOAD] Success error type: {type(success_error).__name__}")
+            import traceback
+            error(f"[DOWNLOAD] Traceback: {traceback.format_exc()}")
 
     # Limpiar tareas activas
     active_tasks.pop(event.id, None)
@@ -908,8 +801,8 @@ def get_extraction_message_and_buttons(extract_result, filename, extracted_path,
     if extract_result == True:
         # Extracción exitosa
         msg = f"✅ **{get_text('extraction_success_title')}**\n\n"
-        msg += f"📄 **{get_text('extraction_file')}:** `{filename}`\n"
-        msg += f"📁 **{get_text('extraction_folder')}:** `{os.path.basename(extracted_path)}`\n\n"
+        msg += f"📄 **{get_text('extraction_file')}:** {md_code(filename)}\n"
+        msg += f"📁 **{get_text('extraction_folder')}:** {md_code(os.path.basename(extracted_path))}\n\n"
         msg += get_text('extraction_ask_delete')
 
         if from_manage:
@@ -940,7 +833,7 @@ def get_extraction_message_and_buttons(extract_result, filename, extracted_path,
     elif extract_result == "missing_parts":
         # Faltan partes del archivo RAR
         msg = f"❌ **{get_text('extraction_missing_parts_title')}**\n\n"
-        msg += f"📄 `{filename}`\n\n"
+        msg += f"📄 {md_code(filename)}\n\n"
         msg += get_text('extraction_missing_parts_desc')
 
         if from_manage:
@@ -954,7 +847,7 @@ def get_extraction_message_and_buttons(extract_result, filename, extracted_path,
     elif extract_result == "partial":
         # Extracción parcial - se borra automáticamente
         msg = f"❌ **{get_text('extraction_partial_title')}**\n\n"
-        msg += f"📄 `{filename}`\n\n"
+        msg += f"📄 {md_code(filename)}\n\n"
         msg += get_text('extraction_partial_desc')
 
         if from_manage:
@@ -968,7 +861,7 @@ def get_extraction_message_and_buttons(extract_result, filename, extracted_path,
     elif extract_result == "corrupted":
         # Archivo corrupto o incompleto
         msg = f"❌ **{get_text('extraction_corrupted_title')}**\n\n"
-        msg += f"📄 `{filename}`\n\n"
+        msg += f"📄 {md_code(filename)}\n\n"
         msg += get_text('extraction_corrupted_desc')
 
         if from_manage:
@@ -982,7 +875,7 @@ def get_extraction_message_and_buttons(extract_result, filename, extracted_path,
     else:
         # Error general en la extracción
         msg = f"❌ **{get_text('extraction_error_title')}**\n\n"
-        msg += f"📄 `{filename}`\n\n"
+        msg += f"📄 {md_code(filename)}\n\n"
         msg += get_text('extraction_error_desc')
 
         if from_manage:
@@ -1016,7 +909,10 @@ def get_file_name(media):
 
 
 
-@bot.on(events.NewMessage(pattern=r"/(start|donate|version|donors|list|manage)"))
+# Anclado: el comando, opcionalmente con @bot, y fin o argumentos. Sin anclar,
+# "/listado" o "/list video" entraban aquí, no casaban con ningún comando y el
+# mensaje del usuario se borraba sin respuesta
+@bot.on(events.NewMessage(pattern=r"^/(start|donate|version|donors|list|manage)(?:@\w+)?(?:\s|$)"))
 async def handle_start(event):
     # Borrar el comando del usuario para mantener el chat limpio
     try:
@@ -1028,18 +924,28 @@ async def handle_start(event):
         debug(f"[AUTH] User {event.sender_id} is not an admin and tried to use the bot")
         response = get_text("user_not_admin")
         await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE)
-    elif event.raw_text == "/start":
+        return
+
+    command = event.pattern_match.group(1)
+    stats.count(f"cmd_{command}")
+    # Lo que va tras el comando (solo /list lo usa: /list <categoría>)
+    has_args = len(event.raw_text.split()) > 1
+    if command == "start":
         response = get_text("welcome_message")
         await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE)
-    elif event.raw_text == "/donate":
+    elif command == "donate":
         response = get_text("donate")
         await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE)
-    elif event.raw_text == "/version":
+    elif command == "version":
         response = get_text("version", VERSION)
         await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE)
-    elif event.raw_text == "/donors":
+    elif command == "donors":
         await print_donors(event.chat_id)
-    elif event.raw_text == "/list":
+    elif command == "list" and has_args:
+        # /list video: directamente el listado de esa categoría
+        debug(f"[LIST] /list command received with arguments: {event.raw_text}")
+        await handle_list_files(event)
+    elif command == "list":
         debug("[LIST] /list command received")
 
         # Mostrar menú de categorías
@@ -1048,7 +954,7 @@ async def handle_start(event):
         msg = get_text("list_select_category")
         await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE)
         debug("[LIST] Menu sent")
-    elif event.raw_text == "/manage":
+    elif command == "manage":
         # Borrar el comando del usuario
         try:
             await event.delete()
@@ -1071,7 +977,7 @@ async def handle_start(event):
             buttons.append(row)
 
         # Agregar botón de cerrar
-        buttons.append([Button.inline("❌ Cerrar", data="close")])
+        buttons.append([Button.inline(get_text("button_close"), data="close")])
 
         msg = get_text("manage_select_category")
         await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE)
@@ -1101,6 +1007,27 @@ async def cancel_download(event):
         # Ya fue cancelada o terminada, borrar el mensaje
         await safe_delete(event)
 
+def content_disposition_filename(content_disposition):
+    """El nombre de fichero de una cabecera Content-Disposition, o None.
+
+    `filename*=UTF-8''Informe%20final.pdf` (RFC 6266/5987) va codificado y,
+    si viene, manda sobre `filename=`, que los servidores suelen dejar como
+    alternativa en ASCII para clientes antiguos.
+    """
+    extended = re.search(r"filename\*\s*=\s*([\w!#$&+.^`|~-]+)'[^']*'([^;\s]+)", content_disposition, re.IGNORECASE)
+    if extended:
+        charset, value = extended.groups()
+        try:
+            return unquote(value, encoding=charset, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            return unquote(value)
+    plain = re.search(r'filename\s*=\s*("([^"]*)"|[^;\n]*)', content_disposition, re.IGNORECASE)
+    if plain:
+        name = plain.group(2) if plain.group(2) is not None else plain.group(1)
+        return name.strip().strip('\'"') or None
+    return None
+
+
 async def is_direct_download_url(url):
     """
     Detecta si una URL es un enlace directo a un archivo descargable.
@@ -1125,8 +1052,15 @@ async def is_direct_download_url(url):
         parsed = urlparse(url)
         path = unquote(parsed.path)
 
-        # Verificar si termina con una extensión conocida
+        # Una página web nunca es descarga directa: aunque .html cuente como
+        # ebook al llegar por Telegram, aquí es una página (una noticia con
+        # vídeo, p. ej.) y la tiene que analizar yt-dlp
         path_lower = path.lower()
+        if path_lower.endswith(tuple(EXTENSIONS_WEBPAGE)):
+            debug(f"[DIRECT_DOWNLOAD] Web page, not a direct download: {url}")
+            return False, None, None, None, None
+
+        # Verificar si termina con una extensión conocida
         for ext in all_extensions:
             if path_lower.endswith(ext):
                 # Extraer nombre del archivo
@@ -1169,13 +1103,8 @@ async def is_direct_download_url(url):
             content_disposition = response.headers.get('Content-Disposition', '')
 
             # Si tiene Content-Disposition con filename, es descarga directa
-            if 'attachment' in content_disposition or 'filename=' in content_disposition:
-                # Extraer filename del header
-                filename_match = re.search(r'filename[^;=\n]*=(([\'"]).*?\2|[^;\n]*)', content_disposition)
-                if filename_match:
-                    filename = filename_match.group(1).strip('\'"')
-                else:
-                    filename = os.path.basename(path) or 'download'
+            if 'attachment' in content_disposition or 'filename' in content_disposition:
+                filename = content_disposition_filename(content_disposition) or os.path.basename(path) or 'download'
                 # El nombre lo elige el servidor: sin sanear, "../../x" o "/x"
                 # escribirían fuera de la carpeta de descargas
                 filename = sanitize_filename(os.path.basename(filename.replace('\\', '/')) or 'download')
@@ -1359,6 +1288,59 @@ async def detect_content_type(url):
         warning(f"[YT-DLP] Error detecting content type: {e}")
         return "unknown"
 
+def ytdlp_settings_args(is_audio):
+    """Las opciones de yt-dlp que salen de /settings: formato, calidad,
+    etiquetas, SponsorBlock y tamaño máximo.
+
+    El vídeo se limita con `-S res:N` y no con un filtro `[height<=N]`: res
+    es el lado corto, así que un vídeo vertical de 1080x1920 cuenta como
+    1080p, y si no hay nada por debajo del límite yt-dlp baja lo más pequeño
+    que haya en vez de fallar.
+
+    Preferir lo compatible pide H.264 y AAC, que Telegram reproduce y yt-dlp
+    junta directamente en un MP4: sin eso, YouTube da AV1 o VP9 y cada vídeo
+    pasa por la conversión completa. El orden importa: el códec de vídeo va
+    antes que la resolución (YouTube no tiene H.264 por encima de 1080p, y es
+    lo que se acepta a cambio), y la resolución antes que el audio, porque si
+    no gana el único formato que trae AAC dentro, el combinado de 360p.
+    """
+    if is_audio:
+        if settings.audio_format() == "M4A":
+            # El AAC que ya trae el vídeo, sin recodificar si lo hay
+            args = ["-f", "bestaudio[ext=m4a]/bestaudio", "--extract-audio", "--audio-format", "m4a"]
+        else:
+            args = ["-f", "bestaudio", "--extract-audio", "--audio-format", "mp3"]
+            bitrate = settings.AUDIO_BITRATES[settings.audio_quality()]
+            if bitrate is not None:
+                args += ["--audio-quality", bitrate]
+        if settings.audio_tags():
+            # La miniatura de YouTube suele ser WebP, que un MP3 no admite
+            args += ["--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg"]
+    else:
+        args = ["-f", "bv*+ba/best"]
+        quality = settings.video_quality()
+        compatible = settings.prefer_compatible()
+        order = []
+        if compatible:
+            order.append("vcodec:h264")
+        if quality != "MAX":
+            order.append(f"res:{quality}")
+        elif compatible:
+            order.append("res")
+        if compatible:
+            order.append("acodec:aac")
+        if order:
+            args += ["-S", ",".join(order)]
+
+    categories = settings.SPONSORBLOCK_CATEGORIES[settings.sponsorblock()]
+    if categories:
+        args += ["--sponsorblock-remove", categories]
+    max_size = settings.max_size_mb()
+    if max_size:
+        args += ["--max-filesize", f"{max_size}M"]
+    return args
+
+
 def ytdlp_output_template(timestamp):
     """Plantilla `-o` para yt-dlp, con la marca temporal que se limpia después.
 
@@ -1391,8 +1373,12 @@ def is_ytdlp_partial(path):
 
 
 def clean_temp_filename(filename):
-    """Quita la marca temporal del nombre: "video_temp123.mp4" -> "video.mp4"."""
-    return re.sub(r'_temp\d+\.', '.', filename)
+    """Quita la marca temporal del nombre: "video_temp123.mp4" -> "video.mp4".
+
+    Solo la última: el título puede contener algo parecido ("Prueba_temp2.final")
+    y eso es parte del nombre.
+    """
+    return re.sub(r'_temp\d+(\.[^.]*)$', r'\1', filename)
 
 
 async def move_download_to(temp_file_path, final_output_dir):
@@ -1513,7 +1499,7 @@ def build_ffmpeg_conversion_command(input_path, output_path, hardware=None, qual
         ])
         return command
 
-    hardware = (hardware or FFMPEG_HW).strip().upper()
+    hardware = (hardware or settings.ffmpeg_hw()).strip().upper()
     hw_profiles = {
         "NONE": ("libx264", []),
         "VAAPI": ("h264_vaapi", [
@@ -1538,8 +1524,19 @@ def build_ffmpeg_conversion_command(input_path, output_path, hardware=None, qual
 
     command.extend(["-i", input_path])
 
+    command.extend(["-c:v", video_encoder])
+    if hardware == "NONE":
+        # Telegram solo reproduce H.264 4:2:0 de 8 bits: sin forzarlo, libx264
+        # conserva el 4:4:4 o los 10 bits del origen (High 4:4:4 / High 10).
+        # El 4:2:0 exige ancho y alto pares, así que se redondean (un 161x121
+        # haría fallar la conversión). Solo en software: con GPU el frame está
+        # en memoria de vídeo y estos filtros no valen; si el encoder hardware
+        # no acepta el formato del origen, ffmpeg falla y se reintenta aquí
+        command.extend([
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-pix_fmt", "yuv420p",
+        ])
     command.extend([
-        "-c:v", video_encoder,
         "-c:a", "aac",
         "-movflags", "+faststart",
         "-progress", "pipe:1",
@@ -1566,13 +1563,20 @@ def build_ffmpeg_conversion_command(input_path, output_path, hardware=None, qual
     return command
 
 
-@bot.on(events.NewMessage(pattern=r'https?://[^\s]+'))
+URL_IN_TEXT_RE = re.compile(r'https?://\S+')
+
+
+@bot.on(events.NewMessage(pattern=URL_IN_TEXT_RE))
 async def handle_url_link(event):
     if await check_admin_and_warn(event):
         return
 
-    url = event.raw_text.strip()
+    # Solo el enlace: el patrón acepta un mensaje que empieza por la URL y
+    # sigue con texto ("https://... mira esto"), y ese texto no puede acabar
+    # dentro de la URL que se le pasa a la detección y a yt-dlp
+    url = URL_IN_TEXT_RE.search(event.raw_text).group(0)
     url_id = str(event.id)
+    claimed_urls.discard(url_id)
     # Almacenar URL con información de playlist (se actualizará si es playlist)
     pending_urls[url_id] = {"url": url, "playlist_count": 1}
 
@@ -1610,6 +1614,7 @@ async def handle_url_link(event):
             )
 
         # Iniciar descarga directa
+        stats.count("url_direct")
         task = asyncio.create_task(run_direct_download(event, url, filename, status_message, download_path, icon, direct_type))
         active_tasks[event.id] = task
         return
@@ -1621,6 +1626,13 @@ async def handle_url_link(event):
         debug(f"[PLAYLIST] Detected playlist with {playlist_count} videos: {playlist_title}")
         # Almacenar el playlist_count para usarlo después
         pending_urls[url_id]["playlist_count"] = playlist_count
+
+        # Con un modo fijo en /settings, seguir sin preguntar
+        playlist_mode = settings.playlist_mode()
+        if playlist_mode != "ASK":
+            stats.count("url_playlist")
+            await continue_playlist(event, analyzing_msg, url_id, playlist_mode.lower())
+            return
 
         # Preguntar al usuario si quiere descargar toda la playlist o solo el primero
         buttons = [
@@ -1640,61 +1652,13 @@ async def handle_url_link(event):
     # No es descarga directa ni playlist - usar yt-dlp para detectar tipo de contenido
     content_type = await detect_content_type(url)
 
-    # Si AUTO_DOWNLOAD_FORMAT está configurado, descargar automáticamente sin preguntar
-    if AUTO_DOWNLOAD_FORMAT in ["VIDEO", "AUDIO"]:
+    # Con un formato automático en /settings, descargar sin preguntar
+    auto_format = settings.auto_format()
+    if auto_format in ["VIDEO", "AUDIO"]:
         url_data = pending_urls.pop(url_id, None)
         playlist_count = url_data.get("playlist_count", 1) if url_data else 1
-        is_audio = AUTO_DOWNLOAD_FORMAT == "AUDIO"
-
-        format_flag = "bestaudio" if is_audio else "bv*+ba/best"
-        final_output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
-
-        # Editar mensaje de análisis o crear uno nuevo si no existe
-        if analyzing_msg:
-            status_message = await safe_edit(
-                analyzing_msg,
-                get_text("downloading", AUD_ICO if is_audio else VID_ICO),
-                buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-                parse_mode=PARSE_MODE,
-                wait_for_result=True
-            )
-        else:
-            status_message = await safe_reply(
-                event,
-                get_text("downloading", AUD_ICO if is_audio else VID_ICO),
-                buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-                parse_mode=PARSE_MODE,
-                wait_for_result=False
-            )
-
-        # Usar timestamp para evitar sobrescribir archivos durante la descarga
-        timestamp = int(time.time() * 1000)  # Timestamp en milisegundos
-        # Incluir índice de playlist en el template para evitar sobrescrituras
-        temp_template = ytdlp_output_template(timestamp)
-
-        cmd = [
-            "yt-dlp",
-            "-f", format_flag,
-            "--restrict-filenames",
-            "--newline",
-            "--progress",  # Forzar mostrar progreso
-            "-o", os.path.join(TEMP_DIR, temp_template),  # Descargar a /tmp
-            url
-        ]
-        cmd = add_ytdlp_cookies(cmd)
-
-        # Calcular delay automático basado en el número de vídeos
-        sleep_interval = calculate_ytdlp_sleep_interval(playlist_count)
-
-        if sleep_interval > 0:
-            cmd.extend(["--sleep-interval", str(sleep_interval)])
-            debug(f"[URL_DOWNLOAD] Auto-calculated sleep interval: {sleep_interval}s for {playlist_count} video(s)")
-
-        if is_audio:
-            cmd.extend(["--extract-audio", "--audio-format", "mp3"])
-
-        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=playlist_count, temp_marker=ytdlp_temp_marker(timestamp)))
-        active_tasks[event.id] = task
+        stats.count(f"url_{auto_format.lower()}")
+        await start_ytdlp_download(event, analyzing_msg, url, auto_format == "AUDIO", playlist_count)
         return
 
     # Crear botones según el tipo de contenido
@@ -1908,6 +1872,36 @@ async def handle_extracted_delete_compressed(event):
         await safe_edit(event, get_text("error_deleting_user", file_path), buttons=None, parse_mode=PARSE_MODE)
         error(f"[FILE_DELETE] Error deleting {file_path}: {e}")
 
+# Solicitudes que ya ha reclamado un botón (su descarga está en marcha o ha
+# terminado). Un segundo clic sobre el mismo mensaje no las encuentra en
+# pending_urls, pero no ha caducado: el mensaje ya muestra el progreso de la
+# descarga y no hay que taparlo con "solicitud expirada". Son ids de mensaje,
+# así que ocupan poco aunque no se vacíe.
+claimed_urls = set()
+
+
+def claim_pending_url(url_id):
+    """Saca la solicitud de pending_urls (atómico) y la marca como reclamada."""
+    url_data = pending_urls.pop(url_id, None)
+    if url_data is not None:
+        claimed_urls.add(url_id)
+    return url_data
+
+
+async def answer_unclaimable_url(target, url_id):
+    """Un botón cuya solicitud ya no está en pending_urls.
+
+    Si la reclamó otro clic (doble clic), no se dice nada: el clic ya se ha
+    respondido y el mensaje es el del progreso. Si no, ha caducado (p. ej.
+    tras reiniciar el bot) y se avisa.
+    """
+    if url_id in claimed_urls:
+        debug(f"[URL_DOWNLOAD] Request {url_id} already claimed, ignoring repeated click")
+        return
+    if target is not None:
+        await safe_edit(target, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
+
+
 @bot.on(events.CallbackQuery(pattern=b"playlist_(full|first):(.+)"))
 async def handle_playlist_selection(event):
     """Maneja la selección de descargar playlist completa o solo primer video"""
@@ -1915,105 +1909,46 @@ async def handle_playlist_selection(event):
         return
 
     await safe_answer(event)
+    stats.count("url_playlist")
     playlist_mode = event.pattern_match.group(1).decode()  # "full" o "first"
     url_id = event.pattern_match.group(2).decode()
 
+    debug(f"[PLAYLIST] User selected: {playlist_mode} for URL ID: {url_id}")
+    await continue_playlist(event, event, url_id, playlist_mode)
+
+
+async def continue_playlist(event, target, url_id, playlist_mode):
+    """Sigue con una playlist una vez decidido si va entera ("full") o solo el
+    primero ("first"): descarga ya si hay formato automático, o pregunta el
+    formato editando `target` (el mensaje con los botones, o el de análisis).
+    """
     url_data = pending_urls.get(url_id)
     if not url_data:
-        await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
+        await answer_unclaimable_url(target, url_id)
         return
 
-    url = url_data["url"]
-    playlist_count = url_data.get("playlist_count", 1)
-
-    debug(f"[PLAYLIST] User selected: {playlist_mode} for URL ID: {url_id} (playlist_count: {playlist_count})")
-
-    # Si AUTO_DOWNLOAD_FORMAT está configurado, no preguntar formato
-    if AUTO_DOWNLOAD_FORMAT in ["AUDIO", "VIDEO"]:
-        debug(f"[PLAYLIST] AUTO_DOWNLOAD_FORMAT={AUTO_DOWNLOAD_FORMAT}, skipping format selection")
-        # Simular selección de formato automática
-        format_type = AUTO_DOWNLOAD_FORMAT.lower()
-
+    # Con un formato automático en /settings, no preguntar formato
+    auto_format = settings.auto_format()
+    if auto_format in ["AUDIO", "VIDEO"]:
+        debug(f"[PLAYLIST] auto format={auto_format}, skipping format selection")
         # Reclamar atómicamente para evitar doble descarga por doble click:
         # el segundo click obtiene None y sale (el branch ASK no necesita esto)
-        if pending_urls.pop(url_id, None) is None:
+        if claim_pending_url(url_id) is None:
             return
-        is_audio = format_type == "audio"
-        download_full_playlist = playlist_mode == "full"
-
-        debug(f"[PLAYLIST] Downloading {'full playlist' if download_full_playlist else 'first video only'} as {format_type}")
-
-        format_flag = "bestaudio" if is_audio else "bv*+ba/best"
-        final_output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
-
-        status_message = await safe_edit(
-            event,
-            get_text("downloading", AUD_ICO if is_audio else VID_ICO),
-            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-            parse_mode=PARSE_MODE,
-            wait_for_result=True
-        )
-
-        if status_message is None:
-            status_message = await safe_reply(
-                event,
-                get_text("downloading", AUD_ICO if is_audio else VID_ICO),
-                buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-                parse_mode=PARSE_MODE,
-                wait_for_result=False
-            )
-
-        # Usar timestamp para evitar sobrescribir archivos durante la descarga
-        timestamp = int(time.time() * 1000)
-        # Incluir índice de playlist en el template para evitar sobrescrituras
-        temp_template = ytdlp_output_template(timestamp)
-
-        cmd = [
-            "yt-dlp",
-            "-f", format_flag,
-            "--restrict-filenames",
-            "--newline",
-            "--progress",
-            "-o", os.path.join(TEMP_DIR, temp_template),
-            url
-        ]
-        cmd = add_ytdlp_cookies(cmd)
-
-        # Si solo quiere el primer video, agregar --no-playlist
-        if not download_full_playlist:
-            cmd.insert(1, "--no-playlist")
-            debug("[PLAYLIST] Added --no-playlist flag")
-        else:
-            # En playlists completas, omitir vídeos no disponibles para no abortar el resto
-            cmd.insert(1, "--ignore-errors")
-            debug("[PLAYLIST] Added --ignore-errors flag for full playlist")
-
-        # Calcular delay automático basado en el número de vídeos
-        # Si download_full_playlist es False, solo descarga 1 vídeo
-        videos_to_download = playlist_count if download_full_playlist else 1
-        sleep_interval = calculate_ytdlp_sleep_interval(videos_to_download)
-
-        if sleep_interval > 0:
-            cmd.extend(["--sleep-interval", str(sleep_interval)])
-            debug(f"[URL_DOWNLOAD] Auto-calculated sleep interval: {sleep_interval}s for {videos_to_download} video(s)")
-
-        if is_audio:
-            cmd.extend(["--extract-audio", "--audio-format", "mp3"])
-
-        # Pasar el número total de vídeos solo si es playlist completa
-        total_vids = playlist_count if download_full_playlist else 1
-        task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist, total_videos=total_vids, temp_marker=ytdlp_temp_marker(timestamp)))
-        active_tasks[event.id] = task
+        await start_ytdlp_download(event, target, url_data["url"], auto_format == "AUDIO",
+                                   url_data.get("playlist_count", 1), playlist_mode)
         return
 
-    # Si AUTO_DOWNLOAD_FORMAT=ASK, preguntar el formato (audio o video)
+    # Si el formato automático es ASK, preguntar el formato (audio o video)
     buttons = [
         [Button.inline(get_text("audio", AUD_ICO), data=f"playlistfmt_{playlist_mode}_audio:{url_id}"),
          Button.inline(get_text("video", VID_ICO), data=f"playlistfmt_{playlist_mode}_video:{url_id}")],
         [Button.inline(get_text("button_cancel"), data=f"simplecancel:{url_id}")]
     ]
-
-    await safe_edit(event, get_text("dowload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
+    if target is not None:
+        await safe_edit(target, get_text("dowload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
+    else:
+        await safe_reply(event, get_text("dowload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
 
 @bot.on(events.CallbackQuery(pattern=b"playlistfmt_(full|first)_(audio|video):(.+)"))
 async def handle_playlist_format_selection(event):
@@ -2027,9 +1962,9 @@ async def handle_playlist_format_selection(event):
     url_id = event.pattern_match.group(3).decode()
 
     # pop atómico para evitar dobles ejecuciones por doble click (doble descarga)
-    url_data = pending_urls.pop(url_id, None)
+    url_data = claim_pending_url(url_id)
     if not url_data:
-        await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
+        await answer_unclaimable_url(event, url_id)
         return
 
     url = url_data["url"]
@@ -2038,68 +1973,7 @@ async def handle_playlist_format_selection(event):
     download_full_playlist = playlist_mode == "full"
 
     debug(f"[PLAYLIST] Downloading {'full playlist' if download_full_playlist else 'first video only'} as {format_type} (playlist_count: {playlist_count})")
-
-    format_flag = "bestaudio" if is_audio else "bv*+ba/best"
-    final_output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
-
-    status_message = await safe_edit(
-        event,
-        get_text("downloading", AUD_ICO if is_audio else VID_ICO),
-        buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-        parse_mode=PARSE_MODE,
-        wait_for_result=True
-    )
-
-    if status_message is None:
-        status_message = await safe_reply(
-            event,
-            get_text("downloading", AUD_ICO if is_audio else VID_ICO),
-            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-            parse_mode=PARSE_MODE,
-            wait_for_result=False
-        )
-
-    # Usar timestamp para evitar sobrescribir archivos durante la descarga
-    timestamp = int(time.time() * 1000)
-    # Incluir índice de playlist en el template para evitar sobrescrituras
-    temp_template = ytdlp_output_template(timestamp)
-
-    cmd = [
-        "yt-dlp",
-        "-f", format_flag,
-        "--restrict-filenames",
-        "--newline",
-        "--progress",
-        "-o", os.path.join(TEMP_DIR, temp_template),
-        url
-    ]
-    cmd = add_ytdlp_cookies(cmd)
-
-    # Si solo quiere el primer video, agregar --no-playlist
-    if not download_full_playlist:
-        cmd.insert(1, "--no-playlist")
-        debug("[PLAYLIST] Added --no-playlist flag")
-    else:
-        # En playlists completas, omitir vídeos no disponibles para no abortar el resto
-        cmd.insert(1, "--ignore-errors")
-        debug("[PLAYLIST] Added --ignore-errors flag for full playlist")
-
-    # Calcular delay automático basado en el número de vídeos
-    # Si download_full_playlist es False, solo descarga 1 vídeo
-    videos_to_download = playlist_count if download_full_playlist else 1
-    sleep_interval = calculate_ytdlp_sleep_interval(videos_to_download)
-
-    if sleep_interval > 0:
-        cmd.extend(["--sleep-interval", str(sleep_interval)])
-        debug(f"[URL_DOWNLOAD] Auto-calculated sleep interval: {sleep_interval}s for {videos_to_download} video(s)")
-
-    if is_audio:
-        cmd.extend(["--extract-audio", "--audio-format", "mp3"])
-
-    # Pasar el número total de vídeos solo si es playlist completa
-    total_vids = playlist_count if download_full_playlist else 1
-    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=download_full_playlist, total_videos=total_vids, temp_marker=ytdlp_temp_marker(timestamp)))
-    active_tasks[event.id] = task
+    await start_ytdlp_download(event, event, url, is_audio, playlist_count, playlist_mode)
 
 @bot.on(events.CallbackQuery(pattern=b"url_(audio|video):(.+)"))
 async def handle_format_selection(event):
@@ -2111,63 +1985,72 @@ async def handle_format_selection(event):
     url_id = event.pattern_match.group(2).decode()
 
     # pop atómico para evitar dobles ejecuciones por doble click (doble descarga)
-    url_data = pending_urls.pop(url_id, None)
+    url_data = claim_pending_url(url_id)
     if not url_data:
-        await safe_edit(event, get_text("error_url_expired"), buttons=None, parse_mode=PARSE_MODE)
+        await answer_unclaimable_url(event, url_id)
         return
+    stats.count(f"url_{format_type}")
 
     url = url_data["url"]
     playlist_count = url_data.get("playlist_count", 1)
-    is_audio = format_type == "audio"
+    await start_ytdlp_download(event, event, url, format_type == "audio", playlist_count)
 
-    format_flag = "bestaudio" if is_audio else "bv*+ba/best"
+
+async def start_ytdlp_download(event, target, url, is_audio, playlist_count=1, playlist_mode=None):
+    """Lanza yt-dlp para un enlace con las opciones de /settings.
+
+    `target` es el mensaje que pasa a ser el de progreso (el de análisis o el
+    que tenía los botones); si no se puede editar, se envía uno nuevo.
+    `playlist_mode` es None para un vídeo suelto, "first" para quedarse con el
+    primero de una playlist o "full" para bajarla entera, hasta el tope
+    configurado.
+    """
     final_output_dir = DOWNLOAD_PATHS["url_audio"] if is_audio else DOWNLOAD_PATHS["url_video"]
+    text = get_text("downloading", AUD_ICO if is_audio else VID_ICO)
+    buttons = [Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")]
 
-    status_message = await safe_edit(
-        event,
-        get_text("downloading", AUD_ICO if is_audio else VID_ICO),
-        buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-        parse_mode=PARSE_MODE,
-        wait_for_result=True
-    )
-
+    status_message = None
+    if target is not None:
+        status_message = await safe_edit(target, text, buttons=buttons, parse_mode=PARSE_MODE, wait_for_result=True)
     # Si no se pudo editar el mensaje (timeout en cola), crear uno nuevo
     if status_message is None:
-        status_message = await safe_reply(
-            event,
-            get_text("downloading", AUD_ICO if is_audio else VID_ICO),
-            buttons=[Button.inline(get_text("button_cancel"), data=f"cancel:{event.id}")],
-            parse_mode=PARSE_MODE,
-            wait_for_result=False
-        )
+        status_message = await safe_reply(event, text, buttons=buttons, parse_mode=PARSE_MODE, wait_for_result=False)
 
     # Usar timestamp para evitar sobrescribir archivos durante la descarga
-    timestamp = int(time.time() * 1000)  # Timestamp en milisegundos
-    # Incluir índice de playlist en el template para evitar sobrescrituras
-    temp_template = ytdlp_output_template(timestamp)
-
+    timestamp = int(time.time() * 1000)
     cmd = [
         "yt-dlp",
-        "-f", format_flag,
+        *ytdlp_settings_args(is_audio),
         "--restrict-filenames",
         "--newline",  # Cada línea de progreso completa (para parsear en tiempo real)
         "--progress",  # Forzar mostrar progreso
-        "-o", os.path.join(TEMP_DIR, temp_template),  # Descargar a /tmp
+        # Incluye el índice de playlist para evitar sobrescrituras
+        "-o", os.path.join(TEMP_DIR, ytdlp_output_template(timestamp)),  # Descargar a /tmp
         url
     ]
     cmd = add_ytdlp_cookies(cmd)
 
-    # Calcular delay automático basado en el número de vídeos (siempre 1 en este caso)
-    sleep_interval = calculate_ytdlp_sleep_interval(playlist_count)
+    full_playlist = playlist_mode == "full"
+    total_videos = playlist_count
+    if playlist_mode == "first":
+        cmd.insert(1, "--no-playlist")
+        total_videos = 1
+    elif full_playlist:
+        # En playlists completas, omitir vídeos no disponibles para no abortar el resto
+        cmd.insert(1, "--ignore-errors")
+        limit = settings.playlist_limit()
+        if limit:
+            cmd[1:1] = ["--playlist-end", str(limit)]
+            total_videos = min(playlist_count, limit) if playlist_count else limit
+    debug(f"[URL_DOWNLOAD] playlist mode={playlist_mode}, videos={total_videos}")
 
+    # Calcular delay automático basado en el número de vídeos
+    sleep_interval = calculate_ytdlp_sleep_interval(total_videos)
     if sleep_interval > 0:
         cmd.extend(["--sleep-interval", str(sleep_interval)])
-        debug(f"[URL_DOWNLOAD] Auto-calculated sleep interval: {sleep_interval}s for {playlist_count} video(s)")
+        debug(f"[URL_DOWNLOAD] Auto-calculated sleep interval: {sleep_interval}s for {total_videos} video(s)")
 
-    if is_audio:
-        cmd.extend(["--extract-audio", "--audio-format", "mp3"])
-
-    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=False, total_videos=playlist_count, temp_marker=ytdlp_temp_marker(timestamp)))
+    task = asyncio.create_task(run_url_download(event, cmd, status_message, final_output_dir, is_full_playlist=full_playlist, total_videos=total_videos, temp_marker=ytdlp_temp_marker(timestamp)))
     active_tasks[event.id] = task
 
 def parse_progress(line):
@@ -2283,7 +2166,7 @@ async def run_direct_download(event, url, filename, status_message, final_output
 
         # Variables para control de progreso
         last_update_time = 0
-        update_interval = PROGRESS_UPDATE_INTERVAL
+        update_interval = progress_update_interval()
 
         # Leer stderr (wget muestra progreso en stderr)
         async def read_stderr():
@@ -2426,7 +2309,7 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
         # Variables para control de progreso
         stdout_lines = []
         last_update_time = 0
-        update_interval = PROGRESS_UPDATE_INTERVAL  # Intervalo dinámico basado en PARALLEL_DOWNLOADS
+        update_interval = progress_update_interval()  # Intervalo dinámico según las descargas simultáneas
         current_filename = None  # Almacenar el nombre del archivo actual (solo nombre, no path completo)
         current_filepath = None  # Almacenar el path completo del archivo actual
         current_video_index = None  # Índice del vídeo actual en la playlist
@@ -2539,8 +2422,10 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                 warning(f"[URL_DOWNLOAD] yt-dlp exited with code {proc.returncode} but {len(temp_file_paths)} file(s) downloaded. Processing partial result.")
 
             if temp_file_paths:
-                # Si es playlist completa con múltiples archivos, solo almacenar sin mostrar botones
-                if is_full_playlist and len(temp_file_paths) > 1:
+                # Si es playlist completa, solo almacenar sin mostrar botones.
+                # También si de una playlist de varios solo ha quedado uno: hay
+                # que avisar de los que faltan (X/Y), no darlo por un vídeo suelto
+                if is_full_playlist and (len(temp_file_paths) > 1 or (total_videos or 0) > 1):
                     debug(f"[URL_DOWNLOAD] Full playlist detected with {len(temp_file_paths)} files. Storing without action buttons.")
                     stored_files = []
                     stored_paths = []
@@ -2564,11 +2449,12 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                             message = get_text("playlist_stored", icon, len(stored_files))
                         await safe_reply(event, message, parse_mode=PARSE_MODE)
 
-                        # Esta rama no pasa por handle_success, así que AUTO_SEND
-                        # hay que aplicarlo aquí o las playlists se quedarían
-                        # siempre almacenadas sin enviar
-                        if AUTO_SEND in ("SEND", "SEND_DELETE"):
-                            debug(f"[URL_DOWNLOAD] AUTO_SEND={AUTO_SEND}, sending {len(stored_paths)} playlist file(s)")
+                        # Esta rama no pasa por handle_success, así que el envío
+                        # automático hay que aplicarlo aquí o las playlists se
+                        # quedarían siempre almacenadas sin enviar
+                        auto_send = settings.auto_send()
+                        if auto_send in ("SEND", "SEND_DELETE"):
+                            debug(f"[URL_DOWNLOAD] auto send={auto_send}, sending {len(stored_paths)} playlist file(s)")
                             for stored_path in stored_paths:
                                 stored_ext = os.path.splitext(stored_path)[1].lower()
                                 if stored_ext not in EXTENSIONS_VIDEO and stored_ext not in EXTENSIONS_AUDIO:
@@ -2589,11 +2475,11 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
                 warning("[URL_DOWNLOAD] No downloaded files found in yt-dlp output")
                 debug(f"[URL_DOWNLOAD] Command executed: {' '.join(cmd)}")
                 debug(f"[URL_DOWNLOAD] Full stdout: {chr(10).join(stdout_lines)}")
-                await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
+                await safe_reply(event, url_failure_message(stdout_lines), parse_mode=PARSE_MODE)
         else:
             stderr_output = "\n".join(stderr_lines)
             error(f"[URL_DOWNLOAD] URL download failed. Error: {stderr_output}")
-            await safe_reply(event, get_text("error_url_failed_user"), parse_mode=PARSE_MODE)
+            await safe_reply(event, url_failure_message(stdout_lines + stderr_lines), parse_mode=PARSE_MODE)
 
     except asyncio.CancelledError:
         if proc and proc.returncode is None:
@@ -2619,6 +2505,17 @@ async def run_url_download(event, cmd, status_message, final_output_dir, is_full
         # Restos que yt-dlp no llegó a mezclar o borrar (formatos sueltos, .part)
         if temp_marker:
             remove_temp_files(temp_marker)
+
+def url_failure_message(output_lines):
+    """El mensaje para una descarga de enlace que no dejó ningún fichero.
+
+    Si fue el tamaño máximo de /settings, se dice: el error genérico haría
+    pensar que el enlace no funciona, cuando es el bot el que no ha querido.
+    """
+    if any("larger than max-filesize" in line for line in output_lines):
+        return get_text("error_url_too_large", settings.size_label(settings.max_size_mb()))
+    return get_text("error_url_failed_user")
+
 
 def extract_file_paths(stdout_lines):
     """Extrae todas las rutas de archivos descargados (soporta playlists/carruseles)"""
@@ -2659,8 +2556,18 @@ def extract_file_paths(stdout_lines):
                 file_paths.append(current_file)
                 debug(f"[URL_DOWNLOAD] File added to download list: {current_file}")
 
+        # Un fichero que ya estaba en disco: yt-dlp no imprime Destination,
+        # la ruta viene en la propia línea
+        elif already := re.match(r'\[download\] (.+) has already been downloaded', line):
+            current_file = already.group(1).strip()
+            is_partial = is_ytdlp_partial(current_file)
+            if not is_partial and current_file not in file_paths:
+                file_paths.append(current_file)
+                debug(f"[URL_DOWNLOAD] File added to download list: {current_file}")
+            current_file = None
+
         # Detectar finalización de descarga (solo agregar si NO es parcial)
-        elif "[download] 100%" in line or "has already been downloaded" in line:
+        elif "[download] 100%" in line:
             if current_file and not is_partial and current_file not in file_paths:
                 file_paths.append(current_file)
                 debug(f"[URL_DOWNLOAD] File added to download list: {current_file}")
@@ -2848,15 +2755,17 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
                 parse_mode=PARSE_MODE
             )
 
-        selected_hw = "NONE" if _force_software else FFMPEG_HW
+        selected_hw = "NONE" if _force_software else settings.ffmpeg_hw()
+        quality = settings.ffmpeg_quality()
         cmd = build_ffmpeg_conversion_command(
-            input_path, output_path, selected_hw, FFMPEG_QUALITY, plan
+            input_path, output_path, selected_hw, quality, plan
         )
         stream_copy = plan is not None and plan["video"] == "copy"
+        stats.count("convert_remux" if stream_copy else f"convert_{selected_hw.lower()}")
 
         encoder = cmd[cmd.index("-c:v") + 1]
         debug(f"[CONVERSION] Encoder mode: {selected_hw}; video encoder: {encoder}")
-        debug(f"[CONVERSION] Quality: {FFMPEG_QUALITY or 'encoder default'}")
+        debug(f"[CONVERSION] Quality: {quality or 'encoder default'}")
         debug(f"[CONVERSION] Full FFmpeg command: {' '.join(cmd)}")
 
         proc = await asyncio.create_subprocess_exec(
@@ -2896,8 +2805,10 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
 
             line = line.decode().strip()
 
-            # ffmpeg reporta progreso en formato "out_time_ms=XXXXX"
-            if line.startswith("out_time_ms="):
+            # ffmpeg reporta progreso en formato "out_time_ms=XXXXX". Al
+            # principio, antes del primer fotograma, manda "out_time_ms=N/A":
+            # no es un error, simplemente aún no hay progreso
+            if line.startswith("out_time_ms=") and line != "out_time_ms=N/A":
                 try:
                     time_ms = int(line.split("=")[1])
                     time_seconds = time_ms / 1000000  # Convertir microsegundos a segundos
@@ -3024,6 +2935,7 @@ async def convert_video_to_telegram_compatible(input_path, status_message=None, 
             # disponible), reintentar con conversión completa en software
             # para no romper el envío.
             if (stream_copy or selected_hw != "NONE") and not _force_software:
+                stats.count("convert_fallback")
                 failed_mode = "Stream copy" if stream_copy else selected_hw
                 warning(f"[CONVERSION] {failed_mode} failed; retrying with libx264")
                 return await convert_video_to_telegram_compatible(
@@ -3106,8 +3018,12 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
     try:
         debug(f"[SEND] Preparing file send: {file_path}")
 
-        is_video = file_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'))
-        is_audio = os.path.splitext(file_path)[1].lower() in EXTENSIONS_AUDIO
+        # Las mismas extensiones que get_file_info y /manage usan para ofrecerlo
+        # como vídeo: con una lista propia, un .m4v o un .ts se ofrecía como
+        # vídeo pero se enviaba como documento
+        file_ext = os.path.splitext(file_path)[1].lower()
+        is_video = file_ext in EXTENSIONS_VIDEO
+        is_audio = file_ext in EXTENSIONS_AUDIO
         original_filename = os.path.basename(file_path)
         display_filename = original_filename
         attributes = [DocumentAttributeFilename(file_name=original_filename)]
@@ -3212,9 +3128,9 @@ async def send_file_to_telegram(event, file_path, sending_msg=None, delete_after
 
 
 async def send_file_automatically(event, file_path):
-    """Envía un fichero sin preguntar, según AUTO_SEND (SEND o SEND_DELETE).
+    """Envía un fichero sin preguntar, según el envío automático (SEND o SEND_DELETE).
 
-    Comprueba antes el límite de subida de Telegram: con AUTO_SEND activo el
+    Comprueba antes el límite de subida de Telegram: con el envío automático el
     usuario espera recibir el fichero, así que si no cabe hay que decírselo en
     lugar de dejarlo pasar en silencio.
 
@@ -3227,8 +3143,10 @@ async def send_file_automatically(event, file_path):
         await safe_reply(event, get_text("error_file_too_large"), parse_mode=PARSE_MODE)
         return None
 
-    delete_after = AUTO_SEND == "SEND_DELETE"
-    debug(f"[AUTO_SEND] AUTO_SEND={AUTO_SEND}, sending {filename} (delete_after={delete_after})")
+    auto_send = settings.auto_send()
+    delete_after = auto_send == "SEND_DELETE"
+    stats.count("send_auto")
+    debug(f"[AUTO_SEND] auto send={auto_send}, sending {filename} (delete_after={delete_after})")
 
     sending_msg = await safe_reply(
         event,
@@ -3345,11 +3263,12 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
 
         # Solo mostrar botones de acción si se solicita (para descargas de URLs) y solo para video/audio
         debug("[SEND_FILE] Checking if action buttons should be shown...")
-        debug(f"[SEND_FILE] show_action_buttons={show_action_buttons}, file_type={file_type}, AUTO_SEND={AUTO_SEND}")
+        auto_send = settings.auto_send()
+        debug(f"[SEND_FILE] show_action_buttons={show_action_buttons}, file_type={file_type}, auto send={auto_send}")
         if show_action_buttons and file_type in ["video", "audio"]:
-            if AUTO_SEND == "STORE":
-                debug("[SEND_FILE] AUTO_SEND=STORE, keeping file on server without asking")
-            elif AUTO_SEND in ("SEND", "SEND_DELETE"):
+            if auto_send == "STORE":
+                debug("[SEND_FILE] auto send=STORE, keeping file on server without asking")
+            elif auto_send in ("SEND", "SEND_DELETE"):
                 await send_file_automatically(event, file_path)
             elif file_size >= MAX_TELEGRAM_FILE_SIZE:
                 debug("[SEND_FILE] File size is too large to send via Telegram. Maximum size is 2GB")
@@ -3394,6 +3313,7 @@ async def handle_send_choice(event):
     await safe_answer(event)
     action = event.pattern_match.group(1).decode()
     file_id = event.pattern_match.group(2).decode()
+    stats.count(f"btn_{action}")
 
     # Extraer y eliminar atómicamente la entrada para evitar dobles ejecuciones
     # por doble click (condición de carrera): el segundo click obtiene None y sale
@@ -3455,11 +3375,17 @@ async def handle_cancel(status_message, temp_marker=None):
     if temp_marker:
         remove_temp_files(temp_marker)
 
-async def send_startup_message():
+async def send_startup_message(seeded=False):
+    message = get_text("initial_message", VERSION)
+    # Lo que hay que arreglar en el compose se dice aquí, no solo en el log
+    if not store.is_persistent():
+        message += "\n\n" + get_text("startup_not_persistent")
+    elif seeded and settings.env_settings_present():
+        message += "\n\n" + get_text("startup_settings_imported")
     admins = TELEGRAM_ADMIN.split(',')
     for admin in admins:
         try:
-            await safe_send_message(int(admin), get_text("initial_message", VERSION), parse_mode=PARSE_MODE)
+            await safe_send_message(int(admin), message, parse_mode=PARSE_MODE)
         except Exception as e:
             error(f"[STARTUP] Error sending initial message: {e}")
 
@@ -3468,15 +3394,33 @@ async def set_commands():
         BotCommand("start", get_text("menu_start")),
         BotCommand("list", get_text("menu_list")),
         BotCommand("manage", get_text("menu_manage")),
+        BotCommand("settings", get_text("menu_settings")),
         BotCommand("version", get_text("menu_version")),
         BotCommand("donate", get_text("menu_donate")),
         BotCommand("donors", get_text("menu_donors")),
     ]
-    await bot(functions.bots.SetBotCommandsRequest(
-        scope=types.BotCommandScopeDefault(),
-        lang_code=LANGUAGE.lower(),
-        commands=commands
-    ))
+    # Para todos los idiomas del cliente, y también para "es" y "en", que es
+    # donde los dejaban las versiones anteriores: si no se pisan, quien tenga
+    # Telegram en ese idioma seguiría viendo la lista vieja, sin /settings
+    for lang_code in ("", "es", "en"):
+        await bot(functions.bots.SetBotCommandsRequest(
+            scope=types.BotCommandScopeDefault(),
+            lang_code=lang_code,
+            commands=commands
+        ))
+
+
+async def apply_setting(key):
+    """Lo que hay que hacer al cambiar un ajuste desde /settings.
+
+    La mayoría se leen en el momento de usarlos y no necesitan nada. Estos
+    dos viven en otro sitio: los comandos del menú, en Telegram, y el límite
+    de descargas, en el semáforo que ya está creado.
+    """
+    if key == "language":
+        await set_commands()
+    elif key == "downloads.parallel":
+        await download_semaphore.set_limit(settings.parallel_downloads())
 
 async def heartbeat_writer():
     while True:
@@ -3534,17 +3478,21 @@ manage_handlers.init(
     get_extraction_message_and_buttons=get_extraction_message_and_buttons,
     _send_file_fast=_send_file_fast,
 )
+settings_handlers.init(bot, on_change=apply_setting)
 
 
 async def main():
     debug(f"[STARTUP] DropBot v{VERSION}")
-    debug(f"[STARTUP] AUTO_DOWNLOAD_FORMAT={AUTO_DOWNLOAD_FORMAT}, AUTO_SEND={AUTO_SEND}")
-    debug(f"[STARTUP] FFMPEG_HW={FFMPEG_HW}")
+    debug(f"[STARTUP] Settings: {store.settings_path()}")
+    debug(f"[STARTUP] auto format={settings.auto_format()}, auto send={settings.auto_send()}")
+    debug(f"[STARTUP] ffmpeg hw={settings.ffmpeg_hw()}, quality={settings.ffmpeg_quality()}")
+    debug(f"[STARTUP] parallel downloads={settings.parallel_downloads()}, fast connections={settings.fast_connections()}")
     pot_proc = await start_pot_provider()
     await bot.start()
     await message_queue.start()  # Iniciar la cola de mensajes
     await set_commands()
-    await send_startup_message()
+    await send_startup_message(seeded)
+    stats.start(VERSION)
     heartbeat_task = asyncio.create_task(heartbeat_writer())
 
     # Como PID 1 del contenedor, el kernel ignora SIGTERM si no hay handler

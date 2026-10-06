@@ -1,9 +1,13 @@
 telethon==1.45.0
 yt-dlp==2026.08.19
 rarfile==4.5
+# yt-dlp lo usa para meter la carátula y las etiquetas en los M4A
+mutagen==1.48.1
 curl-cffi==0.16.3
 requests==2.34.2
 # Plugin cliente de PO Token para yt-dlp. El servidor que genera los tokens no
 # está en PyPI y se instala en el Dockerfile: mantener esta versión sincronizada
 # con el ARG POT_PROVIDER_VERSION de Dockerfile y Dockerfile_local
 bgutil-ytdlp-pot-provider==2.0.1
+# Cliente de estadísticas anónimas, desde un tag de dgongut/telemetry (sin PyPI)
+dgongut-telemetry @ https://github.com/dgongut/telemetry/archive/refs/tags/client-v1.0.0.zip#subdirectory=clients/python

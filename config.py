@@ -1,6 +1,8 @@
 import os
 import re
 
+from utils.mounts import is_mounted
+
 # Constants
 ANONYMOUS_USER_ID = "1087968824"
 DEFAULT_EMPTY_STR = "abc"
@@ -28,6 +30,10 @@ EXTENSIONS_EBOOK = {
     ".md", ".mobi", ".nfo", ".odt", ".opf", ".pdf", ".pdb", ".prc",
     ".ps", ".rtf", ".txt", ".xps"
 }
+# Páginas web: un .html que llega por Telegram se guarda como ebook, pero un
+# enlace que acaba en .html es una página (una noticia con vídeo, p. ej.) y lo
+# tiene que analizar yt-dlp en vez de bajarse como fichero
+EXTENSIONS_WEBPAGE = {".htm", ".html"}
 EXTENSIONS_COMPRESSED = ['.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.rar']
 IMG_ICO = "🌅"
 VID_ICO = "📽️"
@@ -56,54 +62,47 @@ POT_PROVIDER_DIR = "/opt/bgutil-ytdlp-pot-provider/server"
 POT_PROVIDER_PORT = 4416
 POT_PROVIDER_STARTUP_TIMEOUT = 30  # segundos máximos de espera a que responda
 
+# VARIABLES DE ENTORNO
+#
+# Solo lo que el bot necesita antes de poder leer sus propios ajustes: cómo
+# llegar a Telegram y quién puede hablarle. Todo lo demás es un ajuste, que se
+# cambia desde /settings (ver settings.py). La línea divisoria es que un valor
+# equivocado en cualquiera de estas te deja sin acceso al bot, y lo que impide
+# que el chat funcione no se puede arreglar desde el chat.
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", DEFAULT_EMPTY_STR)
 TELEGRAM_ADMIN = os.environ.get("TELEGRAM_ADMIN", DEFAULT_EMPTY_STR)
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", DEFAULT_EMPTY_STR)
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", DEFAULT_EMPTY_STR)
-LANGUAGE = os.environ.get("LANGUAGE", "ES")
-FILTER_PHOTO = bool(int(os.environ.get("FILTER_PHOTO", 0)))
-FILTER_AUDIO = bool(int(os.environ.get("FILTER_AUDIO", 0)))
-FILTER_VIDEO = bool(int(os.environ.get("FILTER_VIDEO", 0)))
-FILTER_TORRENT = bool(int(os.environ.get("FILTER_TORRENT", 0)))
-FILTER_EBOOK = bool(int(os.environ.get("FILTER_EBOOK", 0)))
-PARALLEL_DOWNLOADS = int(os.environ.get("PARALLEL_DOWNLOADS", 2))
 
-# Transferencia paralela (estilo FastTelethon): número de conexiones simultáneas
-# por fichero para acelerar descargas y subidas con Telegram. 1 = desactivado
-# (usa el método estándar de Telethon). Recomendado 4-8 para cuentas de bot.
-FAST_CONNECTIONS = int(os.environ.get("FAST_CONNECTIONS", 8))
+# Estadísticas anónimas. Activadas por defecto; se desactivan desde /settings o
+# con TELEMETRY=false, que lee el propio telemetry.py: es la misma variable en
+# todos los proyectos que comparten ese cliente.
+# Solo para desarrollo, sin documentar: envía un minuto después de cada
+# arranque en vez de una vez al día, y a un servidor en la misma máquina salvo
+# que se diga otra cosa, nunca al real, donde contaría como una instalación.
+TELEMETRY_DEBUG = os.environ.get("TELEMETRY_DEBUG", "0").strip().lower() in ("1", "true", "yes")
+TELEMETRY_ENDPOINT = os.environ.get(
+    "TELEMETRY_ENDPOINT",
+    "http://host.docker.internal:8000/v1/ping" if TELEMETRY_DEBUG else "https://telemetry.dgongut.com/v1/ping")
 
-# Tamaño mínimo (bytes) para activar la transferencia paralela. Por debajo de
-# este umbral el coste de abrir varias conexiones no compensa.
+# Transferencia paralela (estilo FastTelethon): tamaño mínimo (bytes) para
+# activarla. Por debajo de este umbral el coste de abrir varias conexiones no
+# compensa. El número de conexiones es un ajuste (downloads.fast_connections).
 FAST_TRANSFER_MIN_BYTES = 10 * 1024 * 1024  # 10 MB
 
-# Rutas y filtros para descargas desde URLs (YouTube, Instagram, TikTok, etc.)
-DOWNLOAD_URL_VIDEO = os.environ.get("DOWNLOAD_URL_VIDEO", "/url_video")
-DOWNLOAD_URL_AUDIO = os.environ.get("DOWNLOAD_URL_AUDIO", "/url_audio")
-FILTER_URL_VIDEO = bool(int(os.environ.get("FILTER_URL_VIDEO", 0)))
-FILTER_URL_AUDIO = bool(int(os.environ.get("FILTER_URL_AUDIO", 0)))
+# Carpetas separadas para lo descargado desde URLs (YouTube, Instagram...)
+DOWNLOAD_URL_VIDEO = "/url_video"
+DOWNLOAD_URL_AUDIO = "/url_audio"
 
 # Cookies opcionales para sitios que requieren una sesión autenticada
 YTDLP_COOKIES_FILE = "/app/cookies/cookies.txt"
 
-# Descarga automática de URLs sin preguntar
-# Valores posibles: "ASK" (preguntar), "VIDEO" (descargar video automáticamente), "AUDIO" (descargar audio automáticamente)
-# Un valor vacío (AUTO_DOWNLOAD_FORMAT= en el .env) equivale a no configurarlo
-AUTO_DOWNLOAD_FORMAT = (os.environ.get("AUTO_DOWNLOAD_FORMAT") or "ASK").upper()
-
-# Acción automática tras descargar un vídeo/audio desde URL (sin preguntar)
-# Valores posibles: "ASK" (preguntar, por defecto), "SEND" (enviar y almacenar),
-# "SEND_DELETE" (enviar y borrar), "STORE" (solo almacenar)
-# Un valor vacío (AUTO_SEND= en el .env) equivale a no configurarlo
-AUTO_SEND = (os.environ.get("AUTO_SEND") or "ASK").upper()
-
-# Encoder hardware para la conversión de vídeo con FFmpeg. NONE conserva el
-# comportamiento original y usa libx264.
-FFMPEG_HW = ((os.environ.get("FFMPEG_HW") or "NONE").strip().upper())
-
-# Calidad opcional del encoder. Si queda vacía, cada encoder usa su valor
-# predeterminado. Los valores más altos reducen calidad y tamaño.
-FFMPEG_QUALITY = (os.environ.get("FFMPEG_QUALITY") or "").strip() or None
+# Hasta la 3.x cada carpeta se activaba con su variable además de montarla.
+# Desde la 4.0.0 basta con montarla; si siguen en el compose solo se avisa.
+DEPRECATED_FOLDER_FILTERS = (
+    "FILTER_PHOTO", "FILTER_AUDIO", "FILTER_VIDEO", "FILTER_TORRENT",
+    "FILTER_EBOOK", "FILTER_URL_VIDEO", "FILTER_URL_AUDIO",
+)
 
 # Tamaño máximo que Telegram acepta en una subida (2 GiB)
 MAX_TELEGRAM_FILE_SIZE = 2 * 1024 * 1024 * 1024
@@ -113,13 +112,37 @@ MAX_TELEGRAM_FILE_SIZE = 2 * 1024 * 1024 * 1024
 MESSAGE_QUEUE_DELAY = 0.5  # Delay entre mensajes en segundos
 MESSAGE_QUEUE_MAX_RETRIES = 5  # Número máximo de reintentos
 
-# Carpeta de destino de cada tipo de contenido, segun los filtros activos
-DOWNLOAD_PATHS = {
-    "audio": DOWNLOAD_AUDIO if FILTER_AUDIO else DOWNLOAD_PATH,
-    "video": DOWNLOAD_VIDEO if FILTER_VIDEO else DOWNLOAD_PATH,
-    "photo": DOWNLOAD_PHOTO if FILTER_PHOTO else DOWNLOAD_PATH,
-    "torrent": DOWNLOAD_TORRENT if FILTER_TORRENT else DOWNLOAD_PATH,
-    "ebook": DOWNLOAD_EBOOK if FILTER_EBOOK else DOWNLOAD_PATH,
-    "url_video": DOWNLOAD_URL_VIDEO if FILTER_URL_VIDEO else (DOWNLOAD_VIDEO if FILTER_VIDEO else DOWNLOAD_PATH),
-    "url_audio": DOWNLOAD_URL_AUDIO if FILTER_URL_AUDIO else (DOWNLOAD_AUDIO if FILTER_AUDIO else DOWNLOAD_PATH)
-}
+def resolve_download_paths(mounted=is_mounted):
+    """La carpeta de destino de cada tipo de contenido.
+
+    Un tipo tiene carpeta propia cuando esa carpeta está montada como volumen:
+    montar /video en el docker-compose es lo que dice que los vídeos van
+    aparte. Si no está montada, va a /downloads, que es lo único que se monta
+    siempre. Escribir en una carpeta sin volumen sería escribir dentro del
+    contenedor, y perderlo en la siguiente actualización.
+
+    Lo descargado desde URLs va a /url_video o /url_audio si están montadas, y
+    si no, donde vaya el resto del vídeo o del audio.
+    """
+    def own(path):
+        return path if mounted(path) else None
+
+    video = own(DOWNLOAD_VIDEO) or DOWNLOAD_PATH
+    audio = own(DOWNLOAD_AUDIO) or DOWNLOAD_PATH
+    return {
+        "audio": audio,
+        "video": video,
+        "photo": own(DOWNLOAD_PHOTO) or DOWNLOAD_PATH,
+        "torrent": own(DOWNLOAD_TORRENT) or DOWNLOAD_PATH,
+        "ebook": own(DOWNLOAD_EBOOK) or DOWNLOAD_PATH,
+        "url_video": own(DOWNLOAD_URL_VIDEO) or video,
+        "url_audio": own(DOWNLOAD_URL_AUDIO) or audio,
+    }
+
+
+DOWNLOAD_PATHS = resolve_download_paths()
+
+
+def has_own_folder(*kinds):
+    """True si alguno de esos tipos no va a la carpeta general."""
+    return any(DOWNLOAD_PATHS[kind] != DOWNLOAD_PATH for kind in kinds)

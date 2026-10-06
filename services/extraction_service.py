@@ -139,6 +139,18 @@ def extract_file(file_path, extract_to):
                 else:
                     raise
         else:
+            # Formato que no reconocemos (un .z01, un .rar falso...): la carpeta
+            # que creó el handler se queda vacía y bloquearía el reintento con
+            # "la carpeta de destino ya existe". Como aquí no se ha extraído
+            # nada, solo se quita si está vacía: con rmdir, una carpeta que ya
+            # tuviera cosas del usuario no se toca
+            warning(f"[EXTRACT] Unsupported compressed format: {filename}")
+            try:
+                if os.path.isdir(extract_to) and not os.listdir(extract_to):
+                    os.rmdir(extract_to)
+                    debug(f"[EXTRACT] Deleted empty folder after unsupported format: {extract_to}")
+            except OSError as cleanup_error:
+                warning(f"[EXTRACT] Error deleting empty folder {extract_to}: {cleanup_error}")
             return False
         return True
 

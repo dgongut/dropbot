@@ -5,8 +5,29 @@ import os
 from pathlib import Path
 
 def is_admin(id):
-    admins = TELEGRAM_ADMIN.split(',')
+    # Sin strip, con TELEGRAM_ADMIN="111, 222" el segundo admin era " 222" y
+    # se quedaba fuera del bot
+    admins = [admin.strip() for admin in TELEGRAM_ADMIN.split(',')]
     return str(id) in admins
+
+
+def md_code(text):
+    """Pone `text` como código para el parse_mode markdown de Telethon.
+
+    Ese markdown no tiene escapes: una comilla invertida dentro de `...` cierra
+    el bloque y el usuario ve el nombre mutilado. Lo que no lleva comillas va
+    en línea como siempre; lo que sí, en un bloque ```...```, donde una comilla
+    suelta no cierra nada (Telegram lo pinta como bloque aparte, pero entero).
+    """
+    text = str(text)
+    if '`' not in text:
+        return f'`{text}`'
+    # Dentro del bloque solo cierran tres comillas seguidas, y una comilla al
+    # final se juntaría con las del cierre: un espacio de ancho cero las separa
+    text = re.sub(r'`(?=`)', '`\u200b', text)
+    if text.endswith('`'):
+        text += '\u200b'
+    return f'```{text}```'
 
 # Caracteres que no pueden aparecer en un nombre de fichero: separadores de
 # ruta, los reservados por Windows/SMB y los de control
@@ -106,7 +127,8 @@ def is_split_zip(file_name):
     return False
 
 def clean_rar_base_name(filename):
-    name = filename.lower()
-    name = os.path.splitext(name)[0]
-    name = re.sub(r'(\.part\d+|\.r\d+)$', '', name)
+    # Sin pasar a minúsculas: es el nombre de la carpeta en la que se extrae,
+    # y "Mi Serie.rar" debe ir a "Mi Serie/" como hace un ZIP
+    name = os.path.splitext(filename)[0]
+    name = re.sub(r'(\.part\d+|\.r\d+)$', '', name, flags=re.IGNORECASE)
     return name

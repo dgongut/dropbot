@@ -1,6 +1,9 @@
 """
 Servicio para obtener y mostrar la lista de donantes.
 """
+import asyncio
+import html
+
 import requests
 
 from config import DONORS_URL
@@ -17,7 +20,8 @@ async def get_array_donors_online():
     }
 
     try:
-        response = requests.get(DONORS_URL, headers=headers, timeout=10)
+        # En un hilo: requests es síncrono y bloqueaba el bot entero hasta 10 s
+        response = await asyncio.to_thread(requests.get, DONORS_URL, headers=headers, timeout=10)
         if response.status_code == 200:
             try:
                 data = response.json()
@@ -44,7 +48,8 @@ async def print_donors(chat_id):
     if donors:
         result = ""
         for donor in donors:
-            result += f"· {donor}\n"
+            # El mensaje va en HTML: un nombre con < o & lo rompía
+            result += f"· {html.escape(str(donor))}\n"
         await safe_send_message(chat_id, get_text("donors_list", result), parse_mode="HTML")
     else:
         await safe_send_message(chat_id, get_text("error_getting_donors"), parse_mode=PARSE_MODE)

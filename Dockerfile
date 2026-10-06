@@ -2,7 +2,7 @@
 FROM ubuntu:26.04
 
 # Build arguments
-ARG VERSION=3.6.3
+ARG VERSION=4.0.0
 ARG POT_PROVIDER_VERSION=2.0.1
 
 # Metadata (etiquetas OCI estándar: las leen herramientas como docker-controller-bot)
@@ -79,3 +79,12 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD [ $(($(date +%s) - $(stat -c %Y /tmp/dropbot_heartbeat 2>/dev/null || echo 0))) -lt 60 ] || exit 1
 
 ENTRYPOINT ["python3", "dropbot.py"]
+
+# Cuándo y de qué commit, pasados al construir:
+#   --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) --build-arg VCS_REF=$(git rev-parse HEAD)
+# Al final a propósito: cambian en cada construcción, y todo lo que fuera
+# detrás se reconstruiría siempre en vez de salir de la caché.
+ARG BUILD_DATE
+ARG VCS_REF
+LABEL org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${VCS_REF}"

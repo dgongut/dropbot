@@ -1,4 +1,4 @@
-"""AUTO_SEND: qué hace el bot con un vídeo/audio recién bajado de una URL."""
+"""Envío automático (urls.auto_send): qué hace el bot con un vídeo/audio recién bajado de una URL."""
 
 from unittest.mock import MagicMock
 
@@ -41,7 +41,7 @@ class TestModos:
         self, downloaded, sent_messages, make_event, media_file, run_async, monkeypatch
     ):
         dropbot, sent = downloaded
-        monkeypatch.setattr(dropbot, "AUTO_SEND", "ASK")
+        monkeypatch.setattr(dropbot.settings, "auto_send", lambda: "ASK")
 
         run_async(dropbot.handle_success(make_event(), media_file("v.mp4")))
 
@@ -52,7 +52,7 @@ class TestModos:
         self, downloaded, sent_messages, make_event, media_file, run_async, monkeypatch
     ):
         dropbot, sent = downloaded
-        monkeypatch.setattr(dropbot, "AUTO_SEND", "SEND")
+        monkeypatch.setattr(dropbot.settings, "auto_send", lambda: "SEND")
         path = media_file("v.mp4")
 
         run_async(dropbot.handle_success(make_event(), path))
@@ -64,7 +64,7 @@ class TestModos:
         self, downloaded, make_event, media_file, run_async, monkeypatch
     ):
         dropbot, sent = downloaded
-        monkeypatch.setattr(dropbot, "AUTO_SEND", "SEND_DELETE")
+        monkeypatch.setattr(dropbot.settings, "auto_send", lambda: "SEND_DELETE")
         path = media_file("v.mp4")
 
         run_async(dropbot.handle_success(make_event(), path))
@@ -75,7 +75,7 @@ class TestModos:
         self, downloaded, sent_messages, make_event, media_file, run_async, monkeypatch
     ):
         dropbot, sent = downloaded
-        monkeypatch.setattr(dropbot, "AUTO_SEND", "STORE")
+        monkeypatch.setattr(dropbot.settings, "auto_send", lambda: "STORE")
 
         run_async(dropbot.handle_success(make_event(), media_file("v.mp4")))
 
@@ -90,7 +90,7 @@ class TestLimiteDeTamano:
     ):
         """Con envío automático, un fichero que no cabe tiene que decirse."""
         dropbot, sent = downloaded
-        monkeypatch.setattr(dropbot, "AUTO_SEND", mode)
+        monkeypatch.setattr(dropbot.settings, "auto_send", lambda: mode)
 
         run_async(dropbot.handle_success(make_event(), media_file("grande.mp4", MAX_SIZE + 1)))
 
@@ -102,7 +102,7 @@ class TestLimiteDeTamano:
         self, downloaded, sent_messages, make_event, media_file, run_async, monkeypatch
     ):
         dropbot, _ = downloaded
-        monkeypatch.setattr(dropbot, "AUTO_SEND", "ASK")
+        monkeypatch.setattr(dropbot.settings, "auto_send", lambda: "ASK")
 
         run_async(dropbot.handle_success(make_event(), media_file("grande.mp4", MAX_SIZE + 1)))
 
@@ -116,7 +116,7 @@ class TestAlcance:
         """AUTO_SEND es para descargas de URL; devolver lo que te acaban de
         mandar por Telegram no tendría sentido."""
         dropbot, sent = downloaded
-        monkeypatch.setattr(dropbot, "AUTO_SEND", "SEND")
+        monkeypatch.setattr(dropbot.settings, "auto_send", lambda: "SEND")
 
         run_async(dropbot.handle_success(
             make_event(), media_file("v.mp4"), show_action_buttons=False
@@ -144,7 +144,7 @@ class TestAlcance:
 
         monkeypatch.setattr(dropbot, "get_file_info", file_info)
         monkeypatch.setattr(dropbot, "send_file_to_telegram", send)
-        monkeypatch.setattr(dropbot, "AUTO_SEND", "SEND")
+        monkeypatch.setattr(dropbot.settings, "auto_send", lambda: "SEND")
 
         run_async(dropbot.handle_success(make_event(), media_file("doc.pdf")))
 

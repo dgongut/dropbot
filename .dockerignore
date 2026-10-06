@@ -66,3 +66,6 @@ downloads/
 
 # Cookies (información sensible; se montan en runtime)
 cookies/
+
+# Ajustes locales de desarrollo (se montan en /config)
+config/

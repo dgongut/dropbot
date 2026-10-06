@@ -33,6 +33,9 @@ class TelegramMessageQueue:
     async def start(self):
         """Inicia el worker que procesa la cola"""
         if self.worker_task is None or self.worker_task.done():
+            # shutdown() lo deja a False: sin esto, el worker nuevo salía al
+            # instante y lo que se encolaba después no se enviaba nunca
+            self.running = True
             self.worker_task = asyncio.create_task(self._process_queue())
             debug("[STARTUP] Message queue worker started")
 
@@ -168,6 +171,14 @@ class TelegramMessageQueue:
             except asyncio.TimeoutError:
                 error(f"[QUEUE] ❌ Timeout waiting for {func_name} result in queue (waited 300s)")
                 return None
+            except asyncio.CancelledError:
+                # shutdown() cancela el future de lo que quedó sin enviar: para
+                # quien esperaba es como un timeout. Si a quien cancelan es a
+                # la propia tarea que espera, se propaga como siempre
+                if asyncio.current_task().cancelling():
+                    raise
+                warning(f"[QUEUE] {func_name} was not sent: the queue stopped")
+                return None
 
         return None
 
@@ -177,5 +188,14 @@ class TelegramMessageQueue:
         await self.queue.put(None)  # Señal de parada
         if self.worker_task:
             await self.worker_task
+        # Lo que quedó en la cola ya no se va a enviar: se descarta (también la
+        # señal de parada, si el worker salió sin leerla, para que un start()
+        # posterior no se pare con ella) y se cancela el future de quien
+        # esperaba el resultado, que si no se quedaba esperando 300 s
+        while not self.queue.empty():
+            message_data = self.queue.get_nowait()
+            result_future = message_data and message_data.get('result_future')
+            if result_future is not None and not result_future.done():
+                result_future.cancel()
         debug("Message queue stopped")
 

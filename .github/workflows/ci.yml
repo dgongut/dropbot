@@ -18,6 +18,15 @@ jobs:
           python-version: '3.14'
           cache: pip
 
+      # Las herramientas que usa el bot y que los tests ejercitan de verdad
+      # (conversiones con ffmpeg, RAR con unrar). Sin ellas esos tests se
+      # saltan en vez de fallar, así que conviene que estén
+      - name: Instalar ffmpeg y unrar
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          sudo apt-get install -y --no-install-recommends unrar || echo "unrar no disponible: sus tests se saltan"
+
       - name: Instalar dependencias
         run: pip install -r requirements-dev.txt
 
@@ -30,7 +39,7 @@ jobs:
         run: python -m pyflakes *.py handlers/ services/ utils/ tests/
 
       - name: Tests
-        run: python -m pytest -q
+        run: python -m pytest -q -rs
 
   # El Dockerfile de produccion no copia el codigo local: descarga el zip del tag
   # publicado en GitHub. Por eso solo se puede construir cuando el tag existe, y
@@ -48,12 +57,15 @@ jobs:
 
       - name: Arrancar sin configuracion debe fallar con un mensaje claro
         run: |
-          output=$(docker run --rm -e LANGUAGE=ES dropbot:ci 2>&1 || true)
+          output=$(docker run --rm dropbot:ci 2>&1 || true)
           echo "$output"
           echo "$output" | grep -q "TELEGRAM_TOKEN"
 
-      - name: Un AUTO_SEND invalido debe abortar el arranque
+      # Desde la 4.0.0 las variables antiguas solo siembran settings.json: una
+      # invalida se ignora con un aviso, y el arranque sigue hasta el token
+      - name: Un AUTO_SEND invalido se ignora sin abortar
         run: |
-          output=$(docker run --rm -e LANGUAGE=ES -e AUTO_SEND=NO_EXISTE dropbot:ci 2>&1 || true)
+          output=$(docker run --rm -e TELEMETRY=false -e AUTO_SEND=NO_EXISTE dropbot:ci 2>&1 || true)
           echo "$output"
-          echo "$output" | grep -q "AUTO_SEND only can be"
+          echo "$output" | grep -q "Ignoring AUTO_SEND"
+          echo "$output" | grep -q "TELEGRAM_TOKEN"

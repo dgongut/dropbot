@@ -9,10 +9,12 @@ Características:
 """
 
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 from logger import warning, error
-from config import LANGUAGE
+import settings
+from basic import md_code
 
 # Constante para el parse_mode por defecto
 PARSE_MODE = "markdown"
@@ -64,10 +66,12 @@ def get_text(key: str, *args) -> str:
 		>>> get_text("welcome_user", "John")
 		"¡Bienvenido, John!"
 	"""
+	# Se lee en cada llamada: el idioma se cambia desde /settings sin reiniciar
+	language = settings.language()
 	try:
-		messages = load_locale(LANGUAGE.lower())
+		messages = load_locale(language.lower())
 	except (FileNotFoundError, json.JSONDecodeError) as e:
-		error(f"Error loading locale {LANGUAGE}: {e}")
+		error(f"Error loading locale {language}: {e}")
 		messages = {}
 
 	if key in messages:
@@ -77,19 +81,32 @@ def get_text(key: str, *args) -> str:
 		try:
 			messages_en = load_locale("en")
 			if key in messages_en:
-				warning(f"Translation key '{key}' not found in {LANGUAGE}, using English fallback")
+				warning(f"Translation key '{key}' not found in {language}, using English fallback")
 				translated_text = messages_en[key]
 			else:
-				error(f"Translation key '{key}' not found in {LANGUAGE} or EN")
+				error(f"Translation key '{key}' not found in {language} or EN")
 				return f"[MISSING: {key}]"
 		except (FileNotFoundError, json.JSONDecodeError):
 			error(f"Could not load English fallback for key '{key}'")
 			return f"[MISSING: {key}]"
 
-	# Sustituir placeholders
-	for i, arg in enumerate(args, start=1):
-		placeholder = f"${i}"
-		translated_text = translated_text.replace(placeholder, str(arg))
+	# Sustituir placeholders en una sola pasada y de mayor a menor: uno a uno,
+	# "$1" se comía el principio de "$10", y un valor que contuviera "$2" (un
+	# nombre de fichero, p. ej.) se volvía a sustituir con el argumento 2
+	#
+	# Un hueco escrito como `$1` en la traducción es un nombre que va como
+	# código: se rellena con md_code, que lo deja igual que antes salvo cuando
+	# el nombre trae una comilla invertida, que cerraba el bloque y lo mutilaba
+	if args:
+		numbers = "|".join(str(i) for i in range(len(args), 0, -1))
+		pattern = re.compile(rf"`\$({numbers})`|\$({numbers})")
+
+		def fill(match):
+			if match.group(1):
+				return md_code(args[int(match.group(1)) - 1])
+			return str(args[int(match.group(2)) - 1])
+
+		translated_text = pattern.sub(fill, translated_text)
 
 	return translated_text
 

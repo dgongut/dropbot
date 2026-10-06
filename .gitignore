@@ -3,6 +3,7 @@
 
 # Local development files and folders
 .env
+config/
 cookies/
 downloads/
 __pycache__/

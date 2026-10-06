@@ -37,14 +37,23 @@ async def get_video_metadata(file_path):
         if proc.returncode == 0:
             data = json.loads(stdout.decode())
 
+            streams = data.get("streams", [])
+            duration = int(float(data.get("format", {}).get("duration", 0)))
+
             # Buscar el stream de video
-            for stream in data.get("streams", []):
+            for stream in streams:
                 if stream.get("codec_type") == "video":
-                    duration = int(float(data.get("format", {}).get("duration", 0)))
                     width = stream.get("width", 0)
                     height = stream.get("height", 0)
                     debug(f"[METADATA] ✅ Metadata obtained: {duration}s, {width}x{height}")
                     return duration, width, height
+
+            # Un audio sin carátula no tiene pista de vídeo, pero los envíos
+            # piden aquí también su duración: sin ella Telegram lo muestra sin
+            # barra de reproducción. Se devuelve sin dimensiones
+            if any(stream.get("codec_type") == "audio" for stream in streams):
+                debug(f"[METADATA] ✅ Audio metadata obtained: {duration}s")
+                return duration or None, None, None
 
             warning("[METADATA] ⚠️ Video stream not found")
         else:
@@ -150,13 +159,33 @@ def format_duration(seconds):
         return f"{minutes:02d}:{secs:02d}"
 
 
-async def generate_video_thumbnail(video_path, output_path=None, timestamp="00:00:03"):
+# Telegram rechaza miniaturas con algún lado de más de 320 px
+THUMBNAIL_MAX_SIDE = 320
+
+
+async def _thumbnail_timestamp(video_path):
+    """Instante para la miniatura: el segundo 3 (pasado el negro inicial), o la
+    mitad del vídeo si dura menos, porque más allá del final ffmpeg no
+    encuentra fotograma y no escribe nada."""
+    probe = await probe_media(video_path)
+    try:
+        duration = float((probe or {}).get("format", {}).get("duration", 0))
+    except (TypeError, ValueError):
+        duration = 0
+    return f"{min(3.0, duration / 2):.3f}" if duration > 0 else "0"
+
+
+async def generate_video_thumbnail(video_path, output_path=None, timestamp=None):
     """
-    Genera una miniatura de un video en el segundo especificado.
+    Genera una miniatura de un video en el segundo especificado (por defecto,
+    el que elige _thumbnail_timestamp según la duración).
     Retorna la ruta del thumbnail generado o None si falla.
     """
     try:
         debug(f"[THUMBNAIL] Generating thumbnail for: {video_path}")
+
+        if timestamp is None:
+            timestamp = await _thumbnail_timestamp(video_path)
 
         if output_path is None:
             # Generar thumbnail en /tmp
@@ -173,7 +202,10 @@ async def generate_video_thumbnail(video_path, output_path=None, timestamp="00:0
             "-i", video_path,
             "-ss", timestamp,  # Segundo del video para capturar
             "-vframes", "1",   # Solo 1 frame
-            "-vf", "scale=320:-1",  # Escalar a 320px de ancho manteniendo aspecto
+            # Encajar en 320x320 manteniendo el aspecto: con scale=320:-1 un
+            # vídeo vertical salía de 320x427
+            "-vf", (f"scale={THUMBNAIL_MAX_SIDE}:{THUMBNAIL_MAX_SIDE}"
+                    ":force_original_aspect_ratio=decrease"),
             "-y",  # Sobrescribir sin preguntar
             output_path
         ]

@@ -33,9 +33,10 @@ EXPECTED_CALLBACKS = {
     b"extract:(.+)",
     b"(delcompressed|keepcompressed):(.+)",
     b"(send|senddelete|nosend):(.+)",
+    b"cfg:(.+)",
 }
 
-EXPECTED_HANDLER_COUNT = 24
+EXPECTED_HANDLER_COUNT = 26
 
 
 def _pattern_of(event):

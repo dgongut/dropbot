@@ -6,10 +6,12 @@ services:
         build:
           context: .
           dockerfile: ./Dockerfile_local
-        tty: true
         restart: unless-stopped
         volumes:
+          - ./config:/config
           - ./downloads:/downloads
+          # Opcional: cada tipo va a su carpeta si la montas, por ejemplo:
+          #- ./downloads/video:/video
           # Opcional: montar cookies de yt-dlp para sitios que requieren sesión.
           # Debe ser escribible porque yt-dlp actualiza el cookie jar.
           #- ./cookies:/app/cookies

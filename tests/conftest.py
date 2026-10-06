@@ -1,13 +1,13 @@
 """Infraestructura común para los tests de DropBot.
 
-`dropbot.py` hace bastante trabajo en tiempo de importación: valida la
-configuración, crea las carpetas de descarga, limpia TEMP_DIR y abre la
-conexión con Telegram. Para poder importarlo en un test hay que preparar
-tres cosas antes:
+`dropbot.py` hace bastante trabajo en tiempo de importación: migra los
+ajustes, crea las carpetas de descarga, limpia TEMP_DIR y abre la conexión con
+Telegram. Para poder importarlo en un test hay que preparar tres cosas antes:
 
 1. Las variables de entorno mínimas, o el módulo llama a `sys.exit(1)`.
-2. Las rutas de `config`, que por defecto apuntan a `/downloads` y `/tmp`
-   (pensadas para el contenedor) y que en un portátil no son escribibles.
+2. Las rutas de `config` y de `store`, que por defecto apuntan a `/downloads`,
+   `/config` y `/tmp` (pensadas para el contenedor) y que en un portátil no
+   son escribibles.
 3. `TelegramClient`, que en la línea de creación del bot ya llama a
    `.start()` y se conectaría de verdad. Se sustituye por un doble.
 
@@ -41,10 +41,14 @@ os.environ.update({
     "TELEGRAM_ADMIN": str(ADMIN_ID),
     "TELEGRAM_API_ID": "1",
     "TELEGRAM_API_HASH": "testhash",
-    "LANGUAGE": "ES",
-    "AUTO_DOWNLOAD_FORMAT": "ASK",
-    "AUTO_SEND": "ASK",
+    # Ni un envío de estadísticas desde los tests
+    "TELEMETRY": "false",
 })
+# Las variables que en la 4.0.0 pasaron a ser ajustes no deben colarse desde el
+# entorno de quien ejecuta los tests: sembrarían el settings.json de pruebas
+for _variable in ("LANGUAGE", "PARALLEL_DOWNLOADS", "FAST_CONNECTIONS", "AUTO_DOWNLOAD_FORMAT",
+                  "AUTO_SEND", "FFMPEG_HW", "FFMPEG_QUALITY"):
+    os.environ.pop(_variable, None)
 
 # --- Punto 2: rutas dentro de un directorio temporal -------------------------
 _SANDBOX = Path(tempfile.mkdtemp(prefix="dropbot-tests-"))
@@ -58,16 +62,14 @@ for _name in ("DOWNLOAD_PATH", "DOWNLOAD_AUDIO", "DOWNLOAD_VIDEO", "DOWNLOAD_PHO
 config.TEMP_DIR = str(_SANDBOX / "temp")
 
 # DOWNLOAD_PATHS se calcula al importar config a partir de las rutas de arriba,
-# asi que hay que recalcularlo despues de sustituirlas
-config.DOWNLOAD_PATHS = {
-    "audio": config.DOWNLOAD_AUDIO if config.FILTER_AUDIO else config.DOWNLOAD_PATH,
-    "video": config.DOWNLOAD_VIDEO if config.FILTER_VIDEO else config.DOWNLOAD_PATH,
-    "photo": config.DOWNLOAD_PHOTO if config.FILTER_PHOTO else config.DOWNLOAD_PATH,
-    "torrent": config.DOWNLOAD_TORRENT if config.FILTER_TORRENT else config.DOWNLOAD_PATH,
-    "ebook": config.DOWNLOAD_EBOOK if config.FILTER_EBOOK else config.DOWNLOAD_PATH,
-    "url_video": config.DOWNLOAD_URL_VIDEO,
-    "url_audio": config.DOWNLOAD_URL_AUDIO,
-}
+# asi que hay que recalcularlo despues de sustituirlas. Como si solo estuvieran
+# montadas /url_video y /url_audio, que los tests de URLs usan por separado
+_MOUNTED = {config.DOWNLOAD_URL_VIDEO, config.DOWNLOAD_URL_AUDIO}
+config.DOWNLOAD_PATHS = config.resolve_download_paths(mounted=lambda path: path in _MOUNTED)
+
+import store  # noqa: E402
+
+store.init(str(_SANDBOX / "config"))
 
 
 # Cada `@bot.on(evento)` que se evalúe al importar deja aquí (evento, función)
@@ -209,6 +211,15 @@ class _FakeMatch:
 
     def group(self, index):
         return self._groups[index]
+
+
+@pytest.fixture
+def config_dir(tmp_path):
+    """Un /config vacío para el test, y el de la sesión de vuelta al acabar."""
+    root = tmp_path / "config"
+    store.init(str(root))
+    yield root
+    store.init(str(_SANDBOX / "config"))
 
 
 @pytest.fixture

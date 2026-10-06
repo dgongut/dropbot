@@ -77,9 +77,14 @@ class _UploadSender:
         self.request.file_part += self.stride
 
     async def disconnect(self):
-        if self.previous:
-            await self.previous
-        return await self.sender.disconnect()
+        # Desconectar siempre, aunque la última parte haya fallado: si no, el
+        # error de esa parte salía antes de llegar aquí y la conexión MTProto
+        # quedaba abierta. El error se relanza igualmente para que la subida falle.
+        try:
+            if self.previous:
+                await self.previous
+        finally:
+            await self.sender.disconnect()
 
 
 class _ParallelTransferrer:
@@ -93,12 +98,19 @@ class _ParallelTransferrer:
         self.upload_ticker = 0
 
     async def _cleanup(self):
+        """Cierra todas las conexiones y devuelve los errores que hubo al cerrarlas.
+
+        En la subida, cerrar es lo que espera la última parte de cada conexión:
+        su error llega aquí y finish_upload debe relanzarlo.
+        """
+        results = []
         if self.senders:
-            await asyncio.gather(
+            results = await asyncio.gather(
                 *(s.disconnect() for s in self.senders),
                 return_exceptions=True,
             )
         self.senders = None
+        return [r for r in results if isinstance(r, BaseException)]
 
     @staticmethod
     def _connection_count(file_size, max_count, full_size=100 * 1024 * 1024):
@@ -197,8 +209,14 @@ class _ParallelTransferrer:
             try:
                 while True:
                     data = await sender.next()
-                    if not data:
+                    if data is None:
                         break
+                    if not data:
+                        # Parte vacía antes de tiempo (el tamaño anunciado es
+                        # mayor que el real). Salir sin más dejaba al consumidor
+                        # esperando en su cola para siempre: hay que fallar para
+                        # que el llamador recurra al método estándar.
+                        raise ValueError("Incomplete parallel download: empty part")
                     await queue.put(data)
             except asyncio.CancelledError:
                 raise
@@ -243,7 +261,11 @@ class _ParallelTransferrer:
         self.upload_ticker = (self.upload_ticker + 1) % len(self.senders)
 
     async def finish_upload(self):
-        await self._cleanup()
+        # Si falló la última parte de alguna conexión, la subida no está
+        # completa: devolver el InputFile haría que Telegram lo rechazara después.
+        errors = await self._cleanup()
+        if errors:
+            raise errors[0]
 
 
 def connection_count(file_size, max_connections, full_size=100 * 1024 * 1024):
@@ -312,8 +334,15 @@ async def upload_file(client, file, file_size, max_connections, progress_callbac
                 del buffer[:part_size]
         if len(buffer) > 0:
             await uploader.upload(bytes(buffer))
-    finally:
-        await uploader.finish_upload()
+    except BaseException:
+        # Ya hay un error (o una cancelación) en curso: cerrar sin taparlo con
+        # el de las últimas partes, que es una consecuencia
+        try:
+            await uploader.finish_upload()
+        except Exception:
+            pass
+        raise
+    await uploader.finish_upload()
     if is_large:
         return InputFileBig(file_id, part_count, "upload")
     return InputFile(file_id, part_count, "upload", hash_md5.hexdigest())

@@ -62,12 +62,16 @@ docker compose up -d
 Open Telegram, send `/start` to your bot and send it a file or a link. Everything else is set from `/settings`.
 
 > [!WARNING]
-> Always map a volume on `/config`: that is where the settings are kept. Without it they are lost when the container is recreated, and the bot reminds you on startup.
+> Always map a volume on `/config`: that is where the settings and the bot's Telegram session are kept, and the session moves there on its own if it was in `/app`. Without it they are lost when the container is recreated, and the bot reminds you on startup. The session gives the same access as the token: do not share that folder or use it in two containers at once.
+>
+> If you revoke the token in @BotFather, putting the new one in `TELEGRAM_TOKEN` is enough: the bot starts a new session. If Telegram stops accepting the session, the bot moves it aside as `.bad` and creates another on restart. If the log still shows session errors after that, delete `/config/state/dropbot-*.session` and restart.
+>
+> Mount `/downloads` too: if it is not a volume, what is downloaded stays inside the container and is lost when it is recreated. The bot warns you on startup and in `/settings`.
 
 | KEY                            | REQUIRED    | VALUE |
 |---------------------------------|:------------:|-------|
 | TELEGRAM_TOKEN                 |✅            | Bot token |
-| TELEGRAM_ADMIN                 |✅            | ChatId of the administrator (you can get it by talking to the Rose bot and typing /id). Several administrators can be given, separated by commas. For example 12345,54431,55944 |
+| TELEGRAM_ADMIN                 |✅            | ChatId of the administrator (you can get it by sending /id privately to the Rose bot). Several administrators can be given, separated by commas. For example 12345,54431,55944. Only a person's id works: the id of a group or a channel, or of an anonymous admin, is ignored |
 | TELEGRAM_API_HASH              |✅            | Telegram API hash (you get it when creating your application at https://my.telegram.org) |
 | TELEGRAM_API_ID                |✅            | Telegram API ID (you get it when creating your application at https://my.telegram.org) |
 | TELEMETRY                      |❌            | `false` to turn the anonymous statistics off without going through `/settings`. The usual way is to turn them off from `/settings`; this is for whoever prefers to have it fixed in the compose |
@@ -87,6 +91,8 @@ Only the variables the bot needs **before** it can read its own settings are lef
 
 Downloading needs no command: just send it the file or the link.
 
+Careful with links from third parties: for direct links, the bot does not follow a redirect from a public site to your local network, but yt-dlp follows redirects on its own, and also the links it finds in the page. A crafted link can thus make the container send a request to a device on your network (the router, a NAS). The only way to fully prevent it is to limit the container's network: a firewall rule or a Docker network that does not let it reach private addresses (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` and `169.254.0.0/16`), or an egress proxy. In exchange, the bot will not be able to download from your local network either.
+
 ## Settings and more
 
 <details>
@@ -98,7 +104,7 @@ They are kept in `settings.json`, inside `/config`, and apply at once, without r
 |:------------- | :-------------|
 | Language | Español or English. Spanish by default |
 | Links → Download as | What to do when a link arrives: ask whether you want video or audio (default), or always download as video or always as audio |
-| Links → After downloading a link | What to do with what was downloaded from a link, whole playlists included: ask (default), send and keep, send and delete from the server, or keep only. It does not affect the files you send the bot from Telegram. Anything over 2 GB does not fit in Telegram and stays on the server only. Long videos still offer to cancel the conversion or send the original |
+| Links → After downloading a link | What to do with what was downloaded from a link, whole playlists included: ask (default), send and keep, send and delete from the server, or keep only. It does not affect the files you send the bot from Telegram. Anything over 2000 MB does not fit in Telegram and stays on the server only. Long videos still offer to cancel the conversion or send the original |
 | Links → Quality → Video | Maximum resolution: best available (default), 2160p, 1440p, 1080p, 720p, 480p or 360p. It counts the short side, so a 1080×1920 vertical video is 1080p. If a video has nothing below the limit, the smallest one available is downloaded |
 | Links → Quality → Prefer Telegram-compatible | Asks for H.264 video and AAC audio, which Telegram plays as they are: the video is sent in seconds instead of going through the conversion. Since YouTube does not offer H.264 above 1080p, with this on a 4K video is downloaded in 1080p. On by default |
 | Links → Quality → Audio format | MP3 (default) or M4A, which keeps the AAC audio as it comes, without re-encoding: it sounds like the original, is smaller and takes less time |
@@ -106,7 +112,7 @@ They are kept in `settings.json`, inside `/config`, and apply at once, without r
 | Links → Quality → Tags and cover in the audio | Puts the title, the artist and the video thumbnail as cover art into the audio. On by default |
 | Links → Playlists | On a playlist: ask whether you want all of it or only the first video (default), or always do the same. And a video cap when downloading all of it (10, 25, 50, 100 or 200; no cap by default) |
 | Links → SponsorBlock | Removes from YouTube videos the segments marked by the [SponsorBlock](https://sponsor.ajay.app) community: off (default), sponsors, sponsors and self-promotion, or everything that is not content (also intros, outros, previews, filler and whatever is not music in music videos) |
-| Links → Maximum size | Anything bigger is not downloaded, and the bot tells you so: 512 MB, 1, 2, 5 or 10 GB, or no limit (default). In a playlist that video is skipped and the rest carry on |
+| Links → Maximum size | Anything bigger is not downloaded, and the bot tells you so: 512 MB, 1 GB, 2000 MB (the most that can be sent through Telegram), 5 or 10 GB, or no limit (default). In a playlist that video is skipped and the rest carry on |
 | Simultaneous downloads | Files transferred at once. 2 by default |
 | Connections per file | Parallel connections per file to speed up the transfer (FastTelethon style). 1 = Telethon's standard method. 4-8 recommended. 8 by default |
 | Video conversion → Encoder | CPU (`libx264`, default), VAAPI (Intel/AMD, recommended), NVENC (NVIDIA) or QSV (Intel Quick Sync, experimental: it needs Intel's runtime, which is not in the image). If the hardware encoder fails, it is retried with `libx264` automatically. See the hardware acceleration section |
@@ -175,14 +181,23 @@ You can check which encoder is in use in the logs (`[CONVERSION] Encoder mode: .
 <summary>🍪 Optional cookies for yt-dlp</summary>
 
 For sites that need a logged-in session, create `cookies/cookies.txt` and
-mount the folder on `/app/cookies`. The volume has to be writable, because
-yt-dlp may update the cookie jar. If the file does not exist, DropBot keeps
-using yt-dlp without cookies.
+mount the folder on `/app/cookies`. It can be read-only (`:ro`): yt-dlp works
+on a copy. If it is writable, the cookies yt-dlp renews are saved into the
+file, unless you changed it in the meantime: a freshly exported `cookies.txt`
+is not overwritten. If the file does not exist, DropBot keeps using yt-dlp
+without cookies.
 
 ```yaml
     volumes:
       - /path/to/cookies:/app/cookies
 ```
+
+</details>
+
+<details>
+<summary>🔄 Coming from 4.0.0?</summary>
+
+- `TELEGRAM_ADMIN` only takes ids of people. If you had the id of a group or a channel (they start with `-`) to control the bot as an anonymous admin, it is now ignored: the bot starts with the other ids and tells you so in the startup message. If it was the only one, the bot does not start and explains why in the log. Put your own id, which the Rose bot gives you if you send it `/id` privately (in a group it gives you the group's).
 
 </details>
 
@@ -196,6 +211,7 @@ using yt-dlp without cookies.
 - What you download from links is now requested as H.264 and AAC by default, which Telegram plays without converting. It is sent much sooner, but a 4K YouTube video arrives in 1080p. If you prefer the old behaviour, turn off *Prefer Telegram-compatible* in `/settings` → *Links* → *Quality*.
 - Links to web pages (`.html`) are no longer downloaded as a file: they go through yt-dlp like any other link.
 - `tty: true` is not needed. You can remove it, or keep it: it does no harm.
+- Nor is `init: true`: the image already starts with tini, which passes the stop signal on to the bot so it shuts down cleanly. You can remove it, or keep it: it does no harm either.
 
 </details>
 

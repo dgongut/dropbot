@@ -62,6 +62,16 @@ class TestTope:
         assert "--playlist-end" not in calls[0]["cmd"]
         assert calls[0]["total_videos"] == 1
 
+    def test_solo_el_primero_corta_tambien_las_listas_puras(self, launched, make_event, run_async):
+        """--no-playlist solo escoge el vídeo en un enlace mixto (watch?v=X&list=Y):
+        con playlist?list=… o un canal no hace nada y yt-dlp bajaba la lista entera."""
+        dropbot, calls = launched
+
+        _start(dropbot, make_event, run_async, 300, "first")
+
+        cmd = calls[0]["cmd"]
+        assert cmd[cmd.index("--playlist-items") + 1] == "1"
+
 
 class TestModo:
     @pytest.fixture
@@ -89,7 +99,7 @@ class TestModo:
         self._send_link(dropbot, make_event, run_async)
 
         assert not calls
-        assert "77" in dropbot.pending_urls
+        assert "42_77" in dropbot.pending_urls
 
     @pytest.mark.parametrize("mode,flag", [("FULL", "--ignore-errors"), ("FIRST", "--no-playlist")])
     def test_un_modo_fijo_no_pregunta(self, playlist_link, make_event, run_async, mode, flag):

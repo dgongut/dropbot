@@ -18,6 +18,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -289,6 +290,22 @@ def test_mkv_h264_se_reempaqueta_sin_recodificar_y_con_faststart(conversion, med
     assert_faststart(result)
     assert plan_is_noop(telegram_conversion_plan(result, probe))
     assert conversion.new_temp_files == set()
+
+
+@needs_ffmpeg
+def test_un_video_con_un_nombre_que_ocupa_casi_255_bytes_tambien_se_convierte(
+    conversion, media, tmp_path
+):
+    """El temporal llevaba el nombre del vídeo más «_{ms}_telegram.mp4»: con
+    un nombre largo pasaba de 255 bytes, ffmpeg no podía crearlo y se enviaba
+    el original sin convertir."""
+    source = tmp_path / ("x" * 240 + ".mkv")
+    shutil.copy(media("h264_aac.mkv"), source)
+
+    result = conversion.run(str(source))
+
+    assert result != str(source) and result.endswith("_telegram.mp4")
+    assert streams(ffprobe(result), "video")[0]["codec_name"] == "h264"
 
 
 @needs_ffmpeg
@@ -572,8 +589,8 @@ async def _wait_for_progress(dropbot, sent_messages):
 
 
 def _outputs_for(dropbot, source):
-    base = os.path.splitext(os.path.basename(source))[0]
-    return glob.glob(os.path.join(dropbot.TEMP_DIR, f"{base}_*_telegram.mp4"))
+    # El temporal no lleva el nombre del vídeo sino el id de la conversión
+    return glob.glob(os.path.join(dropbot.TEMP_DIR, "conv_*_telegram.mp4"))
 
 
 @needs_ffmpeg
@@ -790,6 +807,18 @@ def test_todos_los_modos_piden_faststart_y_progreso(dropbot, hardware):
     assert command[command.index("-i") + 1] == "in.webm"
 
 
+@pytest.mark.parametrize("plan", [
+    None,
+    {"video": "copy", "audio": "copy", "remux": True, "hvc1": False},
+])
+def test_ffmpeg_no_escribe_estadisticas_en_stderr(dropbot, plan):
+    """El progreso llega por -progress: las estadísticas solo engordaban el
+    stderr que se guarda para el log."""
+    command = dropbot.build_ffmpeg_conversion_command("in.webm", "out.mp4", "NONE", None, plan)
+    assert "-nostats" in command
+    assert command.index("-nostats") < command.index("-i")
+
+
 def test_la_copia_de_pistas_hevc_reetiqueta_y_mapea_solo_video_y_audio(dropbot):
     plan = {"video": "copy", "audio": "copy", "remux": True, "hvc1": True}
     command = dropbot.build_ffmpeg_conversion_command("in.mkv", "out.mp4", "NONE", 23, plan)
@@ -835,9 +864,25 @@ def test_una_linea_partida_entre_lecturas_llega_entera(dropbot, run_async):
 
 
 def test_una_linea_enorme_sin_saltos_no_rompe_la_lectura(dropbot, run_async):
-    """readline() fallaba pasados 64 KiB sin salto de línea."""
+    """readline() fallaba pasados 64 KiB sin salto de línea; ahora se recorta."""
     data = b"x" * (200 * 1024)
-    assert _lines(run_async, dropbot, data) == ["x" * (200 * 1024)]
+    assert _lines(run_async, dropbot, data) == ["x" * dropbot.PROGRESS_LINE_MAX]
+
+
+def test_un_titulo_de_varios_mb_se_lee_sin_parar_el_bot(dropbot, run_async):
+    """yt-dlp escribe en una sola línea el <title> de una página genérica.
+    Volviendo a partir todo lo acumulado en cada lectura, 8 MiB eran unos 15 s
+    de event loop ocupado."""
+    prefix = b"[download] Downloading playlist: "
+    data = prefix + b"T" * (8 * 1024 * 1024) + b"\nsiguiente\n"
+
+    start = time.perf_counter()
+    lines = _lines(run_async, dropbot, data)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 2
+    assert lines[0].startswith(prefix.decode()) and len(lines[0]) == dropbot.PROGRESS_LINE_MAX
+    assert lines[1:] == ["siguiente"]
 
 
 def test_los_bytes_invalidos_se_sustituyen(dropbot, run_async):

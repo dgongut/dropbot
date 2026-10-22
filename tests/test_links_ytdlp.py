@@ -10,6 +10,7 @@ dice al usuario.
 import asyncio
 import json
 import os
+import signal
 import sys
 import textwrap
 from types import SimpleNamespace
@@ -19,6 +20,8 @@ import pytest
 
 import settings
 from button_data import button_data
+from conftest import FORUM_TOPIC
+from proc_helpers import alive
 
 URL = "https://www.youtube.com/watch?v=abc"
 
@@ -47,6 +50,20 @@ def err(line):
 
 def ready():
     touch(os.environ["FAKE_YTDLP_READY"])
+
+def done(p):
+    """Lo que imprime --print after_move:… al acabar del todo un vídeo."""
+    if "--print" in args:
+        out(args[args.index("--print") + 1].removeprefix("after_move:").replace("%(filepath)s", p))
+
+def gone(p, timeout=2):
+    """Si `p` deja de estar en su sitio (el bot se lo lleva) antes de `timeout` s."""
+    end = time.time() + timeout
+    while os.path.exists(p):
+        if time.time() > end:
+            return False
+        time.sleep(0.01)
+    return True
 '''
 
 
@@ -108,10 +125,17 @@ def links(quiet_bot, tmp_path, monkeypatch, config_dir):
 
 
 def _download(links, run_async, event, is_audio=False, playlist_count=1, mode=None, target=None):
-    """Lanza la descarga como lo hace el bot y espera a que termine."""
+    """Lanza la descarga como lo hace el bot y espera a que termine.
+
+    `target` es el mensaje que pasa a ser el de progreso (el de análisis o el
+    de los botones); si no se da, uno cualquiera.
+    """
+    if target is None:
+        target = MagicMock(name="botones")
+
     async def scenario():
         await links.bot.start_ytdlp_download(event, target, URL, is_audio, playlist_count, mode)
-        await links.bot.active_tasks[event.id]
+        await links.bot.active_tasks[links.bot.task_key(event)]
     run_async(scenario())
 
 
@@ -162,7 +186,7 @@ class TestUnVideo:
         assert _ls(links.temp) == [], "no debe quedar nada en TEMP_DIR"
         assert "Descarga completada" in texts() and "Mi_video.mp4" in texts()
         assert any(kind == "delete" for kind, _, _ in sent_messages), "el progreso se borra"
-        assert 501 not in links.bot.active_tasks
+        assert "42_501" not in links.bot.active_tasks
 
     def test_ofrece_los_botones_de_envio(self, links, fake_ytdlp, make_event, run_async, sent_messages):
         fake_ytdlp(VIDEO_MERGE)
@@ -189,7 +213,7 @@ class TestUnVideo:
         assert os.path.dirname(output) == str(links.temp)
         assert URL in args
         # Un vídeo suelto ni duerme entre descargas ni toca opciones de playlist
-        for flag in ("--sleep-interval", "--no-playlist", "--ignore-errors", "--playlist-end"):
+        for flag in ("--sleep-interval", "--no-playlist", "--ignore-errors", "--playlist-end", "--print"):
             assert flag not in args
 
     def test_un_audio_mp3_se_queda_solo_con_el_mp3(self, links, fake_ytdlp, make_event, run_async, texts):
@@ -214,6 +238,7 @@ class TestUnVideo:
         assert _ls(links.video) == []
         assert _ls(links.temp) == []
         assert texts().count("Descarga completada") == 1
+        assert "convertir" not in texts()
 
     def test_un_m4a_que_no_hace_falta_convertir(self, links, fake_ytdlp, make_event, run_async):
         settings.put("urls.audio_format", "M4A")
@@ -262,9 +287,11 @@ class TestUnVideo:
 
         assert ajeno.exists()
 
-    def test_si_no_se_puede_editar_el_mensaje_se_envia_uno_nuevo(
+    def test_si_no_se_puede_editar_el_mensaje_baja_sin_uno_nuevo(
         self, links, fake_ytdlp, make_event, run_async, sent_messages, monkeypatch
     ):
+        """Si la cola no edita a tiempo, un «Descargando…» mandado sin esperar
+        salía después, sin referencia: ni progreso ni nadie que lo borrara."""
         fake_ytdlp(VIDEO_MERGE)
 
         async def edit_timeout(message, text=None, **kwargs):
@@ -275,9 +302,52 @@ class TestUnVideo:
 
         _download(links, run_async, make_event(event_id=509), target=MagicMock())
 
-        kinds = [(kind, "Descargando" in text) for kind, text, _ in sent_messages[:2]]
-        assert kinds == [("edit", True), ("reply", True)]
-        assert _buttons(sent_messages[1][2]) == [b"cancel:509"]
+        downloading = [kind for kind, text, _ in sent_messages if "Descargando" in text]
+        assert downloading == ["edit"]
+        assert _ls(links.video) == ["Mi_video.mp4"]
+        assert "Descarga completada" in " ".join(text for _, text, _ in sent_messages)
+
+
+class TestTemaDelForo:
+    """El mensaje del botón pasa a ser el de progreso y se borra al terminar:
+    lo que se le contestaba después, sin el tema, salía en General."""
+
+    def _answers(self, sent_messages):
+        """Lo que se dice al usuario aparte de editar y borrar el progreso."""
+        return [(kind, text, kwargs) for kind, text, kwargs in sent_messages
+                if kind not in ("edit", "delete")]
+
+    @pytest.mark.parametrize("auto_send, then", [
+        ("ASK", ("upload_asking",)),
+        ("SEND", ("sending", "Mi_video.mp4")),
+    ])
+    def test_lo_que_se_dice_al_acabar_va_al_tema_del_boton(
+        self, links, fake_ytdlp, forum_callback, run_async, sent_messages, auto_send, then
+    ):
+        """«Descarga completada» y, detrás, sus botones o el «Enviando…»: con
+        los botones en General, al pulsar Enviar el vídeo también iba allí."""
+        settings.put("urls.auto_send", auto_send)
+        fake_ytdlp(VIDEO_MERGE)
+        click = forum_callback()
+
+        _download(links, run_async, click, target=click)
+
+        answers = self._answers(sent_messages)
+        assert "Descarga completada" in answers[0][1]
+        assert answers[1][1] == links.bot.get_text(*then)
+        assert [(kind, kwargs["reply_to"]) for kind, _, kwargs in answers] == [("send_message", FORUM_TOPIC)] * 2
+
+    def test_el_aviso_de_la_playlist_va_al_tema_del_boton(
+        self, links, fake_ytdlp, forum_callback, run_async, sent_messages
+    ):
+        fake_ytdlp(PLAYLIST_3)
+        click = forum_callback()
+
+        _download(links, run_async, click, playlist_count=3, mode="full", target=click)
+
+        [(kind, text, kwargs)] = self._answers(sent_messages)
+        assert "Playlist almacenada" in text
+        assert kind == "send_message" and kwargs["reply_to"] == FORUM_TOPIC
 
 
 class TestFallos:
@@ -294,7 +364,7 @@ class TestFallos:
 
         assert "La descarga desde la URL ha fallado" in texts()
         assert _ls(links.video) == [] and _ls(links.temp) == []
-        assert 511 not in links.bot.active_tasks
+        assert "42_511" not in links.bot.active_tasks
 
     def test_codigo_cero_pero_sin_ficheros_tambien_es_un_fallo(
         self, links, fake_ytdlp, make_event, run_async, texts
@@ -347,7 +417,7 @@ class TestFallos:
 
         assert "La descarga desde la URL ha fallado" in texts()
         assert sent_messages[0][0] == "delete", "el mensaje de progreso se quita"
-        assert 515 not in links.bot.active_tasks
+        assert "42_515" not in links.bot.active_tasks
 
     def test_un_fichero_anunciado_que_no_existe_no_rompe_nada(
         self, links, fake_ytdlp, make_event, run_async, texts
@@ -360,7 +430,146 @@ class TestFallos:
         _download(links, run_async, make_event(event_id=516))
 
         assert _ls(links.video) == []
-        assert 516 not in links.bot.active_tasks
+        assert "42_516" not in links.bot.active_tasks
+
+    def test_un_merge_que_falla_se_dice(self, links, fake_ytdlp, make_event, run_async, texts):
+        """yt-dlp anuncia el fichero mezclado antes de que ffmpeg lo escriba: si
+        ffmpeg falla (sin espacio, por ejemplo), ese fichero no llega a existir
+        y el progreso desaparecía sin ningún aviso."""
+        fake_ytdlp('''
+            v = path("Mi_video", "f137.mp4")
+            a = path("Mi_video", "f251.webm")
+            final = path("Mi_video", "mkv")
+            out(f"[download] Destination: {v}")
+            touch(v)
+            out("[download] 100% of   10.00MiB in 00:00:01 at 10.00MiB/s")
+            out(f"[download] Destination: {a}")
+            touch(a)
+            out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+            out(f'[Merger] Merging formats into "{final}"')
+            touch(path("Mi_video", "temp.mkv"), b"a medias")
+            err("ERROR: Postprocessing: Conversion failed!")
+            sys.exit(1)
+        ''')
+
+        _download(links, run_async, make_event(event_id=517))
+
+        assert "La descarga desde la URL ha fallado" in texts()
+        assert _ls(links.video) == [] and _ls(links.temp) == []
+
+    def test_un_audio_a_medio_convertir_no_se_entrega(self, links, fake_ytdlp, make_event, run_async, texts):
+        """ffmpeg escribe el .mp3 directamente: si falla a medias, queda cortado y
+        yt-dlp no llega a borrar el original, que es lo que está entero."""
+        fake_ytdlp('''
+            src = path("Cancion", "webm")
+            mp3 = path("Cancion", "mp3")
+            out(f"[download] Destination: {src}")
+            touch(src, b"original")
+            out("[download] 100% of    3.00MiB in 00:00:01 at 3.00MiB/s")
+            out(f"[ExtractAudio] Destination: {mp3}")
+            touch(mp3, b"cortado")
+            err("ERROR: Postprocessing: audio conversion failed: No space left on device")
+            sys.exit(1)
+        ''')
+
+        _download(links, run_async, make_event(event_id=518), is_audio=True)
+
+        assert _ls(links.audio) == ["Cancion.webm"]
+        assert (links.audio / "Cancion.webm").read_bytes() == b"original"
+        assert texts().count("Descarga completada") == 1
+        assert _ls(links.temp) == []
+
+    @pytest.mark.parametrize("audio_format, source", [("MP3", "webm"), ("M4A", "opus")])
+    def test_si_no_se_puede_convertir_el_audio_se_avisa(
+        self, links, fake_ytdlp, make_event, run_async, texts, audio_format, source
+    ):
+        """Se entrega el original, que está entero, pero no es lo que se pidió:
+        se daba por una descarga completada sin más, y con el envío automático
+        llegaba un .webm en vez de un MP3."""
+        settings.put("urls.audio_format", audio_format)
+        fake_ytdlp(f'''
+            src = path("Cancion", "{source}")
+            dst = path("Cancion", "{audio_format.lower()}")
+            out(f"[download] Destination: {{src}}")
+            touch(src, b"original")
+            out("[download] 100% of    3.00MiB in 00:00:01 at 3.00MiB/s")
+            out(f"[ExtractAudio] Destination: {{dst}}")
+            touch(dst, b"cortado")
+            err("ERROR: Postprocessing: audio conversion failed: Conversion failed!")
+            sys.exit(1)
+        ''')
+
+        _download(links, run_async, make_event(event_id=585), is_audio=True)
+
+        assert _ls(links.audio) == [f"Cancion.{source}"]
+        assert texts().count("Descarga completada") == 1
+        assert f"No se ha podido convertir a {audio_format}" in texts()
+        assert f"`Cancion.{source}`" in texts()
+
+    def test_una_linea_de_mas_de_64_kib_no_corta_la_descarga(self, links, fake_ytdlp, make_event, run_async, texts):
+        """yt-dlp repite el título de la playlist, que pone un tercero: con
+        readline() una línea tan larga cortaba la lectura, se avisaba de un
+        error y yt-dlp seguía descargando sin que nadie lo leyera."""
+        fake_ytdlp('''
+            out("[download] Downloading playlist: " + "A" * 100000)
+            final = path("Clip", "mp4")
+            out(f"[download] Destination: {final}")
+            touch(final)
+            out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+        ''')
+
+        _download(links, run_async, make_event(event_id=571))
+
+        assert _ls(links.video) == ["Clip.mp4"]
+        assert "Descarga completada" in texts() and "ha fallado" not in texts()
+
+    def test_una_salida_que_no_es_utf8_no_tira_la_descarga(self, links, fake_ytdlp, make_event, run_async, texts):
+        """ffmpeg imprime tal cual los metadatos, que no tienen por qué ser UTF-8."""
+        fake_ytdlp('''
+            sys.stderr.buffer.write(b"[ffmpeg] title: \\xff\\xfe sin decodificar\\n")
+            sys.stderr.flush()
+            final = path("Clip", "mp4")
+            out(f"[download] Destination: {final}")
+            touch(final)
+            out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+        ''')
+
+        _download(links, run_async, make_event(event_id=572))
+
+        assert _ls(links.video) == ["Clip.mp4"]
+        assert "ha fallado" not in texts()
+
+    def test_un_error_a_mitad_no_deja_ytdlp_vivo(
+        self, links, fake_ytdlp, make_event, run_async, texts, monkeypatch
+    ):
+        """Se avisaba del error y se borraban los temporales con yt-dlp vivo: sin
+        nadie leyendo su salida, acababa bloqueado escribiendo hasta reiniciar."""
+        fake_ytdlp('''
+            part = path("Largo", "f137.mp4")
+            out(f"[download] Destination: {part}")
+            touch(part + ".part")
+            out("[download]  12.0% of   10.00MiB at    1.00MiB/s ETA 00:09")
+            time.sleep(30)
+        ''')
+        procs = []
+
+        def broken(line):
+            procs.append(links.bot.active_tasks["42_573"])
+            raise RuntimeError("fallo leyendo la salida")
+
+        monkeypatch.setattr(links.bot, "parse_progress", broken)
+
+        try:
+            _download(links, run_async, make_event(event_id=573))
+
+            (proc,) = procs
+            assert proc.returncode is not None, "yt-dlp no debe quedar vivo"
+        finally:
+            if procs and procs[0].returncode is None:
+                os.kill(procs[0].pid, signal.SIGKILL)
+        assert "ha fallado" in texts()
+        assert _ls(links.temp) == []
+        assert "42_573" not in links.bot.active_tasks
 
 
 PLAYLIST_3 = '''
@@ -372,6 +581,31 @@ for index, title in ((1, "Uno"), (2, "Dos"), (3, "Tres")):
     out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
 out("[download] Finished downloading playlist: Lista")
 '''
+
+# Como el de verdad con --print after_move: avisa de cada vídeo terminado y,
+# antes de bajar el siguiente, apunta si el bot ya lo ha sacado de TEMP_DIR.
+# FAKE_UNAVAILABLE es un vídeo que no está disponible
+PLAYLIST_DONE = '''
+skip = os.environ.get("FAKE_UNAVAILABLE")
+moved = []
+for index, title in ((1, "Uno"), (2, "Dos"), (3, "Tres")):
+    if title == skip:
+        err(f"ERROR: [youtube] {title}: Video unavailable")
+        continue
+    final = path(title, "mp4", index)
+    out(f"[download] Destination: {final}")
+    touch(final, title.encode())
+    out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+    done(final)
+    moved.append(gone(final))
+with open(os.environ["FAKE_YTDLP_READY"] + ".moved", "w") as handle:
+    json.dump(moved, handle)
+sys.exit(1 if skip else 0)
+'''
+
+
+def _moved_early(fake_ytdlp):
+    return json.loads((fake_ytdlp.ready.parent / "ytdlp-ready.moved").read_text())
 
 
 class TestPlaylists:
@@ -386,7 +620,7 @@ class TestPlaylists:
         assert _ls(links.temp) == []
         assert "Playlist almacenada" in texts() and "**3 archivos**" in texts()
         data = [d for _, _, kwargs in sent_messages for d in _buttons(kwargs)]
-        assert data == [b"cancel:521"], "solo el botón de cancelar del progreso"
+        assert data == [b"cancel:42_521"], "solo el botón de cancelar del progreso"
         assert not links.uploaded
 
     def test_el_comando_de_playlist_entera(self, links, fake_ytdlp, make_event, run_async):
@@ -400,6 +634,9 @@ class TestPlaylists:
         assert args[args.index("--playlist-end") + 1] == "2"
         # 2 vídeos: 1 segundo entre uno y otro
         assert args[args.index("--sleep-interval") + 1] == "1"
+        # Avisa de cada vídeo terminado sin callar el progreso
+        assert args[args.index("--print") + 1] == "after_move:DROPBOT_DONE:%(filepath)s"
+        assert "--no-quiet" in args
 
     def test_solo_el_primero_ofrece_botones(self, links, fake_ytdlp, make_event, run_async, sent_messages):
         fake_ytdlp('''
@@ -415,6 +652,132 @@ class TestPlaylists:
         assert "--no-playlist" in args and "--sleep-interval" not in args
         assert _ls(links.video) == ["Uno.mp4"]
         assert any(d.startswith(b"send:") for _, _, kw in sent_messages for d in _buttons(kw))
+
+    def test_solo_el_primero_de_una_lista_pura_baja_uno(self, links, fake_ytdlp, make_event, run_async, texts):
+        """En playlist?list=… (sin vídeo en el enlace) --no-playlist no hace nada:
+        yt-dlp bajaba la lista entera, sin tope ni pausa entre vídeos."""
+        fake_ytdlp('''
+            items = [(1, "Uno"), (2, "Dos"), (3, "Tres")]
+            if "--playlist-items" in args:
+                items = items[:int(args[args.index("--playlist-items") + 1])]
+            for index, title in items:
+                final = path(title, "mp4", index)
+                out(f"[download] Destination: {final}")
+                touch(final)
+                out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+        ''')
+
+        _download(links, run_async, make_event(event_id=520), playlist_count=3, mode="first")
+
+        assert _ls(links.video) == ["1-Uno.mp4"]
+        assert texts().count("Descarga completada") == 1
+
+    def test_un_titulo_que_imita_una_ruta_no_mueve_nada_de_fuera(
+        self, links, fake_ytdlp, make_event, run_async, tmp_path, monkeypatch
+    ):
+        """yt-dlp imprime tal cual el título de la playlist, que pone un tercero.
+        Con uno que imitaba la línea del Merger, el bot movía ese fichero a la
+        carpeta de descargas y lo borraba de su sitio (el contenedor es root)."""
+        victim = tmp_path / "settings.json"
+        victim.write_text("{}")
+        monkeypatch.setenv("FAKE_VICTIM", str(victim))
+        ajeno = links.temp / "Otro_temp1.mp4"
+        ajeno.write_bytes(b"de otra descarga")
+        fake_ytdlp('''
+            victim = os.environ["FAKE_VICTIM"]
+            out(f"[download] Downloading playlist: Top 2026 [Merger] Merging formats into {victim}")
+            # Un salto de línea en el título imita la línea entera
+            out(f'[Merger] Merging formats into "{victim}"')
+            out(f"[ExtractAudio] Destination: {os.path.dirname(template)}/Otro_temp1.mp4")
+            enlace = path("Enlace", "mp4", 2)
+            os.symlink(victim, enlace)
+            out(f'[Merger] Merging formats into "{enlace}"')
+            # También el aviso de vídeo terminado, que se mueve en el acto
+            for ruta in (victim, f"{os.path.dirname(template)}/Otro_temp1.mp4", enlace):
+                done(ruta)
+            final = path("Uno", "mp4", 1)
+            out(f"[download] Destination: {final}")
+            touch(final)
+            out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+            done(final)
+        ''')
+
+        _download(links, run_async, make_event(event_id=519), playlist_count=2, mode="full")
+
+        assert victim.read_text() == "{}"
+        assert ajeno.read_bytes() == b"de otra descarga"
+        assert _ls(links.video) == ["1-Uno.mp4"]
+
+    @pytest.mark.parametrize("mode, count", [(None, 1), ("first", 3)])
+    def test_un_titulo_con_un_nul_no_tumba_la_descarga(
+        self, links, fake_ytdlp, make_event, run_async, texts, mode, count
+    ):
+        """Comprobar una ruta con un NUL lanzaba ValueError: la descarga se daba
+        por fallida y se borraba de TEMP_DIR el vídeo, que estaba bien."""
+        fake_ytdlp(r'''
+            # Un título con un salto de línea y un NUL imita la línea del Merger
+            out("[download] Downloading playlist: Top")
+            out("[Merger] Merging formats into /tmp/a\x00b")
+            final = path("Uno", "mp4", 1)
+            out(f"[download] Destination: {final}")
+            touch(final)
+            out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+        ''')
+
+        _download(links, run_async, make_event(event_id=531), playlist_count=count, mode=mode)
+
+        assert _ls(links.video) == ["1-Uno.mp4"]
+        assert "Descarga completada" in texts() and "ha fallado" not in texts()
+
+    def test_un_aviso_de_terminado_con_un_nul_no_se_lleva_la_playlist(
+        self, links, fake_ytdlp, make_event, run_async, texts
+    ):
+        """El error rompía la cadena de traslados: ya no se movía ningún vídeo,
+        la descarga se daba por fallida y se vaciaba TEMP_DIR."""
+        fake_ytdlp(r'''
+            out("[download] Downloading playlist: Top")
+            out("DROPBOT_DONE:/tmp/a\x00b")
+            for index, title in ((1, "Uno"), (2, "Dos")):
+                final = path(title, "mp4", index)
+                out(f"[download] Destination: {final}")
+                touch(final)
+                out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+                done(final)
+        ''')
+
+        _download(links, run_async, make_event(event_id=532), playlist_count=2, mode="full")
+
+        assert _ls(links.video) == ["1-Uno.mp4", "2-Dos.mp4"]
+        assert "Playlist almacenada" in texts() and "ha fallado" not in texts()
+
+    def test_si_falla_la_comprobacion_de_un_video_terminado_se_mueven_los_demas(
+        self, links, fake_ytdlp, make_event, run_async, texts, monkeypatch
+    ):
+        """Cada traslado espera al anterior: el error de uno lo relanzaban todos
+        los de detrás y la playlist acababa en el error genérico."""
+        real = links.bot.is_ytdlp_output
+        checked = []
+
+        def fails_once(path, marker):
+            checked.append(path)
+            if len(checked) == 1:
+                raise OSError("Input/output error")
+            return real(path, marker)
+
+        monkeypatch.setattr(links.bot, "is_ytdlp_output", fails_once)
+        fake_ytdlp('''
+            for index, title in ((1, "Uno"), (2, "Dos")):
+                final = path(title, "mp4", index)
+                out(f"[download] Destination: {final}")
+                touch(final)
+                out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+                done(final)
+        ''')
+
+        _download(links, run_async, make_event(event_id=533), playlist_count=2, mode="full")
+
+        assert _ls(links.video) == ["1-Uno.mp4", "2-Dos.mp4"]
+        assert "Playlist almacenada" in texts() and "ha fallado" not in texts()
 
     def test_una_playlist_con_videos_no_disponibles_cuenta_lo_que_hay(
         self, links, fake_ytdlp, make_event, run_async, texts
@@ -472,6 +835,37 @@ class TestPlaylists:
         assert _ls(links.audio) == ["1-Uno.mp3", "2-Dos.mp3"]
         assert "**2 archivos**" in texts()
         assert "parcial" not in texts()
+        assert "convertir" not in texts()
+
+    def test_en_una_playlist_se_avisa_de_los_audios_sin_convertir(
+        self, links, fake_ytdlp, make_event, run_async, texts
+    ):
+        """Con --ignore-errors, yt-dlp sigue con el resto y da por terminado el
+        original del que falla: se guardaba y contaba como «correctamente»."""
+        fake_ytdlp('''
+            for index, title in ((1, "Uno"), (2, "Dos")):
+                src = path(title, "webm", index)
+                mp3 = path(title, "mp3", index)
+                out(f"[download] Destination: {src}")
+                touch(src)
+                out("[download] 100% of    3.00MiB in 00:00:01 at 3.00MiB/s")
+                out(f"[ExtractAudio] Destination: {mp3}")
+                touch(mp3)
+                if index == 1:
+                    err("ERROR: Postprocessing: audio conversion failed: Conversion failed!")
+                    done(src)
+                else:
+                    os.remove(src)
+                    out(f"Deleting original file {src} (pass -k to keep)")
+                    done(mp3)
+            sys.exit(1)
+        ''')
+
+        _download(links, run_async, make_event(event_id=586), is_audio=True, playlist_count=2, mode="full")
+
+        assert _ls(links.audio) == ["1-Uno.webm", "2-Dos.mp3"]
+        assert "**2 archivos**" in texts()
+        assert "Sin convertir a MP3: 1." in texts()
 
     @pytest.mark.parametrize("mode,delete_after", [("SEND", False), ("SEND_DELETE", True)])
     def test_el_envio_automatico_manda_cada_video(
@@ -511,12 +905,161 @@ class TestPlaylists:
 
         assert not links.uploaded
 
+    def test_cada_video_se_lleva_a_su_carpeta_en_cuanto_acaba(
+        self, links, fake_ytdlp, make_event, run_async, texts
+    ):
+        """Se movían todos al final: una playlist de horas se quedaba entera en
+        TEMP_DIR, en el disco del contenedor, y un reinicio a mitad la perdía."""
+        fake_ytdlp(PLAYLIST_DONE)
+
+        _download(links, run_async, make_event(event_id=581), playlist_count=3, mode="full")
+
+        assert _moved_early(fake_ytdlp) == [True, True, True]
+        # Ni se mueven dos veces ni se cuentan dos veces
+        assert _ls(links.video) == ["1-Uno.mp4", "2-Dos.mp4", "3-Tres.mp4"]
+        assert (links.video / "2-Dos.mp4").read_bytes() == b"Dos"
+        assert _ls(links.temp) == []
+        assert "Playlist almacenada" in texts() and "**3 archivos**" in texts()
+        assert "parcial" not in texts()
+
+    def test_los_videos_movidos_al_acabar_cuentan_bien_los_que_faltan(
+        self, links, fake_ytdlp, make_event, run_async, texts, monkeypatch
+    ):
+        monkeypatch.setenv("FAKE_UNAVAILABLE", "Dos")
+        fake_ytdlp(PLAYLIST_DONE)
+
+        _download(links, run_async, make_event(event_id=582), playlist_count=3, mode="full")
+
+        assert _moved_early(fake_ytdlp) == [True, True]
+        assert _ls(links.video) == ["1-Uno.mp4", "3-Tres.mp4"]
+        assert "parcial" in texts() and "**2/3 archivos**" in texts()
+        assert "ha fallado" not in texts()
+
+    def test_el_envio_automatico_manda_los_videos_movidos_al_acabar(
+        self, links, fake_ytdlp, make_event, run_async
+    ):
+        settings.put("urls.auto_send", "SEND")
+        fake_ytdlp(PLAYLIST_DONE)
+
+        _download(links, run_async, make_event(event_id=583), playlist_count=3, mode="full")
+
+        assert _moved_early(fake_ytdlp) == [True, True, True]
+        assert links.uploaded == [("1-Uno.mp4", False), ("2-Dos.mp4", False), ("3-Tres.mp4", False)]
+
+    def test_un_traslado_lento_no_para_la_lectura_de_ytdlp(
+        self, links, fake_ytdlp, make_event, run_async, monkeypatch
+    ):
+        """Esperando la copia en la lectura de stdout, una larga entre
+        dispositivos llenaba la tubería y dejaba a yt-dlp parado."""
+        fake_ytdlp('''
+            first = path("Uno", "mp4", 1)
+            touch(first)
+            done(first)
+            # Más de lo que cabe en la tubería y el búfer de asyncio (unos
+            # 192 KiB) mientras el bot copia el primero
+            for _ in range(5000):
+                out("[download]  50.0% of   10.00MiB at    1.00MiB/s ETA 00:05" + " " * 40)
+            ready()
+        ''')
+        real_move = links.bot.move_download_to
+        while_moving = []
+
+        async def slow_move(path, folder):
+            # La copia no acaba hasta que yt-dlp ha podido escribirlo todo
+            for _ in range(300):
+                if fake_ytdlp.ready.exists():
+                    break
+                await asyncio.sleep(0.01)
+            while_moving.append(fake_ytdlp.ready.exists())
+            return await real_move(path, folder)
+
+        monkeypatch.setattr(links.bot, "move_download_to", slow_move)
+
+        _download(links, run_async, make_event(event_id=584), playlist_count=2, mode="full")
+
+        assert while_moving == [True], "yt-dlp ha seguido escribiendo mientras se copiaba"
+        assert _ls(links.video) == ["1-Uno.mp4"]
+
+
+# Como el de verdad: carga las cookies al empezar y, al salir, reescribe el
+# fichero que recibe con las que cargó más las que le ha renovado el sitio
+COOKIES_DOWNLOAD = '''
+jar = args[args.index("--cookies") + 1]
+with open(jar) as handle:
+    loaded = handle.read()
+if os.environ.get("FAKE_NEW_EXPORT"):
+    # Mientras dura la descarga, el admin exporta unas cookies nuevas
+    with open(os.environ["FAKE_NEW_EXPORT"], "w") as handle:
+        handle.write("# exportacion nueva\\n")
+final = path("Clip", "mp4")
+out(f"[download] Destination: {final}")
+touch(final)
+out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+with open(jar, "w") as handle:
+    handle.write(loaded + "# renovada\\n")
+'''
+
+
+class TestCookies:
+    @pytest.fixture
+    def cookies(self, links, tmp_path, monkeypatch):
+        cookies = tmp_path / "cookies.txt"
+        cookies.write_text("# sesion\n")
+        monkeypatch.setattr(links.bot, "YTDLP_COOKIES_FILE", str(cookies))
+        return cookies
+
+    def test_unas_cookies_exportadas_durante_la_descarga_no_se_pisan(
+        self, links, cookies, fake_ytdlp, make_event, run_async, monkeypatch
+    ):
+        """Con el fichero compartido, la descarga lo reescribía al salir con lo
+        que cargó al empezar y la exportación nueva desaparecía sin aviso."""
+        monkeypatch.setenv("FAKE_NEW_EXPORT", str(cookies))
+        fake_ytdlp(COOKIES_DOWNLOAD)
+
+        _download(links, run_async, make_event(event_id=561))
+
+        assert cookies.read_text() == "# exportacion nueva\n"
+        assert _ls(links.video) == ["Clip.mp4"]
+        assert _ls(links.temp) == [], "la copia también se borra"
+
+    def test_lo_que_renueva_una_descarga_se_guarda(self, links, cookies, fake_ytdlp, make_event, run_async):
+        fake_ytdlp(COOKIES_DOWNLOAD)
+
+        _download(links, run_async, make_event(event_id=562))
+
+        assert cookies.read_text() == "# sesion\n# renovada\n"
+        assert _ls(links.temp) == []
+
+    def test_una_descarga_fallida_no_guarda_nada(self, links, cookies, fake_ytdlp, make_event, run_async):
+        fake_ytdlp(COOKIES_DOWNLOAD + 'sys.exit(1)\n')
+
+        _download(links, run_async, make_event(event_id=563))
+
+        assert cookies.read_text() == "# sesion\n"
+        assert _ls(links.temp) == []
+
 
 CANCELABLE_PLAYLIST = '''
 done = path("Uno", "mp4", 1)
 out(f"[download] Destination: {done}")
 touch(done, b"terminado")
 out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+part = path("Dos", "f137.mp4", 2)
+out(f"[download] Destination: {part}")
+touch(part + ".part")
+out("[download]  12.0% of   10.00MiB at    1.00MiB/s ETA 00:09")
+ready()
+time.sleep(30)
+'''
+
+# El primero ya se lo ha llevado el bot al terminarlo (--print after_move)
+CANCELABLE_PLAYLIST_DONE = '''
+first = path("Uno", "mp4", 1)
+out(f"[download] Destination: {first}")
+touch(first, b"terminado")
+out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+done(first)
+gone(first)
 part = path("Dos", "f137.mp4", 2)
 out(f"[download] Destination: {part}")
 touch(part + ".part")
@@ -533,10 +1076,23 @@ ready()
 time.sleep(30)
 '''
 
+# Un directo: yt-dlp le pasa la grabación a ffmpeg, que hereda sus tuberías
+CANCELABLE_LIVE = '''
+import subprocess
+part = path("Directo", "mp4")
+out(f"[download] Destination: {part}")
+ffmpeg = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+with open(os.environ["FAKE_YTDLP_READY"] + ".ffmpeg", "w") as handle:
+    handle.write(str(ffmpeg.pid))
+touch(part + ".part")
+ready()
+ffmpeg.wait()
+'''
+
 
 async def _wait_ready(fake_ytdlp, bot, event_id):
     for _ in range(500):
-        if fake_ytdlp.ready.exists() and isinstance(bot.active_tasks.get(event_id), asyncio.subprocess.Process):
+        if fake_ytdlp.ready.exists() and isinstance(bot.active_tasks.get(f"42_{event_id}"), asyncio.subprocess.Process):
             return
         await asyncio.sleep(0.01)
     raise AssertionError("el yt-dlp falso no llegó a arrancar")
@@ -546,10 +1102,10 @@ class TestCancelar:
     def _run_and_cancel(self, links, fake_ytdlp, make_event, run_async, event_id, playlist_count, mode):
         async def scenario():
             event = make_event(event_id=event_id)
-            await links.bot.start_ytdlp_download(event, None, URL, False, playlist_count, mode)
-            task = links.bot.active_tasks[event_id]
+            await links.bot.start_ytdlp_download(event, MagicMock(), URL, False, playlist_count, mode)
+            task = links.bot.active_tasks[f"42_{event_id}"]
             await _wait_ready(fake_ytdlp, links.bot, event_id)
-            click = make_event(event_id=9000 + event_id, data=f"cancel:{event_id}".encode())
+            click = make_event(event_id=9000 + event_id, data=f"cancel:42_{event_id}".encode())
             await links.bot.cancel_download(click)
             await asyncio.wait_for(task, timeout=10)
         run_async(scenario())
@@ -565,7 +1121,19 @@ class TestCancelar:
         assert (links.video / "1-Uno.mp4").read_bytes() == b"terminado"
         assert _ls(links.temp) == [], "el vídeo a medias se borra"
         assert "Se conservaron **1 de 3 vídeos**" in texts()
-        assert 531 not in links.bot.active_tasks
+        assert "42_531" not in links.bot.active_tasks
+
+    def test_cancelar_una_playlist_cuenta_los_videos_ya_movidos(
+        self, links, fake_ytdlp, make_event, run_async, texts
+    ):
+        fake_ytdlp(CANCELABLE_PLAYLIST_DONE)
+
+        self._run_and_cancel(links, fake_ytdlp, make_event, run_async, 538, 3, "full")
+
+        assert _ls(links.video) == ["1-Uno.mp4"]
+        assert (links.video / "1-Uno.mp4").read_bytes() == b"terminado"
+        assert _ls(links.temp) == []
+        assert "Se conservaron **1 de 3 vídeos**" in texts()
 
     def test_cancelar_un_video_suelto_borra_lo_descargado(
         self, links, fake_ytdlp, make_event, run_async, texts
@@ -578,7 +1146,7 @@ class TestCancelar:
         assert _ls(links.temp) == []
         assert "Descarga cancelada" in texts()
         assert "ha fallado" not in texts()
-        assert 532 not in links.bot.active_tasks
+        assert "42_532" not in links.bot.active_tasks
 
     def test_cancelar_una_playlist_sin_nada_terminado_es_una_cancelacion_normal(
         self, links, fake_ytdlp, make_event, run_async, texts
@@ -597,10 +1165,10 @@ class TestCancelar:
 
         async def scenario():
             event = make_event(event_id=534)
-            await links.bot.start_ytdlp_download(event, None, URL, False)
-            task = links.bot.active_tasks[534]
+            await links.bot.start_ytdlp_download(event, MagicMock(), URL, False)
+            task = links.bot.active_tasks["42_534"]
             await _wait_ready(fake_ytdlp, links.bot, 534)
-            proc = links.bot.active_tasks[534]
+            proc = links.bot.active_tasks["42_534"]
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -611,27 +1179,81 @@ class TestCancelar:
         assert proc.returncode is not None, "yt-dlp no debe quedar vivo"
         assert _ls(links.temp) == []
         assert "Descarga cancelada" in texts()
-        assert 534 not in links.bot.active_tasks
+        assert "42_534" not in links.bot.active_tasks
+
+    def test_cancelar_un_directo_para_tambien_el_ffmpeg(self, links, fake_ytdlp, make_event, run_async, texts):
+        """Solo se paraba yt-dlp: ffmpeg seguía grabando con sus tuberías abiertas,
+        así que la descarga no llegaba a acabar y el disco se iba llenando."""
+        fake_ytdlp(CANCELABLE_LIVE)
+
+        self._run_and_cancel(links, fake_ytdlp, make_event, run_async, 535, 1, None)
+
+        assert not alive(int((fake_ytdlp.ready.parent / "ytdlp-ready.ffmpeg").read_text()))
+        assert "Descarga cancelada" in texts()
+        assert _ls(links.video) == [] and _ls(links.temp) == []
+        assert "42_535" not in links.bot.active_tasks
+
+    def test_cancelar_la_tarea_para_tambien_el_ffmpeg(self, links, fake_ytdlp, make_event, run_async, texts):
+        fake_ytdlp(CANCELABLE_LIVE)
+
+        async def scenario():
+            event = make_event(event_id=536)
+            await links.bot.start_ytdlp_download(event, MagicMock(), URL, False)
+            task = links.bot.active_tasks["42_536"]
+            await _wait_ready(fake_ytdlp, links.bot, 536)
+            task.cancel()
+            done, _ = await asyncio.wait([task], timeout=10)
+            return done
+
+        assert run_async(scenario()), "la cancelación no ha terminado"
+        assert not alive(int((fake_ytdlp.ready.parent / "ytdlp-ready.ffmpeg").read_text()))
+        assert "Descarga cancelada" in texts()
+        assert _ls(links.temp) == []
+
+    def test_al_acabar_no_quita_la_tarea_que_la_ha_pisado(self, links, fake_ytdlp, make_event, run_async):
+        """Dos descargas del mismo mensaje compartían la clave: la primera en
+        acabar se llevaba la de la otra, que ya no se podía cancelar."""
+        fake_ytdlp('''
+            ready()
+            time.sleep(0.3)
+            final = path("Clip", "mp4")
+            out(f"[download] Destination: {final}")
+            touch(final)
+            out("[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s")
+        ''')
+        other = object()
+
+        async def scenario():
+            event = make_event(event_id=537)
+            await links.bot.start_ytdlp_download(event, None, URL, False)
+            task = links.bot.active_tasks["42_537"]
+            await _wait_ready(fake_ytdlp, links.bot, 537)
+            links.bot.active_tasks["42_537"] = other
+            await task
+
+        run_async(scenario())
+
+        assert links.bot.active_tasks["42_537"] is other
 
 
 class TestBotonCancelar:
     def test_una_tarea_que_aun_no_ha_lanzado_ytdlp_se_cancela(self, quiet_bot, make_event, run_async):
         async def scenario():
             task = asyncio.create_task(asyncio.sleep(30))
-            quiet_bot.active_tasks[541] = task
-            await quiet_bot.cancel_download(make_event(data=b"cancel:541"))
+            quiet_bot.active_tasks["42_541"] = task
+            await quiet_bot.cancel_download(make_event(data=b"cancel:42_541"))
             await asyncio.sleep(0)
             return task.cancelled()
 
         try:
             assert run_async(scenario()) is True
         finally:
-            quiet_bot.active_tasks.pop(541, None)
+            quiet_bot.active_tasks.pop("42_541", None)
 
     def test_una_descarga_ya_terminada_solo_borra_el_mensaje(self, quiet_bot, make_event, run_async, sent_messages):
-        quiet_bot.active_tasks.pop(542, None)
+        quiet_bot.active_tasks.pop("42_542", None)
 
-        run_async(quiet_bot.cancel_download(make_event(data=b"cancel:542")))
+        run_async(quiet_bot.cancel_download(make_event(data=b"cancel:42_542")))
 
         assert [kind for kind, _, _ in sent_messages] == ["delete"]
 
@@ -643,17 +1265,35 @@ class TestBotonCancelar:
                 raise ProcessLookupError
 
             proc.terminate = gone
-            quiet_bot.active_tasks[543] = proc
+            quiet_bot.active_tasks["42_543"] = proc
             try:
-                await quiet_bot.cancel_download(make_event(data=b"cancel:543"))
+                await quiet_bot.cancel_download(make_event(data=b"cancel:42_543"))
             finally:
-                quiet_bot.active_tasks.pop(543, None)
+                quiet_bot.active_tasks.pop("42_543", None)
                 proc.kill()
                 await proc.wait()
 
         run_async(scenario())
 
         assert [kind for kind, _, _ in sent_messages] == ["delete"]
+
+    @pytest.mark.parametrize("data", [b"cancel:abc", b"cancel:", b"cancel:\xff"])
+    def test_un_data_mal_formado_solo_se_contesta(
+        self, quiet_bot, make_event, run_async, sent_messages, monkeypatch, data
+    ):
+        """Los botones del bot siempre llevan un id: uno fabricado a mano no
+        cancela nada ni deja el botón girando con una excepción en el log."""
+        answered = []
+
+        async def answer(event, *args, **kwargs):
+            answered.append(event)
+
+        monkeypatch.setattr(quiet_bot, "safe_answer", answer)
+
+        run_async(quiet_bot.cancel_download(make_event(data=data)))
+
+        assert len(answered) == 1
+        assert sent_messages == []
 
 
 class TestProgreso:
@@ -683,7 +1323,106 @@ class TestProgreso:
         # (2-1)/4 de la playlist + 45.2%/4 del vídeo actual
         assert "36.3% total" in texts[0]
         assert "50.0% total" in texts[1]
-        assert _buttons(status.edit.await_args_list[0].kwargs) == [b"cancel:551"]
+        assert _buttons(status.edit.await_args_list[0].kwargs) == [b"cancel:42_551"]
+
+    def test_con_telegram_sin_responder_la_descarga_sigue(
+        self, links, fake_ytdlp, make_event, run_async, monkeypatch
+    ):
+        """Telethon retiene la edición hasta reconectar (minutos) y, mientras,
+        nadie leía la salida de yt-dlp: la tubería se llenaba y se paraba."""
+        monkeypatch.setattr(links.bot, "PROGRESS_EDIT_TIMEOUT", 0.1)
+        fake_ytdlp('''
+            final = path("Clip", "mp4")
+            out(f"[download] Destination: {final}")
+            touch(final)
+            out("[download]  45.2% of   10.00MiB at    1.23MiB/s ETA 00:30")
+            out("[download] 100% of   10.00MiB in 00:00:08 at 1.20MiB/s")
+        ''')
+
+        async def no_answer(*args, **kwargs):
+            await asyncio.sleep(3600)
+
+        status = MagicMock(name="progreso")
+        status.edit = AsyncMock(side_effect=no_answer)
+        script = os.path.join(os.environ["PATH"].split(os.pathsep)[0], "yt-dlp")
+        cmd = [script, "-o", str(links.temp / "%(title).200s_temp1.%(ext)s"), URL]
+
+        run_async(asyncio.wait_for(links.bot.run_url_download(
+            make_event(event_id=552), cmd, status, str(links.video), temp_marker="_temp1",
+        ), 10))
+
+        assert _ls(links.video) == ["Clip.mp4"]
+        assert status.edit.call_count == 2, "se sigue intentando, sin esperar a Telegram"
+
+
+class TestLog:
+    @pytest.fixture
+    def logged(self, links, monkeypatch):
+        lines = []
+        for level in ("debug", "warning", "error"):
+            monkeypatch.setattr(links.bot, level, lines.append)
+        return lines
+
+    @pytest.mark.parametrize("finished, code", [(True, 0), (False, 0), (False, 1)])
+    def test_el_progreso_no_llena_el_log_y_lo_demas_sigue(
+        self, links, fake_ytdlp, logged, make_event, run_async, finished, code
+    ):
+        """Con --newline yt-dlp da varias líneas de progreso por segundo, y cada
+        una iba al log tres veces; el ffmpeg de un directo, otra por cada
+        estadística. Sin rotación, el log de Docker crecía sin tope. Tampoco
+        van en lo que se vuelca al log cuando la descarga no deja nada."""
+        fake_ytdlp('''
+            final = path("Clip", "mp4")
+            out(f"[download] Destination: {final}")
+            for i in range(300):
+                out(f"[download] {i / 3:5.1f}% of   10.00MiB at    1.23MiB/s ETA 00:30")
+                out(f"[download]  {i}.00KiB at  512.00KiB/s (00:00:0{i % 10})")
+                sys.stderr.write(f"frame= {i} fps= 25 q=-1.0 size= {i}kB time=00:00:01.00 bitrate=1.0kbits/s speed=1.0x\\r")
+            if FINISHED:
+                touch(final)
+            out("[download] 100% of   10.00MiB in 00:00:08 at 1.20MiB/s")
+            err("WARNING: [generic] Falling back on generic information extractor")
+            sys.exit(CODE)
+        '''.replace("FINISHED", str(finished)).replace("CODE", str(code)))
+        status = MagicMock(name="progreso")
+        status.edit = AsyncMock()
+        script = os.path.join(os.environ["PATH"].split(os.pathsep)[0], "yt-dlp")
+        cmd = [script, "-o", str(links.temp / "%(title).200s_temp1.%(ext)s"), URL]
+
+        run_async(links.bot.run_url_download(
+            make_event(event_id=562), cmd, status, str(links.video), temp_marker="_temp1"))
+
+        assert _ls(links.video) == (["Clip.mp4"] if finished else [])
+        assert status.edit.await_count >= 2, "el progreso se sigue leyendo"
+        assert len(logged) < 60, f"{len(logged)} líneas de log"
+        assert not [line for line in logged if "ETA 00:30" in line or "KiB/s" in line or "frame=" in line]
+        assert any("Destination:" in line for line in logged)
+        assert any("100% of   10.00MiB in 00:00:08" in line for line in logged)
+        assert any("Falling back on generic" in line for line in logged)
+
+    @pytest.mark.parametrize("code", [0, 1])
+    def test_la_contrasena_y_los_tokens_de_la_url_no_llegan_al_log(
+        self, links, fake_ytdlp, logged, make_event, run_async, code
+    ):
+        """El comando de yt-dlp y lo que imprime dejaban en `docker logs` el
+        usuario:contraseña de la URL y sus tokens; si fallaba, a nivel ERROR."""
+        url = "https://admin:MiClave@nas.local/video?token=secreto"
+        fake_ytdlp(f'''
+            out(f"[generic] Extracting URL: {{args[-1]}}")
+            err(f"ERROR: [generic] Unable to download webpage: {{args[-1]}}")
+            sys.exit({code})
+        ''')
+
+        async def scenario():
+            await links.bot.start_ytdlp_download(make_event(event_id=563), MagicMock(), url, False)
+            await links.bot.active_tasks["42_563"]
+
+        run_async(scenario())
+
+        assert fake_ytdlp.calls()[0][-1] == url, "yt-dlp recibe la URL entera"
+        log = "\n".join(logged)
+        assert "nas.local/video" in log
+        assert "MiClave" not in log and "secreto" not in log
 
 
 class TestParseProgress:
@@ -742,6 +1481,19 @@ class TestUpdateProgressMessage:
         status.edit = AsyncMock(side_effect=RuntimeError("FloodWait"))
 
         run_async(quiet_bot.update_progress_message(status, self.INFO, make_event(), "x"))
+
+    def test_una_edicion_sin_respuesta_no_se_espera(self, quiet_bot, make_event, run_async, config_dir, monkeypatch):
+        monkeypatch.setattr(quiet_bot, "PROGRESS_EDIT_TIMEOUT", 0.1)
+
+        async def no_answer(*args, **kwargs):
+            await asyncio.sleep(3600)
+
+        status = MagicMock(name="progreso")
+        status.edit = AsyncMock(side_effect=no_answer)
+
+        run_async(asyncio.wait_for(quiet_bot.update_progress_message(status, self.INFO, make_event(), "x"), 5))
+
+        status.edit.assert_called_once()
 
     def test_un_progreso_ilegible_no_corta_la_descarga(self, quiet_bot, make_event, run_async, config_dir):
         status = self._status()
@@ -817,6 +1569,52 @@ class TestExtractFilePaths:
         ]
         assert dropbot.extract_file_paths(lines) == ["/tmp/1-A_temp1.mp4", "/tmp/2-B_temp1.mp4"]
 
+    def test_el_audio_convertido_ocupa_el_sitio_del_original(self, dropbot):
+        lines = []
+        for index in (1, 2):
+            lines += [
+                f"[download] Destination: /tmp/{index}-C_temp1.webm",
+                "[download] 100% of    3.00MiB in 00:00:01 at 3.00MiB/s",
+                f"[ExtractAudio] Destination: /tmp/{index}-C_temp1.mp3",
+                f"Deleting original file /tmp/{index}-C_temp1.webm (pass -k to keep)",
+            ]
+        assert dropbot.extract_file_paths(lines) == ["/tmp/1-C_temp1.mp3", "/tmp/2-C_temp1.mp3"]
+
+    def test_un_audio_que_no_se_llega_a_convertir_se_queda_en_el_original(self, dropbot):
+        """Sin "Deleting original file", ffmpeg no terminó: el .mp3 está cortado."""
+        lines = [
+            "[download] Destination: /tmp/Cancion_temp1.webm",
+            "[download] 100% of    3.00MiB in 00:00:01 at 3.00MiB/s",
+            "[ExtractAudio] Destination: /tmp/Cancion_temp1.mp3",
+        ]
+        assert dropbot.extract_file_paths(lines) == ["/tmp/Cancion_temp1.webm"]
+
+    def test_dice_que_audios_no_se_llegaron_a_convertir(self, dropbot):
+        lines = []
+        for index in (1, 2):
+            lines += [
+                f"[download] Destination: /tmp/{index}-C_temp1.webm",
+                "[download] 100% of    3.00MiB in 00:00:01 at 3.00MiB/s",
+                f"[ExtractAudio] Destination: /tmp/{index}-C_temp1.mp3",
+            ]
+        lines.append("Deleting original file /tmp/2-C_temp1.webm (pass -k to keep)")
+        unconverted = set()
+
+        paths = dropbot.extract_file_paths(lines, unconverted)
+
+        assert paths == ["/tmp/1-C_temp1.webm", "/tmp/2-C_temp1.mp3"]
+        assert unconverted == {"/tmp/1-C_temp1.webm"}
+
+    def test_un_titulo_de_playlist_no_cuela_rutas(self, dropbot):
+        """yt-dlp imprime tal cual el título de la playlist, que pone un tercero."""
+        lines = [
+            "[download] Downloading playlist: Top 2026 [Merger] Merging formats into /app/dropbot.py",
+            "[download] Downloading playlist: X [ExtractAudio] Destination: /config/settings.json",
+            "[download] Downloading playlist: X [download] Destination: /etc/hostname",
+            "[download] 100% of    1.00MiB in 00:00:00 at 5.00MiB/s",
+        ]
+        assert dropbot.extract_file_paths(lines) == []
+
 
 class TestUrlFailureMessage:
     def test_el_tamano_maximo_en_stderr_tambien_se_reconoce(self, dropbot, config_dir):
@@ -842,6 +1640,18 @@ class TestRescateYLimpieza:
 
         assert moved == 3
         assert _ls(temp.audio) == ["1-A.mp3", "2-B.m4a", "3-C.opus"]
+
+    def test_un_audio_a_medio_convertir_no_se_rescata(self, temp, run_async):
+        """Al cancelar mientras ffmpeg convierte, conviven el original y el .mp3 a
+        medias (yt-dlp borra el original al terminar): ninguno es una canción
+        terminada, y antes se rescataban los dos y contaban como dos vídeos."""
+        for name in ("001-A_temp9.mp3", "002-B_temp9.webm", "002-B_temp9.mp3"):
+            (temp.temp / name).write_bytes(b"x")
+
+        moved = run_async(temp.bot.rescue_completed_playlist_files("_temp9", str(temp.audio)))
+
+        assert moved == 1
+        assert _ls(temp.audio) == ["001-A.mp3"]
 
     def test_un_fallo_al_mover_no_para_el_rescate(self, temp, run_async, monkeypatch):
         for name in ("1-A_temp9.mp4", "2-B_temp9.mp4"):

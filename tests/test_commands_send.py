@@ -146,9 +146,11 @@ class TestBotonesDeEnvio:
         assert uploads == []
         assert sent_messages[-1][1] == quiet_bot.get_text("error_file_does_not_exist_user")
 
-    def test_si_no_se_puede_editar_crea_un_mensaje_nuevo(
+    def test_si_no_se_puede_editar_envia_sin_mensaje_de_progreso(
         self, quiet_bot, uploads, sent_messages, media_file, run_async, monkeypatch
     ):
+        """Un «Enviando…» mandado sin esperar a la cola atascada salía después,
+        sin referencia, y se quedaba en el chat junto al fichero."""
         async def edit_times_out(*args, **kwargs):
             return None
 
@@ -158,8 +160,8 @@ class TestBotonesDeEnvio:
 
         run_async(quiet_bot.handle_send_choice(ChoiceEvent("send", file_id)))
 
-        assert sent_messages[0][0] == "reply"
-        assert uploads and uploads[0][1] is not None
+        assert sent_messages == []
+        assert uploads and uploads[0][1] is None
 
     def test_si_falla_preparar_el_mensaje_avisa_y_no_envia(
         self, quiet_bot, uploads, sent_messages, media_file, run_async, monkeypatch
@@ -247,6 +249,27 @@ class TestEnvioAutomatico:
         run_async(quiet_bot.send_file_automatically(MagicMock(), path))
 
         assert len(uploads) == 1
+
+    def test_un_fichero_que_ya_no_esta_se_avisa_y_no_corta_el_resto(
+        self, quiet_bot, uploads, sent_messages, media_file, run_async, config_dir
+    ):
+        """En una playlist se envían uno tras otro y ya se ven en /manage: si
+        entretanto se borra uno, la excepción cortaba los siguientes y el aviso
+        decía que había fallado la descarga."""
+        quiet_bot.settings.put("urls.auto_send", "SEND")
+        first, gone, last = media_file("001.mp4"), media_file("002-Trailer.mp4"), media_file("003.mp4")
+        os.remove(gone)
+
+        async def playlist():
+            for path in (first, gone, last):
+                await quiet_bot.send_file_automatically(MagicMock(), path)
+
+        run_async(playlist())
+
+        assert [path for path, _, _ in uploads] == [first, last]
+        assert quiet_bot.get_text("error_file_does_not_exist_named_user", "002-Trailer.mp4") in [
+            text for _, text, _ in sent_messages
+        ]
 
 
 # --- handle_success ----------------------------------------------------------
@@ -388,7 +411,7 @@ def upload_spy(quiet_bot, monkeypatch):
     async def thumbnail(path):
         return None
 
-    async def upload(entity, path, filename, attributes, thumb, is_video, callback):
+    async def upload(entity, path, filename, attributes, thumb, is_video, callback, reply_to=None):
         calls.append(("upload", entity, path, filename, attributes, is_video, callback))
         return MagicMock(id=321)
 
@@ -427,7 +450,7 @@ class TestEnvioATelegram:
     def test_si_falla_borra_el_mensaje_de_enviando_y_avisa(
         self, quiet_bot, upload_spy, sent_messages, make_event, media_file, run_async, monkeypatch
     ):
-        async def upload(*args):
+        async def upload(*args, **kwargs):
             raise RuntimeError("se cortó")
 
         monkeypatch.setattr(quiet_bot, "_send_file_fast", upload)

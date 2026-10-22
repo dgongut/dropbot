@@ -8,8 +8,11 @@ lo subido llega en las partes correctas.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import io
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -29,8 +32,9 @@ class FakeSender:
 
     instances = []
 
-    def __init__(self, auth_key, loggers=None):
+    def __init__(self, auth_key, loggers=None, connect_timeout=None):
         self.auth_key = auth_key
+        self.connect_timeout = connect_timeout
         self.connected = False
         self.disconnected = False
         self.sent = []
@@ -48,9 +52,10 @@ class FakeSender:
 
 
 class FakeClient:
-    def __init__(self, data=b"", dc_id=2, short_after=None, fail_part=None):
+    def __init__(self, data=b"", dc_id=2, short_after=None, fail_part=None, lost_part=None):
         self.data = data
         self.session = SimpleNamespace(dc_id=dc_id, auth_key="clave-principal")
+        self._timeout = 10
         self._log = {}
         self._proxy = None
         self._local_addr = None
@@ -59,6 +64,9 @@ class FakeClient:
         self.parts = []
         self.short_after = short_after
         self.fail_part = fail_part
+        # Parte cuya respuesta no llega nunca: la conexión esperaba su
+        # rpc_result cuando el router perdió la tabla NAT
+        self.lost_part = lost_part
 
     async def _get_dc(self, dc_id):
         return SimpleNamespace(ip_address="127.0.0.1", port=443, id=dc_id)
@@ -73,10 +81,14 @@ class FakeClient:
     async def _call(self, sender, request):
         await asyncio.sleep(0)
         if isinstance(request, GetFileRequest):
+            if request.offset // request.limit == self.lost_part:
+                await asyncio.Event().wait()
             if self.short_after is not None and request.offset >= self.short_after:
                 return SimpleNamespace(bytes=b"")
             return SimpleNamespace(bytes=self.data[request.offset:request.offset + request.limit])
         if isinstance(request, (SaveFilePartRequest, SaveBigFilePartRequest)):
+            if request.file_part == self.lost_part:
+                await asyncio.Event().wait()
             if request.file_part == self.fail_part:
                 raise ConnectionError(f"parte {request.file_part} perdida")
             self.parts.append((type(request).__name__, request.file_part, bytes(request.bytes)))
@@ -99,6 +111,30 @@ def _payload(size):
 def _document(size, dc_id=2):
     return types.Document(id=1, access_hash=2, file_reference=b"ref", date=None,
                           mime_type="video/mp4", size=size, dc_id=dc_id, attributes=[])
+
+
+async def _settle(coro, seconds=1):
+    """Lanza `coro` y devuelve su tarea ya terminada, o falla si sigue en
+    marcha pasados `seconds` en vez de dejar el test colgado."""
+    task = asyncio.ensure_future(coro)
+    await asyncio.wait({task}, timeout=seconds)
+    assert task.done(), "la transferencia se ha quedado parada"
+    return task
+
+
+@contextlib.asynccontextmanager
+async def _default_pool_busy():
+    """Ocupa el único hilo del pool por defecto del loop, como una extracción
+    o una copia de varios GB que lo tienen ocupado durante minutos."""
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    release = threading.Event()
+    busy = loop.run_in_executor(None, release.wait)
+    try:
+        yield
+    finally:
+        release.set()
+        await busy
 
 
 class TestConexiones:
@@ -229,6 +265,79 @@ class TestDescarga:
         with pytest.raises(ValueError, match="Incomplete"):
             run_async(scenario())
 
+    def test_las_conexiones_llevan_tope_al_conectar(self, run_async):
+        """Sin él, abrir una durante un corte de red tardaba unos 10 min en rendirse."""
+        size = 40 * MB
+        client = FakeClient(_payload(size))
+        run_async(fast_telethon.download_file(client, _document(size), io.BytesIO(), 8))
+        assert {s.connect_timeout for s in FakeSender.instances} == {client._timeout}
+
+    def test_una_parte_sin_respuesta_falla_en_vez_de_colgarse(self, run_async, monkeypatch):
+        """El router pierde la tabla NAT mientras una conexión espera su parte.
+
+        Las conexiones extra no hacen ping y nada las avisa: la descarga se
+        quedaba parada hasta el tope de 50 min de la descarga entera. Ahora
+        falla en cuanto vence el tope de esa petición y el llamador recurre
+        al método estándar.
+        """
+        monkeypatch.setattr(fast_telethon, "_REQUEST_TIMEOUT", 0.2)
+        size = 40 * MB
+        client = FakeClient(_payload(size), lost_part=5)
+
+        task = run_async(_settle(
+            fast_telethon.download_file(client, _document(size), io.BytesIO(), 8), seconds=2))
+
+        with pytest.raises(TimeoutError):
+            task.result()
+        assert all(s.disconnected for s in FakeSender.instances)
+
+    @pytest.mark.parametrize("opened, created", [(0, 1), (3, 8)])
+    def test_cancelar_mientras_se_abren_las_conexiones_las_cierra_todas(
+        self, run_async, monkeypatch, opened, created
+    ):
+        """El botón Cancelar en los primeros segundos de una descarga grande.
+
+        Con 0 abiertas, la cancelación llega durante el DH de la primera; con 3,
+        mientras se abren las demás. Antes quedaban vivas, con su reconexión
+        automática, hasta reiniciar el contenedor.
+        """
+
+        class HalfOpenSender(FakeSender):
+            async def connect(self, connection):
+                if FakeSender.instances.index(self) >= opened:
+                    await asyncio.Event().wait()  # TCP o DH a medias
+                await super().connect(connection)
+
+        monkeypatch.setattr(fast_telethon, "MTProtoSender", HalfOpenSender)
+
+        async def scenario():
+            task = asyncio.ensure_future(fast_telethon.download_file(
+                FakeClient(), _document(1500 * MB), io.BytesIO(), 8))
+            for _ in range(100):  # que todas lleguen a abrirse o a quedarse a medias
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        run_async(scenario())
+        assert len(FakeSender.instances) == created
+        assert all(s.disconnected for s in FakeSender.instances)
+
+    def test_no_espera_a_las_tareas_largas_del_pool_por_defecto(self, run_async):
+        """Con el pool por defecto ocupado por extracciones o copias, cada trozo
+        esperaba su turno para escribirse y la descarga se paraba."""
+        size = 300 * 1024
+        data = _payload(size)
+        out = io.BytesIO()
+
+        async def scenario():
+            async with _default_pool_busy():
+                return await _settle(fast_telethon.download_file(
+                    FakeClient(data), _document(size), out, 4))
+
+        run_async(scenario()).result()
+        assert out.getvalue() == data
+
 
 class TestSubida:
     @staticmethod
@@ -319,3 +428,36 @@ class TestSubida:
         client = FakeClient(fail_part=part_count - 1)
         with pytest.raises(ConnectionError):
             run_async(fast_telethon.upload_file(client, io.BytesIO(_payload(size)), size, 8))
+
+    def test_una_parte_sin_respuesta_falla_en_vez_de_colgarse(self, run_async, monkeypatch):
+        """El router pierde la tabla NAT con una parte ya entregada y sin respuesta.
+
+        La subida se quedaba para siempre esperando esa parte, con «Enviando…»
+        fijo y sin botón de cancelar. Ahora falla en cuanto vence el tope de esa
+        petición, cierra sus conexiones y el llamador recurre al envío estándar.
+        """
+        monkeypatch.setattr(fast_telethon, "_REQUEST_TIMEOUT", 0.2)
+        size = 30 * MB
+        client = FakeClient(lost_part=3)
+
+        task = run_async(_settle(
+            fast_telethon.upload_file(client, io.BytesIO(_payload(size)), size, 8), seconds=2))
+
+        with pytest.raises(TimeoutError):
+            task.result()
+        assert len(FakeSender.instances) > 1
+        assert all(s.disconnected for s in FakeSender.instances)
+
+    def test_no_espera_a_las_tareas_largas_del_pool_por_defecto(self, run_async):
+        """Con el pool por defecto ocupado por extracciones o copias, cada trozo
+        esperaba su turno para leerse y la subida se paraba."""
+        size = 300 * 1024
+        data = _payload(size)
+        client = FakeClient()
+
+        async def scenario():
+            async with _default_pool_busy():
+                return await _settle(fast_telethon.upload_file(client, io.BytesIO(data), size, 4))
+
+        run_async(scenario()).result()
+        assert self._rebuild(client.parts) == data

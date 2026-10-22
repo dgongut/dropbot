@@ -188,6 +188,9 @@ class _RenameInput:
         self.sender_id = sender_id
         self.reply_to_msg_id = None
         self.id = 500
+        # En el privado, el mismo chat que el FakeEvent con el que se pidió
+        self.chat_id = 42
+        self.is_private = True
 
     async def delete(self):
         return None

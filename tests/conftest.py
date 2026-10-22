@@ -1,15 +1,15 @@
 """Infraestructura común para los tests de DropBot.
 
 `dropbot.py` hace bastante trabajo en tiempo de importación: migra los
-ajustes, crea las carpetas de descarga, limpia TEMP_DIR y abre la conexión con
+ajustes, crea las carpetas de descarga, limpia TEMP_DIR y crea el cliente de
 Telegram. Para poder importarlo en un test hay que preparar tres cosas antes:
 
 1. Las variables de entorno mínimas, o el módulo llama a `sys.exit(1)`.
 2. Las rutas de `config` y de `store`, que por defecto apuntan a `/downloads`,
    `/config` y `/tmp` (pensadas para el contenedor) y que en un portátil no
    son escribibles.
-3. `TelegramClient`, que en la línea de creación del bot ya llama a
-   `.start()` y se conectaría de verdad. Se sustituye por un doble.
+3. `TelegramClient`, que se conectaría de verdad en main() y que, al crearlo,
+   ya abre su sesión. Se sustituye por un doble.
 
 Los puntos 1 y 2 se hacen al importar este fichero, no dentro de un fixture:
 pytest importa los conftest antes que los módulos de test, y basta con que un
@@ -26,9 +26,14 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from telethon import events
+from telethon.tl.types import (
+    InputPeerChannel, Message, MessageReplyHeader, PeerChannel, UpdateBotCallbackQuery,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -94,8 +99,7 @@ def dropbot():
     """Importa `dropbot` una sola vez, con el cliente de Telegram simulado."""
     import telethon
 
-    client = MagicMock(name="TelegramClient")
-    client.start.return_value = MagicMock(name="bot", on=_recording_decorator)
+    client = MagicMock(name="bot", on=_recording_decorator)
     original = telethon.TelegramClient
     telethon.TelegramClient = MagicMock(return_value=client)
     try:
@@ -211,6 +215,50 @@ class _FakeMatch:
 
     def group(self, index):
         return self._groups[index]
+
+
+# Un supergrupo con temas (un foro), su id como lo da Telethon y uno de sus temas
+FORUM_CHANNEL = PeerChannel(1234567890)
+FORUM_CHAT_ID = -1001234567890
+FORUM_TOPIC = 77
+
+
+def forum_reply_to(topic=FORUM_TOPIC, reply_to_msg_id=None):
+    """El reply_to de un mensaje escrito en un tema de un foro.
+
+    Directamente en el tema, apunta al mensaje que lo abrió; si contesta a
+    otro mensaje del tema, apunta a ese y el tema va en reply_to_top_id.
+    """
+    if reply_to_msg_id is None:
+        return MessageReplyHeader(forum_topic=True, reply_to_msg_id=topic)
+    return MessageReplyHeader(forum_topic=True, reply_to_msg_id=reply_to_msg_id, reply_to_top_id=topic)
+
+
+@pytest.fixture
+def forum_callback():
+    """Un CallbackQuery de Telethon pulsado en un tema de un foro.
+
+    `get_message()` es el de verdad: le pide el mensaje del botón a un cliente
+    falso (`._client`), que cuenta las peticiones en `.requests`. Con su
+    `.message = None`, Telegram ya no lo da (se ha borrado).
+    """
+    def factory(groups=(), topic=FORUM_TOPIC, message_id=50, query_id=10_000):
+        query = UpdateBotCallbackQuery(query_id=query_id, user_id=ADMIN_ID, peer=FORUM_CHANNEL,
+                                       msg_id=message_id, chat_instance=0, data=b"")
+        event = events.CallbackQuery.Event(query, FORUM_CHANNEL, message_id)
+        event.pattern_match = _FakeMatch(groups) if groups else None
+        client = SimpleNamespace(requests=0, message=Message(
+            id=message_id, peer_id=FORUM_CHANNEL, date=None, message="", reply_to=forum_reply_to(topic)))
+
+        async def get_messages(chat, ids):
+            client.requests += 1
+            return client.message
+
+        client.get_messages = get_messages
+        event._client = client
+        event._input_chat = InputPeerChannel(channel_id=FORUM_CHANNEL.channel_id, access_hash=1)
+        return event
+    return factory
 
 
 @pytest.fixture

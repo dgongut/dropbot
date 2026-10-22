@@ -176,8 +176,26 @@ def test_la_miniatura_por_defecto_va_a_temp_dir(media, run_async):
     try:
         assert result is not None
         assert os.path.dirname(result) == video_service.TEMP_DIR
-        assert os.path.basename(result).startswith("h264_4s_")
         assert result.endswith("_thumb.jpg")
+        assert os.path.getsize(result) > 0
+    finally:
+        if result and os.path.exists(result):
+            os.remove(result)
+
+
+@needs_ffmpeg
+def test_un_video_con_un_nombre_que_ocupa_casi_255_bytes_tambien_tiene_miniatura(
+    media, run_async, tmp_path
+):
+    """La miniatura llevaba el nombre del vídeo más «_{ms}_thumb.jpg»: con un
+    nombre largo pasaba de 255 bytes y el vídeo se enviaba sin miniatura."""
+    os.makedirs(video_service.TEMP_DIR, exist_ok=True)
+    video = tmp_path / ("ñ" * 120 + ".mp4")
+    shutil.copy(media("h264_4s.mp4"), video)
+
+    result = run_async(video_service.generate_video_thumbnail(str(video)))
+    try:
+        assert result is not None
         assert os.path.getsize(result) > 0
     finally:
         if result and os.path.exists(result):
@@ -301,7 +319,7 @@ def upload(quiet_bot, config_dir, monkeypatch):
     """Envío real (conversión, metadatos, miniatura) con la subida simulada."""
     captured = {}
 
-    async def fake_send(entity, path, filename, attributes, thumb, is_video, callback):
+    async def fake_send(entity, path, filename, attributes, thumb, is_video, callback, reply_to=None):
         captured.update(path=path, filename=filename, attributes=attributes, thumb=thumb,
                         thumb_existed=bool(thumb) and os.path.exists(thumb),
                         thumb_size=ffprobe_video(thumb) if thumb and os.path.exists(thumb) else None,

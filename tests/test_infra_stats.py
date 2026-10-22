@@ -5,15 +5,19 @@ telemetría, que descarta cualquier otra clave; y nunca puede llevar una
 ruta, un nombre ni un id de Telegram.
 """
 
+import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
+import basic
 import config
 import settings
 import stats
 import store
+import telemetry
 
 MANIFEST_CANDIDATES = (
     Path("/telemetry-projects/dropbot.yaml"),
@@ -63,6 +67,32 @@ class TestCuandoSeEnvian:
         settings.put("telemetry", False)
         assert stats.is_on() is False
 
+    def test_con_settings_ilegible_no_se_envian(self, fresh):
+        """Ilegible, se usan los valores por defecto, que las activan: se
+        enviaban aunque el fichero dijera que no, y desactivarlas no se guardaba."""
+        (fresh / "settings.json").write_text('{"telemetry": false,\n "language": "EN",\n}', encoding="utf-8")
+        store.reload()
+
+        assert stats.forced_off() == "settings"
+        assert stats.is_on() is False
+
+    def test_si_no_se_puede_guardar_la_baja_no_se_envian(self, fresh, monkeypatch):
+        """Con /config de solo lectura, un NFS con root_squash o el disco
+        lleno, desactivarlas no llegaba al disco: tras reiniciar volvían a
+        estar activadas y se enviaban con un id nuevo."""
+        def read_only(src, dst):
+            raise OSError(30, "Read-only file system")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(store.os, "replace", read_only)
+            stats.disable()
+        # El reinicio: lo que no llegó al disco se pierde
+        store.reload()
+
+        assert settings.get("telemetry") is True
+        assert stats.forced_off() == "settings"
+        assert stats.is_on() is False
+
     def test_el_estado_va_en_config_state(self, fresh):
         assert stats.client().state_path == os.path.join(str(fresh), "state", "telemetry.json")
 
@@ -79,7 +109,7 @@ class TestMetricas:
         assert set(metrics) == expected
 
     def test_solo_numeros_booleanos_y_valores_cerrados(self, fresh, monkeypatch):
-        monkeypatch.setattr(stats, "TELEGRAM_ADMIN", "123456789,987654321")
+        monkeypatch.setattr(basic, "TELEGRAM_ADMIN", "123456789,987654321")
         settings.put("video.quality", "23")
         metrics = stats.collect_metrics()
 
@@ -95,9 +125,11 @@ class TestMetricas:
 
     @pytest.mark.parametrize("admins, expected", [
         ("1", 1), ("1,2", 2), ("1, 2 ,3", 3), ("1,,2,", 2), ("", 0),
+        # El id de un grupo se ignora: no es un admin
+        ("1,-1002", 1),
     ])
     def test_cuenta_los_admins_sin_mandarlos(self, fresh, monkeypatch, admins, expected):
-        monkeypatch.setattr(stats, "TELEGRAM_ADMIN", admins)
+        monkeypatch.setattr(basic, "TELEGRAM_ADMIN", admins)
         assert stats.collect_metrics()["admins"] == expected
 
     def test_las_carpetas_dicen_si_tienen_volumen_no_cual(self, fresh, monkeypatch):
@@ -194,6 +226,38 @@ class TestContadores:
         assert preview["install_id"] is None
         assert preview["usage"] == {}
 
+    def test_desactivarlas_mientras_el_hilo_vuelca_no_devuelve_el_id_al_disco(self, fresh, monkeypatch):
+        """El hilo copia el estado bajo el lock del cliente y lo escribe
+        después, ya sin él. Si forget() escribía entre medias, el volcado del
+        hilo devolvía al disco el id que se acababa de olvidar."""
+        client = stats.client()
+        client._state["install_id"] = "id-anterior"
+        stats.count("cmd_start")
+        copied, resume = threading.Event(), threading.Event()
+        real_makedirs = os.makedirs
+
+        def makedirs(path, *args, **kwargs):
+            # El hilo, ya con su copia del estado y antes de escribirla
+            if threading.current_thread().name == "telemetry":
+                copied.set()
+                resume.wait(timeout=5)
+            return real_makedirs(path, *args, **kwargs)
+
+        monkeypatch.setattr(telemetry.os, "makedirs", makedirs)
+        flushing = threading.Thread(target=client._flush, kwargs={"force": True}, name="telemetry")
+        flushing.start()
+        assert copied.wait(timeout=5)
+        disabling = threading.Thread(target=stats.disable)
+        disabling.start()
+        # En fila, forget() espera a que acabe el volcado en curso
+        disabling.join(timeout=0.2)
+        resume.set()
+        flushing.join(timeout=5)
+        disabling.join(timeout=5)
+
+        state = json.loads((fresh / "state" / "telemetry.json").read_text(encoding="utf-8"))
+        assert state["install_id"] is None and state["pending"] == {}
+
     def test_preview_recorta_a_los_mas_usados(self, fresh):
         extra = 5
         for index in range(stats.PREVIEW_USAGE_KEYS + extra):
@@ -229,6 +293,48 @@ class TestContadores:
         assert client.version == "4.1.0"
         assert stats.preview()[0]["version"] == "4.1.0"
         assert runs == [1]
+
+    def test_al_arrancar_con_la_variable_se_olvida_la_instalacion(self, fresh, monkeypatch):
+        """Solo el botón de /settings olvidaba el id. Con TELEMETRY=false se
+        quedaba en disco, y si un día se quitaba la variable, el primer envío
+        cosía los dos periodos con el mismo id y los contadores de antes."""
+        state = fresh / "state" / "telemetry.json"
+        state.write_text(json.dumps({"install_id": "id-anterior", "pending": {"cmd_list": 3}}),
+                         encoding="utf-8")
+        monkeypatch.setenv("TELEMETRY", "false")
+        monkeypatch.setattr(stats, "_version", "unknown")
+        client = stats.client()
+        client._run = lambda: None
+
+        stats.start("4.0.1")
+        client._thread.join(timeout=1)
+
+        stored = json.loads(state.read_text(encoding="utf-8"))
+        assert stored["install_id"] is None and stored["pending"] == {}
+        assert stats.preview()[0]["install_id"] is None
+
+    def test_con_la_variable_y_nada_que_olvidar_no_se_escribe(self, fresh, monkeypatch):
+        monkeypatch.setenv("TELEMETRY", "false")
+        monkeypatch.setattr(stats, "_version", "unknown")
+        client = stats.client()
+        client._run = lambda: None
+
+        stats.start("4.0.1")
+        client._thread.join(timeout=1)
+
+        assert not (fresh / "state" / "telemetry.json").exists()
+
+    def test_sin_la_variable_al_arrancar_se_conserva_el_id(self, fresh, monkeypatch):
+        state = fresh / "state" / "telemetry.json"
+        state.write_text(json.dumps({"install_id": "id-anterior", "pending": {}}), encoding="utf-8")
+        monkeypatch.setattr(stats, "_version", "unknown")
+        client = stats.client()
+        client._run = lambda: None
+
+        stats.start("4.0.1")
+        client._thread.join(timeout=1)
+
+        assert stats.preview()[0]["install_id"] == "id-anterior"
 
     def test_start_en_debug_avisa(self, fresh, monkeypatch):
         logged = []

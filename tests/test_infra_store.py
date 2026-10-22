@@ -135,6 +135,50 @@ class TestRaiz:
         assert store.is_persistent() is False
 
 
+def _read_only(src, dst):
+    raise OSError(30, "Read-only file system")
+
+
+class TestSinEscritura:
+    """Montado no quiere decir que se pueda escribir: un volumen :ro, un NFS
+    con root_squash o el disco lleno. Los cambios parecían guardados, solo el
+    log decía lo contrario, y al reiniciar volvían atrás."""
+
+    def test_al_arrancar_se_prueba_a_escribir(self, tmp_path, config_dir, monkeypatch):
+        try:
+            with monkeypatch.context() as patched:
+                patched.setattr(store.os, "replace", _read_only)
+                store.init(str(tmp_path / "config"))
+            assert "Read-only file system" in store.write_error()
+        finally:
+            store.init(str(config_dir))
+        assert store.write_error() is None
+
+    def test_la_prueba_no_deja_nada(self, config_dir):
+        assert sorted(os.listdir(config_dir)) == ["state"]
+
+    def test_un_fallo_al_guardar_se_recuerda_hasta_que_se_guarda_bien(self, config_dir, monkeypatch):
+        with monkeypatch.context() as patched:
+            patched.setattr(store.os, "replace", _read_only)
+            store.set("telemetry", False)
+            assert store.write_error()
+            # Hasta el reinicio vale igual
+            assert store.get("telemetry") is False
+
+        store.set("language", "EN")
+
+        assert store.write_error() is None
+        assert _stored(config_dir)["telemetry"] is False
+
+    def test_write_document_dice_por_que_no_pudo(self, tmp_path, monkeypatch):
+        path = tmp_path / "doc.json"
+        assert store.write_document(str(path), {"bien": 1}) is None
+
+        monkeypatch.setattr(store.os, "replace", _read_only)
+
+        assert "Read-only file system" in store.write_document(str(path), {"nuevo": 2})
+
+
 class TestLectura:
     def test_default_de_claves_que_no_existen(self):
         assert store.default("no_existe") is None
@@ -293,6 +337,16 @@ class TestParsers:
         for value in settings.MAX_SIZE_CHOICES:
             settings.parse_max_size(value)
 
+    def test_el_tamano_maximo_ofrece_justo_lo_que_cabe_en_telegram(self):
+        """La opción «2 GB» eran 2048 MiB, y Telegram no admite más de 2000:
+        dejaba descargar lo que luego no se podía enviar."""
+        from config import MAX_TELEGRAM_FILE_SIZE
+
+        telegram_mb = MAX_TELEGRAM_FILE_SIZE // (1024 * 1024)
+        assert telegram_mb in settings.MAX_SIZE_CHOICES
+        assert not [mb for mb in settings.MAX_SIZE_CHOICES if telegram_mb < mb < 2 * telegram_mb]
+        assert settings.size_label(telegram_mb) == "2000 MB"
+
 
 class TestAvisos:
     def test_un_valor_invalido_se_avisa_una_sola_vez(self, config_dir, monkeypatch):
@@ -367,11 +421,46 @@ class TestMigracion:
         assert migration.run() is False
         assert (config_dir / "settings.json").read_text(encoding="utf-8") == "{roto"
 
+    def test_si_no_se_pudo_escribir_no_dice_que_creo_el_fichero(self, config_dir, logged, monkeypatch):
+        monkeypatch.setenv("AUTO_SEND", "SEND")
+        with monkeypatch.context() as patched:
+            patched.setattr(store.os, "replace", _read_only)
+            migration.run()
+        assert not any("created" in m for _, m in logged)
+
     def test_la_siembra_escribe_una_sola_vez(self, config_dir, logged, monkeypatch, writes):
         monkeypatch.setenv("AUTO_SEND", "SEND")
         monkeypatch.setenv("LANGUAGE", "EN")
         monkeypatch.setenv("FFMPEG_HW", "nope")
         migration.run()
         assert len(writes) == 1
-        assert writes[0]["settings_version"] == 1
+        assert writes[0]["settings_version"] == migration.SETTINGS_VERSION
         assert writes[0]["video"]["hw"] == "NONE"
+
+    def test_los_2_gb_de_la_4_0_0_pasan_a_2000_mb(self, config_dir, logged):
+        """La opción «2 GB» eran 2048 MiB, y Telegram no admite más de 2000:
+        quien la había elegido seguía descargando lo que luego no se podía
+        enviar, y en /settings no salía marcada ninguna opción."""
+        (config_dir / "settings.json").write_text(
+            json.dumps({"settings_version": 1, "urls": {"max_size_mb": 2048}}), encoding="utf-8")
+        store.reload()
+
+        assert migration.run() is False
+
+        assert settings.max_size_mb() == 2000
+        assert _stored(config_dir)["urls"]["max_size_mb"] == 2000
+        assert _stored(config_dir)["settings_version"] == migration.SETTINGS_VERSION
+
+    def test_la_puesta_al_dia_se_hace_una_sola_vez(self, config_dir, logged, writes):
+        """Lo que se elija o se escriba a mano después se respeta."""
+        (config_dir / "settings.json").write_text(
+            json.dumps({"settings_version": 1, "urls": {"max_size_mb": 1024}}), encoding="utf-8")
+        store.reload()
+        migration.run()
+        store.set("urls.max_size_mb", 2048)
+        writes.clear()
+
+        migration.run()
+
+        assert settings.max_size_mb() == 2048
+        assert writes == []

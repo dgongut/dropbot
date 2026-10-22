@@ -313,6 +313,43 @@ class TestLogger:
         record = logging.LogRecord("x", logging.INFO, __file__, 1, "m", None, None)
         assert plain.format(record) == "INFO"
 
+    def test_el_fichero_no_hereda_los_colores_de_la_consola(self, named, tmp_path):
+        """El registro es el mismo para todos los handlers: el color que se le
+        ponía para la consola llegaba al fichero como códigos ANSI."""
+        path = tmp_path / "dropbot.log"
+        log = logger.setup_logger(named, log_file=str(path))
+        log.handlers[0].formatter.use_colors = True  # como en un terminal
+        log.info("arrancado")
+        log.error("mal")
+        for handler in log.handlers:
+            handler.flush()
+        text = path.read_text(encoding="utf-8")
+        assert "\x1b" not in text
+        assert " - INFO     - " in text and " - ERROR    - " in text
+
+    def test_un_texto_remoto_no_falsifica_lineas_ni_manda_escapes(self, named, capsys):
+        """El título de una playlist llega al log tal cual: con un salto de línea
+        fabricaba una línea que parecía un registro real, y con un ESC mandaba
+        secuencias a la terminal de quien sigue `docker logs -f`."""
+        log = logger.setup_logger(named, log_level="DEBUG", console_level="DEBUG", use_colors=False)
+        title = "Fotos\n2026-10-21 10:00:00 - INFO     - [STARTUP] falso\x1b]52;c;Y3VybA==\x07\r\x9b\N{RIGHT-TO-LEFT OVERRIDE}"
+        log.debug(f"[PLAYLIST] Detected playlist with 2 videos: {title}")
+        out = capsys.readouterr().out
+        assert not any(c in out for c in "\x1b\x07\r\x9b\N{RIGHT-TO-LEFT OVERRIDE}")
+        assert "falso\\x1b]52;c;Y3VybA==\\x07\\r\\x9b" in out
+        # La continuación va sangrada: ninguna línea empieza como un registro
+        assert "Fotos\n    | 2026-10-21 10:00:00 - INFO     - [STARTUP] falso" in out
+        assert "\n2026-10-21 10:00:00 - INFO" not in out
+
+    def test_conserva_tabuladores_y_los_argumentos_del_mensaje(self, named, capsys):
+        log = logger.setup_logger(named, use_colors=False)
+        log.info("a\tb %s", "c")
+        assert capsys.readouterr().out.endswith(" - a\tb c\n")
+
+    def test_un_formato_roto_no_tumba_a_quien_escribe(self, named, capsys):
+        log = logger.setup_logger(named, use_colors=False)
+        log.info("%s y %s", "uno")  # no debe lanzar
+
     def test_funciones_de_conveniencia(self, monkeypatch):
         seen = []
 
@@ -384,6 +421,11 @@ class TestDonantes:
         assert run_async(donors_service.get_array_donors_online()) == []
         assert http.logged
 
+    def test_una_respuesta_que_no_es_json_no_se_vuelca_entera_al_log(self, http, run_async):
+        http.response = FakeResponse(data=ValueError("no json"), text="<html>" + "x" * 50_000)
+        assert run_async(donors_service.get_array_donors_online()) == []
+        assert len(http.logged[0]) < 500
+
     @pytest.fixture
     def sent(self, monkeypatch, config_dir):
         messages = []
@@ -400,7 +442,38 @@ class TestDonantes:
         chat_id, text, kwargs = sent[0]
         assert chat_id == 42
         assert "· Ana\n· Bea\n" in text
-        assert kwargs == {"parse_mode": "HTML"}
+        assert kwargs == {"parse_mode": "HTML", "wait_for_result": True, "reply_to": None}
+
+    def test_print_donors_parte_una_lista_que_no_cabe_en_un_mensaje(self, http, sent, run_async):
+        """En un solo mensaje, una lista larga pasaba de los 4096 caracteres de
+        Telegram, la cola lo descartaba y /donors se quedaba sin respuesta."""
+        names = [f"Donante{i:05d}" for i in range(400)]
+        http.response = FakeResponse(data=list(names))
+        run_async(donors_service.print_donors(42))
+
+        texts = [text for _, text, _ in sent]
+        assert len(texts) > 1
+        assert all(len(text.encode("utf-16-le")) // 2 <= 4096 for text in texts)
+        # Se corta entre líneas: unidos, son el mensaje de siempre
+        full = translations.get_text("donors_list", "".join(f"· {name}\n" for name in names))
+        assert "\n".join(texts) == full
+        assert "<b>" in texts[0] and "<i>" in texts[-1]
+        assert all(kwargs == {"parse_mode": "HTML", "wait_for_result": True, "reply_to": None} for _, _, kwargs in sent)
+
+    def test_print_donors_si_telegram_rechaza_la_lista_avisa(self, http, run_async, monkeypatch, config_dir):
+        from telethon.errors import MessageTooLongError
+
+        messages = []
+
+        async def send(chat_id, text, **kwargs):
+            if kwargs.get("parse_mode") == "HTML":
+                raise MessageTooLongError(request=None)
+            messages.append(text)
+
+        monkeypatch.setattr(donors_service, "safe_send_message", send)
+        http.response = FakeResponse(data=["Ana"])
+        run_async(donors_service.print_donors(42))
+        assert messages == [translations.get_text("error_getting_donors")]
 
     def test_print_donors_escapa_los_nombres(self, http, sent, run_async):
         """El mensaje va en HTML: un nombre con < o & no puede romperlo."""
@@ -428,7 +501,7 @@ class TestDonantes:
         run_async(donors_service.print_donors(42))
         chat_id, text, kwargs = sent[0]
         assert text == translations.get_text("error_getting_donors")
-        assert kwargs == {"parse_mode": translations.PARSE_MODE}
+        assert kwargs == {"parse_mode": translations.PARSE_MODE, "reply_to": None}
 
 
 class TestNombresComoCodigoEnLasTraducciones:

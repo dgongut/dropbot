@@ -5,8 +5,13 @@ queda bloqueado escribiendo para siempre: no falla, no avanza y el reintento
 en software nunca salta (visto con un WebM que VAAPI no pudo decodificar).
 """
 
+import ast
 import asyncio
+import inspect
+import itertools
 import sys
+
+import pytest
 
 
 def test_un_ffmpeg_verboso_que_falla_no_bloquea(dropbot, run_async):
@@ -34,9 +39,54 @@ def test_un_ffmpeg_verboso_que_falla_no_bloquea(dropbot, run_async):
         await asyncio.wait_for(proc.wait(), timeout=30)
         await asyncio.wait_for(drain, timeout=30)
         assert proc.returncode == 1
-        assert sum(len(chunk) for chunk in chunks) == 4 * 1024 * 1024
+        # Se ha leído todo, pero solo se guardan el principio y el final
+        kept = dropbot.FFMPEG_STDERR_HEAD_BYTES + dropbot.FFMPEG_STDERR_TAIL_BYTES
+        skipped = 4 * 1024 * 1024 - kept
+        assert chunks[1] == f"\n[... {skipped} bytes skipped ...]\n".encode()
+        assert len(chunks[0]) + len(chunks[2]) == kept
 
     run_async(scenario())
+
+
+def _drain(dropbot, run_async, data):
+    """Lo que queda guardado del stderr de un proceso que escribe `data`."""
+    async def scenario():
+        # Lo que entra por stdin sale por stderr
+        code = "import sys; sys.stderr.buffer.write(sys.stdin.buffer.read())"
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", code,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        chunks = []
+        drain = asyncio.ensure_future(dropbot.accumulate_process_stderr(proc, chunks))
+        proc.stdin.write(data)
+        await proc.stdin.drain()
+        proc.stdin.close()
+        await asyncio.wait_for(proc.wait(), timeout=30)
+        await asyncio.wait_for(drain, timeout=30)
+        return b"".join(chunks)
+
+    return run_async(scenario())
+
+
+def test_un_stderr_enorme_no_se_guarda_entero(dropbot, run_async):
+    """Un vídeo dañado escribe varias líneas de error por fotograma: guardado
+    entero eran cientos de MB en memoria y luego en el log."""
+    data = b"inicio\n" + b"error while decoding MB\n" * 200_000 + b"fin\n"
+
+    kept = _drain(dropbot, run_async, data)
+
+    assert kept.startswith(b"inicio\n") and kept.endswith(b"fin\n")
+    assert len(kept) < dropbot.FFMPEG_STDERR_HEAD_BYTES + dropbot.FFMPEG_STDERR_TAIL_BYTES + 100
+    skipped = len(data) - dropbot.FFMPEG_STDERR_HEAD_BYTES - dropbot.FFMPEG_STDERR_TAIL_BYTES
+    assert f"[... {skipped} bytes skipped ...]".encode() in kept
+
+
+def test_un_stderr_corto_se_guarda_entero(dropbot, run_async):
+    data = b"Error opening output file\n" * 100
+    assert _drain(dropbot, run_async, data) == data
 
 
 # --- Cancelar / enviar original ----------------------------------------------
@@ -96,6 +146,68 @@ def test_cada_conversion_tiene_su_propio_id(dropbot):
     first = next(dropbot._conversion_ids)
     second = next(dropbot._conversion_ids)
     assert first != second
+
+
+def _new_run_prefix(dropbot):
+    """El prefijo de los ids de conversión que tendría un arranque nuevo.
+
+    Evalúa la expresión con la que dropbot.py inicializa `_conversion_run`, y
+    no una copia suya: si se fijara, daría el mismo en todos los arranques.
+    """
+    initializer = next(
+        node.value for node in ast.parse(inspect.getsource(dropbot)).body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "_conversion_run" for target in node.targets)
+    )
+    return eval(compile(ast.Expression(initializer), "dropbot.py", "eval"), vars(dropbot))
+
+
+def test_el_prefijo_de_las_conversiones_cambia_en_cada_arranque(dropbot):
+    assert _new_run_prefix(dropbot) != _new_run_prefix(dropbot)
+
+
+@pytest.mark.parametrize("handler", ["handle_cancel_conversion", "handle_send_original"])
+def test_un_boton_de_antes_de_reiniciar_no_corta_la_conversion_de_ahora(
+    quiet_bot, media_file, make_event, run_async, monkeypatch, handler
+):
+    """El contador vuelve a 1 en cada arranque y los botones de una conversión
+    que se cortó al reiniciar siguen en el chat: los de la primera conversión
+    del arranque anterior cortaban la primera del nuevo."""
+    dropbot = quiet_bot
+    _fake_conversion(dropbot, monkeypatch)
+    # El botón que dejó en el chat la primera conversión del arranque anterior
+    old_button = f"conv_{_new_run_prefix(dropbot)}_1"
+    # Recién arrancado otra vez: es la primera conversión de este proceso
+    monkeypatch.setattr(dropbot, "_conversion_run", _new_run_prefix(dropbot))
+    monkeypatch.setattr(dropbot, "_conversion_ids", itertools.count(1))
+
+    async def scenario():
+        task = asyncio.ensure_future(
+            dropbot.convert_video_to_telegram_compatible(media_file("v.mkv"))
+        )
+        for _ in range(200):
+            ids = [k for k in dropbot.active_tasks if str(k).startswith("conv_")]
+            if ids:
+                break
+            await asyncio.sleep(0.01)
+        conversion_id = ids[0]
+        proc = dropbot.active_tasks[conversion_id]
+
+        await getattr(dropbot, handler)(make_event(groups=(old_button.encode(),)))
+        await asyncio.sleep(0.1)
+        untouched = (
+            proc.returncode is None
+            and conversion_id not in dropbot.cancelled_conversions
+            and conversion_id not in dropbot.send_original_requests
+        )
+
+        dropbot.cancelled_conversions.add(conversion_id)
+        await asyncio.wait_for(task, timeout=10)
+        return conversion_id, untouched
+
+    conversion_id, untouched = run_async(scenario())
+    assert conversion_id.endswith("_1"), "es la primera conversión del arranque"
+    assert untouched, "el botón viejo ha cortado la conversión nueva"
 
 
 def test_cancelar_una_conversion_terminada_no_deja_marca(quiet_bot, make_event, run_async):

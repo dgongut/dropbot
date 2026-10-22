@@ -19,11 +19,12 @@ from telethon import Button, events
 import settings
 import stats
 import store
-from config import DOWNLOAD_PATH, DOWNLOAD_PATHS
+from config import DOWNLOAD_PATH, DOWNLOAD_PATHS, downloads_persistent
 from logger import debug, warning
 from translations import PARSE_MODE, get_text
 from utils.telegram_helpers import (
-    check_admin_and_warn, safe_answer, safe_delete, safe_edit, safe_send_message,
+    check_admin_and_warn, for_another_bot, get_topic, is_file_message, safe_answer, safe_delete,
+    safe_edit, safe_send_message, warn_not_admin,
 )
 
 # Inyectada por init(): qué hacer cuando cambia un ajuste que no basta con
@@ -75,7 +76,10 @@ FOLDER_ORDER = ("video", "audio", "photo", "torrent", "ebook", "url_video", "url
 def init(bot, on_change=None):
     global _on_change
     _on_change = on_change
-    bot.on(events.NewMessage(pattern=r"^/settings(@\w+)?$"))(handle_settings_command)
+    # Un fichero con el pie «/settings» es de handle_files: sin el filtro se
+    # borraba mientras se descargaba, como con los demás comandos
+    bot.on(events.NewMessage(pattern=r"^/settings(@\w+)?$",
+                             func=lambda e: not is_file_message(e)))(handle_settings_command)
     bot.on(events.CallbackQuery(pattern=b"cfg:(.+)"))(handle_settings_callback)
 
 
@@ -175,6 +179,10 @@ def build_main():
         lines += ["", get_text("settings_unreadable", store.settings_path())]
     if not store.is_persistent():
         lines += ["", get_text("settings_not_persistent")]
+    elif store.write_error():
+        lines += ["", get_text("settings_not_writable")]
+    if not downloads_persistent():
+        lines += ["", get_text("settings_downloads_not_persistent")]
     return "\n".join(lines), buttons
 
 
@@ -270,6 +278,8 @@ def build_telemetry():
     buttons = []
     if forced == "volume":
         lines += ["", get_text("settings_telemetry_forced_volume")]
+    elif forced == "settings":
+        lines += ["", get_text("settings_telemetry_forced_settings", store.settings_path())]
     elif forced:
         lines += ["", get_text("settings_telemetry_forced_env", forced)]
     else:
@@ -313,16 +323,21 @@ def build_screen(screen):
 # ---------------------------------------------------------------------------
 
 async def handle_settings_command(event):
+    # "/settings@OtroBot" es para otro bot del grupo: ni se borra ni se contesta
+    if await for_another_bot(event):
+        return
+    if await check_admin_and_warn(event):
+        await warn_not_admin(event)
+        return
     try:
         await event.delete()
     except Exception:
         pass
-    if await check_admin_and_warn(event):
-        await safe_send_message(event.chat_id, get_text("user_not_admin"), parse_mode=PARSE_MODE)
-        return
     stats.count("cmd_settings")
     text, buttons = build_main()
-    await safe_send_message(event.chat_id, text, buttons=buttons, parse_mode=PARSE_MODE, link_preview=False)
+    # En un foro, al tema del comando y no a General
+    await safe_send_message(event.chat_id, text, buttons=buttons, parse_mode=PARSE_MODE, link_preview=False,
+                            reply_to=await get_topic(event))
 
 
 async def handle_settings_callback(event):
@@ -339,7 +354,8 @@ async def handle_settings_callback(event):
     if action == "telshow":
         await safe_answer(event)
         text, buttons = build_telemetry_preview()
-        await safe_send_message(event.chat_id, text, buttons=buttons, parse_mode=PARSE_MODE, link_preview=False)
+        await safe_send_message(event.chat_id, text, buttons=buttons, parse_mode=PARSE_MODE, link_preview=False,
+                                reply_to=await get_topic(event))
         return
 
     if action == "set" and len(parts) == 3:
@@ -350,10 +366,22 @@ async def handle_settings_callback(event):
     await _repaint(event, action)
 
 
+async def _answer_saved(event):
+    """Contesta al botón después de guardar.
+
+    Si no se ha podido escribir, con un aviso que hay que cerrar: lo elegido
+    vale hasta el reinicio, pero no se puede dar por guardado.
+    """
+    if store.write_error():
+        await safe_answer(event, get_text("settings_not_saved"), alert=True)
+    else:
+        await safe_answer(event)
+
+
 async def _apply(event, field, token):
     if field == "tel":
-        await safe_answer(event)
         if token not in ("0", "1") or (token == "1") == bool(settings.get("telemetry")):
+            await safe_answer(event)
             return
         if token == "1":
             settings.put("telemetry", True)
@@ -361,17 +389,19 @@ async def _apply(event, field, token):
         else:
             # Al apagarlas se olvida también el id de la instalación
             stats.disable()
+        await _answer_saved(event)
         debug(f"[SETTINGS] telemetry set to {token == '1'}")
         await _repaint(event, "tel")
         return
 
     if field in TOGGLES:
         key, screen = TOGGLES[field]
-        await safe_answer(event)
         value = token == "1"
         if token not in ("0", "1") or value == bool(settings.get(key)):
+            await safe_answer(event)
             return
         settings.put(key, value)
+        await _answer_saved(event)
         debug(f"[SETTINGS] {key} set to {value!r}")
         stats.count(f"btn_settings_{field}")
         await _repaint(event, screen)
@@ -385,11 +415,12 @@ async def _apply(event, field, token):
         return
 
     value = allowed[token]
-    await safe_answer(event)
     # Repintar el mismo mensaje sin cambios lo rechaza Telegram (MessageNotModified)
     if value == _current(field):
+        await safe_answer(event)
         return
     settings.put(key, value)
+    await _answer_saved(event)
     debug(f"[SETTINGS] {key} set to {value!r}")
     stats.count(f"btn_settings_{field}")
     if _on_change:

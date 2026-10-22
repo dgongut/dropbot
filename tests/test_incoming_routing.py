@@ -199,6 +199,26 @@ class TestNombreDelFichero:
     def test_audio_sin_nombre(self, dropbot):
         assert dropbot.get_file_name(_document([audio_attr()], doc_id=56)) == "audio_56.mp3"
 
+    def test_una_nota_de_voz_se_guarda_como_ogg(self, dropbot):
+        """Es OGG/Opus: con .mp3 la ignoran los programas que se fían de la extensión."""
+        voice = _document([audio_attr(voice=True)], mime="audio/ogg", doc_id=59)
+        assert dropbot.get_file_name(voice) == "audio_59.ogg"
+
+    @pytest.mark.parametrize("mime, extension", [
+        ("audio/mpeg", ".mp3"),
+        ("audio/mp4", ".m4a"),
+        ("audio/flac", ".flac"),
+        ("AUDIO/OGG", ".ogg"),
+    ])
+    def test_un_audio_sin_nombre_toma_la_extension_de_su_tipo(self, dropbot, mime, extension):
+        audio = _document([audio_attr()], mime=mime, doc_id=60)
+        assert dropbot.get_file_name(audio) == f"audio_60{extension}"
+
+    def test_las_extensiones_de_audio_son_de_audio(self, dropbot):
+        """Con una que no estuviera en EXTENSIONS_AUDIO (la .oga que da mimetypes
+        para audio/ogg), /manage lo mandaría como documento."""
+        assert set(dropbot.AUDIO_EXTENSIONS_BY_MIME.values()) <= dropbot.EXTENSIONS_AUDIO
+
     def test_documento_sin_nombre(self, dropbot):
         assert dropbot.get_file_name(_document([], doc_id=57)) == "file_57"
 
@@ -240,14 +260,14 @@ class TestHandleFiles:
 
         async def scenario():
             await quiet_bot.handle_files(event)
-            task = quiet_bot.active_tasks[event.id]
+            task = quiet_bot.active_tasks["42_4242"]
             assert isinstance(task, asyncio.Task)
             await task
 
         try:
             run_async(scenario())
         finally:
-            quiet_bot.active_tasks.pop(4242, None)
+            quiet_bot.active_tasks.pop("42_4242", None)
         assert started == [4242]
 
     @pytest.mark.parametrize("message, key", [
@@ -270,7 +290,7 @@ class TestHandleFiles:
 
         async def scenario():
             await quiet_bot.handle_files(event)
-            await quiet_bot.active_tasks.pop(event.id)
+            await quiet_bot.active_tasks.pop(quiet_bot.task_key(event))
 
         run_async(scenario())
         assert counted == [key]
@@ -294,7 +314,7 @@ class TestHandleFiles:
 
         async def scenario():
             await quiet_bot.handle_files(event)
-            await quiet_bot.active_tasks.pop(event.id)
+            await quiet_bot.active_tasks.pop(quiet_bot.task_key(event))
 
         run_async(scenario())
         assert started == [4244]
@@ -318,5 +338,5 @@ class TestHandleFiles:
 
         run_async(quiet_bot.handle_files(event))
 
-        assert 4245 not in quiet_bot.active_tasks
+        assert "42_4245" not in quiet_bot.active_tasks
         assert not started and not counted

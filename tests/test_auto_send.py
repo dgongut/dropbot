@@ -96,6 +96,8 @@ class TestLimiteDeTamano:
 
         assert not sent, "no debe intentar enviar algo que Telegram rechaza"
         assert "demasiado grande" in texts()
+        # Con el nombre: en una playlist hay que saber cuál es
+        assert dropbot.get_text("error_file_too_large_named", "grande.mp4") in texts()
         assert "MISSING" not in texts(), "la clave de traducción debe existir"
 
     def test_ask_no_ofrece_botones_inutiles(

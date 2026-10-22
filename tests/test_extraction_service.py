@@ -1,19 +1,27 @@
 """Descompresión de ficheros: `services.extraction_service` y los ayudantes de `basic`.
 
 Todos los comprimidos se crean de verdad en el test: los ZIP con `zipfile`, los
-TAR con `tarfile` y los RAR con `rar4()`, que monta a mano un RAR 4 "store"
-(sin compresión). Un RAR así lo lee `rarfile` por su cuenta, sin `unrar`, así
-que estos tests corren también en la CI. Solo los que necesitan de verdad el
-binario se saltan donde no está.
+TAR con `tarfile` y los RAR con `rar4()` y `rar4_volumes()`, que montan a mano
+un RAR 4 "store" (sin compresión), y con `rar5()`, que monta uno de RAR 5. Los
+RAR sólidos y comprimidos, que no se pueden montar así, van como bytes más
+abajo. `rarfile` lee el índice de un RAR
+por su cuenta, pero quien extrae es `unrar`: los tests que extraen un RAR de
+verdad se saltan donde no está el binario.
 """
 
+import base64
+import errno
+import gzip
 import io
 import os
 import shutil
+import stat
 import struct
+import subprocess
 import tarfile
 import zipfile
 import zlib
+from types import SimpleNamespace
 
 import pytest
 import rarfile
@@ -22,15 +30,23 @@ from basic import (
     clean_rar_base_name, clean_youtube_link, get_filename_from_path,
     is_compressed_file, is_split_zip, sanitize_filename,
 )
-from services.extraction_service import extract_file
+from services.extraction_service import FREE_SPACE_MARGIN, extract_file
+
+needs_unrar = pytest.mark.skipif(shutil.which("unrar") is None, reason="necesita el binario unrar")
+
+MIB = 1024 * 1024
 
 
 # --- Fábricas de comprimidos ---------------------------------------------------
 
-# Flags de la cabecera de archivo de un RAR 4
+# Flags de la cabecera de archivo de un RAR 4 (MHD_PASSWORD: "rar -hp", que
+# cifra también los nombres)
 MHD_VOLUME, MHD_NEWNUMBERING, MHD_FIRSTVOLUME = 0x0001, 0x0010, 0x0100
-# Flags de la cabecera de cada fichero
-LHD_SPLIT_BEFORE, LHD_SPLIT_AFTER = 0x0001, 0x0002
+MHD_PASSWORD = 0x0080
+# Flags de la cabecera de cada fichero (LHD_PASSWORD: "rar -p", solo los datos)
+LHD_SPLIT_BEFORE, LHD_SPLIT_AFTER, LHD_PASSWORD = 0x0001, 0x0002, 0x0004
+# Flag del bloque final de un volumen que no es el último
+EARC_NEXT_VOLUME = 0x0001
 
 
 def _rar_block(head_type, flags, body):
@@ -39,25 +55,150 @@ def _rar_block(head_type, flags, body):
     return struct.pack("<H", zlib.crc32(rest) & 0xFFFF) + rest
 
 
+def _rar_file(name, data, flags=0, unpacked_size=None, crc=None, attributes=0o100644):
+    """La cabecera de un fichero guardado sin comprimir, con sus datos detrás."""
+    encoded = name.encode("ascii")
+    body = struct.pack(
+        "<IIBIIBBHI", len(data), len(data) if unpacked_size is None else unpacked_size, 3,
+        zlib.crc32(data) if crc is None else crc, 0x00210000, 20, 0x30, len(encoded), attributes,
+    ) + encoded
+    return _rar_block(0x74, 0x8000 | flags, body) + data
+
+
 def rar4(files, archive_flags=0, file_flags=0, end_flags=0x4000):
     """Un RAR 4 válido con `files` [(nombre, bytes)] guardados sin comprimir."""
     out = b"Rar!\x1a\x07\x00"
     out += _rar_block(0x73, archive_flags, b"\0" * 6)
     for name, data in files:
-        encoded = name.encode("ascii")
-        body = struct.pack(
-            "<IIBIIBBHI", len(data), len(data), 3, zlib.crc32(data),
-            0x00210000, 20, 0x30, len(encoded), 0x81A4,
-        ) + encoded
-        out += _rar_block(0x74, 0x8000 | file_flags, body) + data
+        out += _rar_file(name, data, file_flags)
     out += _rar_block(0x7B, end_flags, b"")
     return out
+
+
+def rar4_volumes(files, parts, new_numbering=True):
+    """Los volúmenes de un RAR 4 multiparte de verdad, que acepta unrar.
+
+    Los ficheros de `files` van enteros en el primer volumen, salvo el último,
+    que se reparte entre los `parts` volúmenes.
+    """
+    *whole, (name, data) = files
+    size = -(-len(data) // parts)
+    chunks = [data[start:start + size] for start in range(0, len(data), size)]
+    volumes = []
+    for number, chunk in enumerate(chunks):
+        first, last = number == 0, number == len(chunks) - 1
+        flags = MHD_VOLUME | (MHD_NEWNUMBERING if new_numbering else 0) | (MHD_FIRSTVOLUME if first else 0)
+        out = b"Rar!\x1a\x07\x00" + _rar_block(0x73, flags, b"\0" * 6)
+        if first:
+            out += b"".join(_rar_file(whole_name, whole_data) for whole_name, whole_data in whole)
+        # Cada trozo lleva el CRC de lo suyo, y el último el del fichero entero
+        split = (0 if first else LHD_SPLIT_BEFORE) | (0 if last else LHD_SPLIT_AFTER)
+        out += _rar_file(name, chunk, split, unpacked_size=len(data),
+                         crc=zlib.crc32(data if last else chunk))
+        out += _rar_block(0x7B, 0x4000 | (0 if last else EARC_NEXT_VOLUME), b"")
+        volumes.append(out)
+    return volumes
+
+
+def write_rar_set(folder, base, files, parts, new_numbering=True):
+    """Escribe en `folder` un RAR multiparte y devuelve las rutas de sus partes.
+
+    Con `new_numbering` se llaman base.partN.rar; sin él, base.rar, base.r00...
+    """
+    if new_numbering:
+        names = [f"{base}.part{number}.rar" for number in range(1, parts + 1)]
+    else:
+        names = [f"{base}.rar"] + [f"{base}.r{number:02d}" for number in range(parts - 1)]
+    paths = []
+    for name, volume in zip(names, rar4_volumes(files, parts, new_numbering)):
+        path = folder / name
+        path.write_bytes(volume)
+        paths.append(path)
+    return paths
 
 
 def rar_second_volume(name="pelicula.mkv", data=b"B" * 32):
     """La segunda parte de un RAR multiparte, sin la primera."""
     return rar4([(name, data)], archive_flags=MHD_VOLUME | MHD_NEWNUMBERING,
                 file_flags=LHD_SPLIT_BEFORE)
+
+
+# Flags de la cabecera de cada fichero de un RAR 5 (UNKNOWN_SIZE: "rar -si",
+# que comprime lo que le llega por una tubería sin saber cuánto será)
+RAR5_FILE_HAS_CRC, RAR5_FILE_UNKNOWN_SIZE = 0x0004, 0x0008
+
+
+def _vint(number):
+    """Un entero como los guarda RAR 5: de 7 en 7 bits, con el octavo si sigue."""
+    out = bytearray()
+    while number > 0x7F:
+        out.append(number & 0x7F | 0x80)
+        number >>= 7
+    return bytes(out + bytes([number]))
+
+
+def _rar5_block(fields):
+    size = _vint(len(fields))
+    return struct.pack("<I", zlib.crc32(size + fields)) + size + fields
+
+
+def rar5(name, data, file_flags=0, unpacked_size=None):
+    """Un RAR 5 válido con un fichero guardado sin comprimir."""
+    encoded = name.encode("ascii")
+    header = (
+        b"".join(_vint(field) for field in (
+            2, 0x0002, len(data), RAR5_FILE_HAS_CRC | file_flags,
+            len(data) if unpacked_size is None else unpacked_size, 0o644,
+        ))
+        + struct.pack("<I", zlib.crc32(data)) + _vint(0) + _vint(1) + _vint(len(encoded)) + encoded
+    )
+    return (b"Rar!\x1a\x07\x01\x00" + _rar5_block(_vint(1) + _vint(0) + _vint(0))
+            + _rar5_block(header) + data + _rar5_block(_vint(5) + _vint(0) + _vint(0)))
+
+
+# Lo bastante grande como para repartirlo en varios volúmenes
+MOVIE = bytes(range(256)) * 1200
+
+# RAR 5 sólidos y comprimidos, hechos con RAR 7.11 porque no se pueden montar a
+# mano. capitulos.rar: `rar a -s -m3 capitulos.rar capitulo1.txt ... capitulo4.txt`,
+# con "capitulo N " 100 veces en cada uno
+SOLID_CHAPTERS_RAR = base64.b64decode(
+    "UmFyIRoHAQAJ78hvCwEFBwQGAQGAgIAAaA0BYCsCAwuoAATMCKSDAkL65xiAGwENY2FwaXR1"
+    "bG8xLnR4dAoDE4At2Wo8cz45xLslM1Qz+FAyCvgLfgQ1XKpVK3CQ/pdvwRmjyY+YYem9f5E9"
+    "8WKP8LBRpacrAgMLhwAEzAikgwJfifMDwBsBDWNhcGl0dWxvMi50eHQKAxOALdlq2xVAOUAe"
+    "BHrin4CfcySwKwIDC4cABMwIpIMCa1ovvMAbAQ1jYXBpdHVsbzMudHh0CgMTgC3ZansmQTlA"
+    "HgR7Ap+AXssDgisCAwuHAATMCKSDAmVv2zXAGwENY2FwaXR1bG80LnR4dAoDE4At2WqCJkI5"
+    "QB4EeyKfgB13VlEDBQQA"
+)
+SOLID_CHAPTERS = {f"capitulo{n}.txt": f"capitulo {n} ".encode() * 100 for n in range(1, 5)}
+
+# nombres_raros.rar: `rar a -s -m3 -@ nombres_raros.rar Bonus "Hola?.txt"
+# "@notas.txt" capitulo1.txt capitulo2.txt`, con "Bonus/Hola?.txt" por delante
+# de "Hola?.txt" dentro del archivo
+SOLID_ODD_NAMES_RAR = base64.b64decode(
+    "UmFyIRoHAQAJ78hvCwEFBwQGAQGAgIAAxoAWBygCAwudAASMBqSDAkB6pw6AQwEKQG5vdGFz"
+    "LnR4dAoDE8Iq2WppqOYVxIQaJAMz+kJKxawNg3jFga3BX+mbED3OyFRkMJjML9vmLQIDC4gA"
+    "BNAFpIMCUNFzD8BDAQ9Cb251cy9Ib2xhPy50eHQKAxPCKtlqjRXkFUQbBd3XiMkY7dyF5ycC"
+    "AwuHAATuBaSDAnSOau7AQwEJSG9sYT8udHh0CgMTwirZasVn5RVHGQTi6RmelD84/ysCAwuH"
+    "AASgBqSDAsGOL5bAQwENY2FwaXR1bG8xLnR4dAoDE8Iq2WontOcVQR8E/CDNACGRmqErAgML"
+    "hwAEyAakgwKJfYgXwEMBDWNhcGl0dWxvMi50eHQKAxPCKtlqIqHoFUEfBNKQ4QBjyAFVHQID"
+    "CwABAO2DAcAAAQVCb251cwoDE8Iq2WpEuOIVHXdWUQMFBAA="
+)
+SOLID_ODD_NAMES = {
+    "@notas.txt": b"notas " * 130,
+    os.path.join("Bonus", "Hola?.txt"): b"extra " * 120,
+    "Hola?.txt": b"hola " * 150,
+    "capitulo1.txt": b"uno " * 200,
+    "capitulo2.txt": b"dos " * 210,
+}
+
+# copias.rar: `rar a -oi:1 -m3 copias.rar uno.txt copia.txt`, los dos con
+# "identico " 300 veces: "copia.txt" se guarda como una referencia a "uno.txt"
+COPY_REFERENCE_RAR = base64.b64decode(
+    "UmFyIRoHAQDz4YLrCwEFBwAGAQGAgIAAt2i7NiUCAwubAASMFaSDAtYJYdOAAwEHdW5vLnR4"
+    "dAoDE4ov2WpxEdYxxIYYAwI/siivm/BAkEl/kIvK1qQLq+djuZEgrd1fwzMCAxeAAASMFaSD"
+    "AgAAAACAAAEJY29waWEudHh0CgMTii/ZatRA1zELBQUAB3Vuby50eHQdd1ZRAwUEAA=="
+)
 
 
 def make_zip(path, members):
@@ -305,6 +446,43 @@ class TestTar:
         assert extract_file(archive, str(dest)) is False
         assert not dest.exists()
 
+    @pytest.mark.parametrize("damage", ["corte_al_empezar_una_cabecera",
+                                        "corte_a_mitad_de_una_cabecera",
+                                        "cabecera_con_un_byte_mal"])
+    def test_un_tar_cortado_o_danado_en_una_cabecera_no_se_da_por_bueno(self, workdir, damage):
+        """tarfile da por acabado el archivo, sin error, en la primera cabecera
+        vacía, cortada o dañada: se extraían los miembros de antes y ya."""
+        source, dest = workdir
+        archive = make_tar(source / "codigo.tar", {f"img{n}.jpg": bytes([n]) * 1000 for n in range(4)})
+        # Cada miembro ocupa su cabecera y sus datos redondeados a bloques de 512
+        third_header = 2 * (512 + 1024)
+        with open(archive, "rb") as handle:
+            data = bytearray(handle.read())
+        if damage == "corte_al_empezar_una_cabecera":
+            data = data[:third_header]
+        elif damage == "corte_a_mitad_de_una_cabecera":
+            data = data[:third_header + 100]
+        else:
+            data[third_header + 5] ^= 0xFF
+        with open(archive, "wb") as handle:
+            handle.write(bytes(data))
+
+        assert extract_file(archive, str(dest)) == "corrupted"
+        assert not dest.exists(), "no se extrae nada de un TAR incompleto"
+
+    def test_un_tar_comprimido_con_una_cabecera_danada_tampoco(self, workdir):
+        source, dest = workdir
+        plain = make_tar(source / "codigo.tar", {f"img{n}.jpg": bytes([n]) * 1000 for n in range(4)})
+        with open(plain, "rb") as handle:
+            data = bytearray(handle.read())
+        data[2 * (512 + 1024) + 5] ^= 0xFF
+        archive = source / "codigo.tar.gz"
+        with gzip.open(archive, "wb") as handle:
+            handle.write(bytes(data))
+
+        assert extract_file(str(archive), str(dest)) == "corrupted"
+        assert not dest.exists()
+
     def test_sin_soporte_de_filter_usa_el_extractall_de_siempre(self, workdir, monkeypatch):
         """Pythons antiguos no conocen `filter=`: se reintenta sin él."""
         source, dest = workdir
@@ -328,6 +506,7 @@ class TestTar:
 # --- RAR -----------------------------------------------------------------------
 
 class TestRar:
+    @needs_unrar
     def test_extrae_un_rar_real(self, workdir):
         source, dest = workdir
         archive = source / "serie.rar"
@@ -339,6 +518,7 @@ class TestRar:
             os.path.join("extras", "cap2.txt"): b"dos",
         }
 
+    @needs_unrar
     def test_un_rar_se_reconoce_por_su_contenido_y_no_por_la_extension(self, workdir):
         source, dest = workdir
         archive = source / "serie.part1.rar"
@@ -359,6 +539,55 @@ class TestRar:
         assert not (source.parent / "evil.txt").exists()
         assert not os.path.exists("/tmp/dropbot-rar-slip.txt")
 
+    def test_un_enlace_simbolico_se_rechaza_entero(self, workdir):
+        """Igual que en los TAR: un enlace puede apuntar fuera del destino."""
+        source, dest = workdir
+        archive = source / "enlace.rar"
+        archive.write_bytes(
+            b"Rar!\x1a\x07\x00" + _rar_block(0x73, 0, b"\0" * 6)
+            + _rar_file("a.txt", b"a")
+            + _rar_file("enlace", b"../../fuera", attributes=0o120777)
+            + _rar_block(0x7B, 0x4000, b"")
+        )
+
+        assert extract_file(str(archive), str(dest)) is False
+        assert not dest.exists()
+
+    @needs_unrar
+    def test_una_copia_de_un_fichero_identico_no_cuenta_como_enlace(self, workdir):
+        source, dest = workdir
+        archive = source / "copias.rar"
+        archive.write_bytes(COPY_REFERENCE_RAR)
+
+        assert extract_file(str(archive), str(dest)) is True
+        assert tree(dest) == {"uno.txt": b"identico " * 300, "copia.txt": b"identico " * 300}
+
+    @needs_unrar
+    @pytest.mark.parametrize("attributes", [0o104755, 0o102755, 0o101777, 0o106777, 0o100755], ids=oct)
+    def test_los_ficheros_salen_sin_setuid_setgid_ni_sticky(self, workdir, attributes):
+        """unrar deja a cada fichero los permisos que trae el RAR: con el bot
+        como root, un RAR ajeno dejaba en la carpeta del host un ejecutable
+        setuid de root. El resto de permisos, como el de ejecución, se queda."""
+        source, dest = workdir
+        archive = source / "utilidades.rar"
+        archive.write_bytes(
+            b"Rar!\x1a\x07\x00" + _rar_block(0x73, 0, b"\0" * 6)
+            + _rar_file("bin/tool", b"#!/bin/sh\n", attributes=attributes)
+            + _rar_block(0x7B, 0x4000, b"")
+        )
+
+        assert extract_file(str(archive), str(dest)) is True
+        assert stat.S_IMODE((dest / "bin" / "tool").stat().st_mode) == attributes & 0o777
+
+    @needs_unrar
+    def test_un_rar5_se_extrae(self, workdir):
+        source, dest = workdir
+        archive = source / "nuevo.rar"
+        archive.write_bytes(rar5("hola.txt", b"hola" * 100))
+
+        assert extract_file(str(archive), str(dest)) is True
+        assert tree(dest) == {"hola.txt": b"hola" * 100}
+
     def test_una_parte_suelta_que_no_es_la_primera_avisa_de_que_faltan_partes(self, workdir):
         source, dest = workdir
         archive = source / "pelicula.part2.rar"
@@ -367,6 +596,114 @@ class TestRar:
         assert extract_file(str(archive), str(dest)) == "missing_parts"
         assert not dest.exists(), "la carpeta vacía se tiene que borrar"
 
+    @needs_unrar
+    @pytest.mark.parametrize("new_numbering", [True, False])
+    def test_un_rar_por_partes_se_extrae_entero(self, workdir, new_numbering):
+        source, dest = workdir
+        parts = write_rar_set(source, "pelicula", [("extras.txt", b"entero"), ("pelicula.mkv", MOVIE)],
+                              3, new_numbering)
+
+        assert extract_file(str(parts[0]), str(dest)) is True
+        assert tree(dest) == {"extras.txt": b"entero", "pelicula.mkv": MOVIE}
+
+    @pytest.mark.parametrize("missing", [1, 2])
+    def test_un_rar_por_partes_al_que_le_falta_una_no_se_extrae(self, workdir, missing):
+        """rarfile no lanza nada si no encuentra el volumen siguiente: lo apunta
+        y sigue con lo que tiene."""
+        source, dest = workdir
+        parts = write_rar_set(source, "pelicula", [("extras.txt", b"entero"), ("pelicula.mkv", MOVIE)], 3)
+        parts[missing].unlink()
+
+        assert extract_file(str(parts[0]), str(dest)) == "missing_parts"
+        assert not dest.exists()
+        assert all(part.exists() for number, part in enumerate(parts) if number != missing)
+
+    @needs_unrar
+    @pytest.mark.parametrize("cut", [1, 2])
+    def test_un_rar_por_partes_con_una_cortada_esta_corrupto(self, workdir, monkeypatch, cut):
+        """rarfile solo lee las cabeceras y no lo nota: lo dice unrar al
+        comprobar el CRC. Con FORCE_TOOL rarfile lee también estos miembros sin
+        comprimir con unrar, como hace con los comprimidos: así se daba por
+        buena la extracción con el último fichero a medias."""
+        monkeypatch.setattr(rarfile, "FORCE_TOOL", True)
+        source, dest = workdir
+        parts = write_rar_set(source, "pelicula", [("extras.txt", b"entero"), ("pelicula.mkv", MOVIE)], 3)
+        with open(parts[cut], "r+b") as handle:
+            handle.truncate(os.path.getsize(parts[cut]) - 300)
+
+        assert extract_file(str(parts[0]), str(dest)) == "corrupted"
+        assert not dest.exists(), "tampoco se queda el fichero que estaba entero"
+
+    @pytest.mark.parametrize("archive_flags,file_flags", [
+        (MHD_PASSWORD, 0),   # rar -hp: el índice sale vacío
+        (0, LHD_PASSWORD),   # rar -p: solo los datos
+    ])
+    def test_un_rar_con_contrasena_no_se_da_por_descomprimido(self, workdir, archive_flags, file_flags):
+        """Con las cabeceras cifradas no había nada que extraer, y "nada" se
+        daba por bueno: se anunciaba el éxito y se ofrecía borrar el RAR."""
+        source, dest = workdir
+        archive = source / "fotos.rar"
+        archive.write_bytes(rar4([("foto.jpg", b"jpg")], archive_flags=archive_flags, file_flags=file_flags))
+
+        assert extract_file(str(archive), str(dest)) == "password"
+        assert not dest.exists()
+
+    @needs_unrar
+    def test_un_rar_solido_se_extrae_con_una_sola_llamada_a_unrar(self, workdir, monkeypatch):
+        """rarfile sacaba cada miembro con su propio "unrar p", que en un RAR
+        sólido vuelve a descomprimir todo lo anterior: con miles de ficheros,
+        horas."""
+        source, dest = workdir
+        archive = source / "capitulos.rar"
+        archive.write_bytes(SOLID_CHAPTERS_RAR)
+        launched = []
+
+        class CountingPopen(subprocess.Popen):
+            def __init__(self, args, *more, **kwargs):
+                launched.append(list(args))
+                super().__init__(args, *more, **kwargs)
+
+        monkeypatch.setattr(subprocess, "Popen", CountingPopen)
+        monkeypatch.setattr(rarfile, "Popen", CountingPopen)
+
+        assert extract_file(str(archive), str(dest)) is True
+        assert tree(dest) == SOLID_CHAPTERS
+        assert [command[1] for command in launched] == ["x"]
+
+    @needs_unrar
+    def test_un_rar_solido_con_arrobas_e_interrogaciones_en_los_nombres_sale_entero(self, workdir):
+        """Pasados a unrar de uno en uno, "@notas.txt" se tomaba por una lista
+        de ficheros y "Hola?.txt" por una máscara que casaba antes con
+        "Bonus/Hola?.txt": salía "extracción incompleta" o "archivo dañado"."""
+        source, dest = workdir
+        archive = source / "nombres_raros.rar"
+        archive.write_bytes(SOLID_ODD_NAMES_RAR)
+
+        assert extract_file(str(archive), str(dest)) is True
+        assert tree(dest) == SOLID_ODD_NAMES
+
+    @needs_unrar
+    def test_un_rar_con_interrogacion_en_su_nombre_no_abre_otros_que_encajen(self, workdir):
+        """unrar también toma por una máscara el nombre del archivo: "Hola?.rar"
+        abriría además "HolaX.rar"."""
+        source, dest = workdir
+        archive = source / "Hola?.rar"
+        archive.write_bytes(rar4([("mio.txt", b"mio")]))
+        (source / "HolaX.rar").write_bytes(rar4([("ajeno.txt", b"ajeno")]))
+
+        assert extract_file(str(archive), str(dest)) is True
+        assert tree(dest) == {"mio.txt": b"mio"}
+
+    @needs_unrar
+    def test_un_rar_por_partes_con_asterisco_en_su_nombre_encuentra_sus_partes(self, workdir):
+        source, dest = workdir
+        parts = write_rar_set(source, "Serie*", [("extras.txt", b"entero"), ("serie.mkv", MOVIE)], 3)
+        (source / "SerieX.part1.rar").write_bytes(rar4([("ajeno.txt", b"ajeno")]))
+
+        assert extract_file(str(parts[0]), str(dest)) is True
+        assert tree(dest) == {"extras.txt": b"entero", "serie.mkv": MOVIE}
+
+    @needs_unrar
     def test_un_rar_con_el_crc_mal_esta_corrupto(self, workdir):
         source, dest = workdir
         data = bytearray(rar4([("hola.txt", b"hola" * 100)]))
@@ -377,126 +714,69 @@ class TestRar:
         assert extract_file(str(archive), str(dest)) == "corrupted"
         assert not dest.exists()
 
-    def test_un_rar_truncado_es_una_extraccion_parcial_y_se_borra(self, workdir):
-        """rarfile deja el fichero creado a 0 bytes antes de quedarse sin datos."""
+    @needs_unrar
+    def test_un_rar_truncado_esta_corrupto_y_no_deja_nada(self, workdir):
         source, dest = workdir
         archive = source / "corto.rar"
         archive.write_bytes(rar4([("hola.txt", b"hola" * 100)])[:60])
 
-        assert extract_file(str(archive), str(dest)) == "partial"
+        assert extract_file(str(archive), str(dest)) == "corrupted"
         assert not dest.exists()
 
-    # Los mensajes que da rarfile según lo que encuentre, sin depender de la
-    # herramienta externa que haya instalada
+    # Cómo se interpreta cada salida de unrar, sin tener que provocarla
     @pytest.fixture
-    def failing_rar(self, workdir, monkeypatch):
+    def unrar_exits(self, workdir, monkeypatch):
         source, dest = workdir
         archive = source / "falla.rar"
         archive.write_bytes(rar4([("a.txt", b"a")]))
 
-        def install(exc, before=None):
-            class FailingRar:
-                def __init__(self, *args, **kwargs):
-                    pass
+        def install(returncode, output=""):
+            def fake_run(command, **kwargs):
+                # Lo que unrar haya llegado a escribir antes de fallar
+                open(os.path.join(command[-1], "a medias.txt"), "wb").close()
+                return subprocess.CompletedProcess(command, returncode, "", output)
 
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *exc_info):
-                    return False
-
-                def namelist(self):
-                    return ["a.txt"]
-
-                def extractall(self, path):
-                    if before:
-                        before(path)
-                    raise exc
-
-            monkeypatch.setattr(rarfile, "RarFile", FailingRar)
+            monkeypatch.setattr(subprocess, "run", fake_run)
             return str(archive), dest
         return install
 
-    @pytest.mark.parametrize("message", [
-        "Need to start from first volume",
-        "Need first volume",
-        "Missing volume: pelicula.part3.rar",
-        "Unexpected end of archive",
+    @pytest.mark.parametrize("returncode,output,expected", [
+        (3, "a.txt - checksum error", "corrupted"),
+        (3, "Unexpected end of archive", "corrupted"),
+        (6, "Cannot find volume /descargas/falla.part2.rar", "missing_parts"),
+        (11, "Incorrect password for a.txt", "password"),
+        # Con el disco lleno, unrar puede contar "Inappropriate ioctl for device"
+        (5, "Write error in the file a.txt", "no_space"),
+        (2, "Algo raro", False),
     ])
-    def test_los_mensajes_de_partes_que_faltan(self, failing_rar, message):
-        archive, dest = failing_rar(rarfile.Error(message))
+    def test_la_salida_de_unrar_decide_el_resultado(self, unrar_exits, returncode, output, expected):
+        archive, dest = unrar_exits(returncode, output)
 
-        assert extract_file(archive, str(dest)) == "missing_parts"
-        assert not dest.exists()
-
-    @pytest.mark.parametrize("message", [
-        "Corrupt file", "Archive is damaged", "Bad RAR file",
-        "CRC failed in a.txt", "Checksum error in the encrypted file",
-    ])
-    def test_los_mensajes_de_archivo_corrupto(self, failing_rar, message):
-        archive, dest = failing_rar(rarfile.Error(message))
-
-        assert extract_file(archive, str(dest)) == "corrupted"
-        assert not dest.exists()
-
-    def test_lectura_corta_con_ficheros_vacios_es_una_extraccion_parcial(self, failing_rar):
-        def leave_half(path):
-            with open(os.path.join(path, "lleno.txt"), "wb") as handle:
-                handle.write(b"datos")
-            open(os.path.join(path, "vacio.txt"), "wb").close()
-
-        archive, dest = failing_rar(
-            rarfile.BadRarFile("Failed the read enough data: req=10 got=0"), leave_half,
-        )
-
-        assert extract_file(archive, str(dest)) == "partial"
+        assert extract_file(archive, str(dest)) == expected
         assert not dest.exists(), "lo extraído a medias se borra"
 
-    def test_lectura_corta_con_todo_extraido_se_da_por_buena(self, failing_rar):
-        def leave_all(path):
-            os.makedirs(os.path.join(path, "sub"))
-            with open(os.path.join(path, "sub", "lleno.txt"), "wb") as handle:
-                handle.write(b"datos")
+    def test_sin_unrar_falla_sin_reventar(self, workdir, monkeypatch):
+        source, dest = workdir
+        archive = source / "a.rar"
+        archive.write_bytes(rar4([("a.txt", b"a")]))
 
-        archive, dest = failing_rar(
-            rarfile.BadRarFile("Failed the read enough data: req=10 got=0"), leave_all,
-        )
+        def missing_tool(command, **kwargs):
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", command[0])
 
-        assert extract_file(archive, str(dest)) is True
-        assert (dest / "sub" / "lleno.txt").read_bytes() == b"datos"
+        monkeypatch.setattr(subprocess, "run", missing_tool)
 
-    def test_lectura_corta_sin_nada_extraido_esta_corrupto(self, failing_rar):
-        archive, dest = failing_rar(
-            rarfile.BadRarFile("Failed the read enough data: req=10 got=0"),
-        )
-
-        assert extract_file(archive, str(dest)) == "corrupted"
+        assert extract_file(str(archive), str(dest)) is False
         assert not dest.exists()
 
-    def test_sin_herramienta_para_descomprimir_falla_sin_reventar(self, failing_rar):
-        archive, dest = failing_rar(rarfile.RarCannotExec("Cannot find working tool"))
-
-        assert extract_file(archive, str(dest)) is False
-
-    def test_un_error_desconocido_falla_y_borra_la_carpeta(self, failing_rar):
-        def leave_something(path):
-            open(os.path.join(path, "a medias.txt"), "wb").close()
-
-        archive, dest = failing_rar(rarfile.Error("Algo raro"), leave_something)
-
-        assert extract_file(archive, str(dest)) is False
-        assert not dest.exists()
-
-    @pytest.mark.parametrize("exc,expected", [
-        (rarfile.Error("Missing volume"), "missing_parts"),
-        (rarfile.Error("Corrupt file"), "corrupted"),
-        (rarfile.BadRarFile("Failed the read enough data"), "corrupted"),
-        (rarfile.Error("Algo raro"), False),
+    @pytest.mark.parametrize("returncode,output,expected", [
+        (6, "Cannot find volume", "missing_parts"),
+        (3, "checksum error", "corrupted"),
+        (2, "Algo raro", False),
     ])
     def test_si_no_se_puede_limpiar_la_carpeta_el_resultado_llega_igual(
-        self, failing_rar, monkeypatch, exc, expected
+        self, unrar_exits, monkeypatch, returncode, output, expected
     ):
-        archive, dest = failing_rar(exc)
+        archive, dest = unrar_exits(returncode, output)
 
         def broken_rmtree(path, *args, **kwargs):
             raise PermissionError("sin permiso")
@@ -505,33 +785,18 @@ class TestRar:
 
         assert extract_file(archive, str(dest)) == expected
 
-    def test_si_no_se_puede_limpiar_tras_una_parcial_sigue_siendo_parcial(
-        self, failing_rar, monkeypatch
-    ):
-        archive, dest = failing_rar(
-            rarfile.BadRarFile("Failed the read enough data"),
-            lambda path: open(os.path.join(path, "vacio.txt"), "wb").close(),
-        )
-
-        def busy_rmtree(path, *args, **kwargs):
-            raise OSError("ocupado")
-
-        monkeypatch.setattr(shutil, "rmtree", busy_rmtree)
-
-        assert extract_file(archive, str(dest)) == "partial"
-
-    @pytest.mark.skipif(shutil.which("unrar") is None, reason="necesita el binario unrar")
+    @needs_unrar
     def test_unrar_de_la_imagen_entiende_los_rar_de_los_tests(self, workdir):
-        """Comprueba que el RAR hecho a mano es un RAR de verdad y no solo algo
-        que acepta rarfile: se lo pasamos a la herramienta real."""
-        import subprocess
-
+        """Comprueba que los RAR hechos a mano son RAR de verdad y no solo algo
+        que acepta rarfile: se los pasamos a la herramienta real."""
         source, dest = workdir
         archive = source / "real.rar"
         archive.write_bytes(rar4([("hola.txt", b"hola")]))
+        parts = write_rar_set(source, "partes", [("a.txt", b"a"), ("b.bin", MOVIE)], 3)
 
-        result = subprocess.run(["unrar", "t", str(archive)], capture_output=True, text=True)
-        assert result.returncode == 0, result.stdout + result.stderr
+        for path in (archive, parts[0]):
+            result = subprocess.run(["unrar", "t", str(path)], capture_output=True, text=True)
+            assert result.returncode == 0, result.stdout + result.stderr
 
     def test_un_falso_rar_no_se_extrae(self, workdir):
         source, dest = workdir
@@ -559,6 +824,85 @@ class TestRar:
 
         assert extract_file(str(archive), str(dest)) is False
         assert (dest / "mio.txt").read_bytes() == b"del usuario"
+
+
+# --- Espacio en disco -------------------------------------------------------------
+
+class TestEspacioEnDisco:
+    """Un comprimido de pocos KB puede declarar cientos de GB: se escribía hasta
+    llenar el disco, y después se borraba todo con un "archivo corrupto"."""
+
+    @pytest.fixture
+    def free_space(self, monkeypatch):
+        def set_free(free):
+            monkeypatch.setattr(shutil, "disk_usage",
+                                lambda path: SimpleNamespace(total=2 * free, used=free, free=free))
+        return set_free
+
+    @pytest.mark.parametrize("name", ["ceros.zip", "ceros.tar.bz2", "ceros.rar"])
+    def test_si_no_cabe_no_se_extrae_nada(self, workdir, free_space, name):
+        source, dest = workdir
+        members = {"ceros.bin": b"\0" * (2 * MIB)}
+        if name.endswith(".zip"):
+            archive = make_zip(source / name, members)
+        elif name.endswith(".tar.bz2"):
+            archive = make_tar(source / name, members, "w:bz2")
+        else:
+            archive = str(source / name)
+            with open(archive, "wb") as handle:
+                handle.write(rar4(list(members.items())))
+        free_space(FREE_SPACE_MARGIN + MIB)
+
+        assert extract_file(archive, str(dest)) == "no_space"
+        assert not dest.exists()
+
+    def test_si_cabe_dejando_el_margen_se_extrae(self, workdir, free_space):
+        source, dest = workdir
+        archive = make_zip(source / "ceros.zip", {"ceros.bin": b"\0" * (MIB // 2)})
+        free_space(FREE_SPACE_MARGIN + MIB)
+
+        assert extract_file(archive, str(dest)) is True
+        assert (dest / "ceros.bin").stat().st_size == MIB // 2
+
+    @pytest.mark.parametrize("archive", [
+        rar5("ceros.bin", b"\0" * MIB, file_flags=RAR5_FILE_UNKNOWN_SIZE, unpacked_size=0),
+        # En RAR 4, un tamaño de 0xFFFFFFFF sin la parte alta (LHD_LARGE)
+        b"Rar!\x1a\x07\x00" + _rar_block(0x73, 0, b"\0" * 6)
+        + _rar_file("ceros.bin", b"\0" * MIB, unpacked_size=0xFFFFFFFF)
+        + _rar_block(0x7B, 0x4000, b""),
+    ], ids=["rar5", "rar4"])
+    def test_un_rar_que_no_dice_cuanto_ocupa_no_se_extrae(self, workdir, free_space, monkeypatch, archive):
+        """unrar no hace caso entonces del tamaño de la cabecera y descomprime
+        hasta el final de los datos: uno que declaraba 0 bytes pasaba la
+        comprobación de espacio y llenaba el disco."""
+        source, dest = workdir
+        path = source / "bomba.rar"
+        path.write_bytes(archive)
+        launched = []
+
+        def fake_run(command, **kwargs):
+            launched.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        free_space(1024 * 1024 * MIB)
+
+        assert extract_file(str(path), str(dest)) is False
+        assert launched == [], "no llega a unrar"
+        assert not dest.exists()
+
+    def test_quedarse_sin_sitio_a_mitad_no_se_toma_por_un_archivo_corrupto(self, workdir, monkeypatch):
+        source, dest = workdir
+        archive = make_zip(source / "fotos.zip", {"a.jpg": b"a"})
+
+        def disk_full(self, path=None, *args, **kwargs):
+            open(os.path.join(path, "a medias.jpg"), "wb").close()
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(zipfile.ZipFile, "extractall", disk_full)
+
+        assert extract_file(archive, str(dest)) == "no_space"
+        assert not dest.exists()
 
 
 # --- basic.py ------------------------------------------------------------------

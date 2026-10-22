@@ -8,17 +8,36 @@ quedan y lo que hay en disco al acabar.
 """
 
 import asyncio
+import errno
 import io
 import os
+import stat
 import tarfile
+import threading
 import zipfile
 
 import pytest
 import rarfile
+from telethon.extensions import markdown
 
+from basic import sanitize_filename
 from button_data import button_data
-from test_extraction_service import rar4, rar_second_volume
+from test_extraction_service import (
+    MHD_PASSWORD, MOVIE, needs_unrar, rar4, rar_second_volume, write_rar_set,
+)
 from translations import get_text
+from utils.telegram_helpers import utf16_len
+
+# Lo más que admite Telegram en un mensaje, sin las marcas de Markdown
+TELEGRAM_TEXT_LIMIT = 4096
+
+# Un juego por partes de los que deja otro programa en la carpeta de descargas
+LONG_RAR_BASE = "Pelicula.Larga.2024.1080p.BluRay.x264-GRUPO"
+
+
+def _telegram_len(text):
+    """La longitud de `text` tal como la mide Telegram, ya sin el Markdown."""
+    return utf16_len(markdown.parse(text)[0])
 
 
 def _payloads(sent_messages):
@@ -89,6 +108,18 @@ def make_tar(path, mode):
     return path
 
 
+def _not_utf8_zip(directory, raw_name=b"caf\xe9.zip"):
+    """Un ZIP con el nombre en Latin-1, que no es UTF-8, como los que quedan al
+    descomprimir en el host uno hecho en Windows. Devuelve su ruta tal como la
+    ve Python, con sustitutos ("caf\\udce9.zip")."""
+    path = os.fsdecode(os.path.join(os.fsencode(directory), raw_name))
+    try:
+        make_zip(path)
+    except OSError:
+        pytest.skip("este sistema de ficheros no admite nombres que no son UTF-8")
+    return path
+
+
 def _non_admin_event(make_event, groups):
     event = make_event(groups=groups)
     event.sender_id = 1
@@ -142,6 +173,7 @@ class TestDescomprimir:
 
         assert (extractor.root / "copia" / "dentro.txt").exists()
 
+    @needs_unrar
     def test_un_rar_real_se_extrae(self, extractor):
         archive = extractor.root / "serie.rar"
         archive.write_bytes(rar4([("cap1.txt", b"uno")]))
@@ -151,6 +183,7 @@ class TestDescomprimir:
         assert (extractor.root / "serie" / "cap1.txt").read_bytes() == b"uno"
         assert get_text("extraction_success_title") in extractor.last()
 
+    @needs_unrar
     def test_la_primera_parte_de_un_rar_se_extrae_sin_el_sufijo_de_parte(self, extractor):
         archive = extractor.root / "pelicula.part1.rar"
         archive.write_bytes(rar4([("pelicula.mkv", b"video")]))
@@ -159,6 +192,7 @@ class TestDescomprimir:
 
         assert (extractor.root / "pelicula" / "pelicula.mkv").read_bytes() == b"video"
 
+    @needs_unrar
     def test_un_rar_conserva_las_mayusculas_en_la_carpeta(self, extractor):
         archive = extractor.root / "Mi Serie.rar"
         archive.write_bytes(rar4([("cap1.txt", b"uno")]))
@@ -178,6 +212,7 @@ class TestDescomprimir:
         assert b"fileact:x1" in extractor.payloads()
         assert not any(p.startswith(b"delcompressed:") for p in extractor.payloads())
 
+    @needs_unrar
     def test_un_rar_con_el_crc_mal_se_da_por_corrupto(self, extractor):
         data = bytearray(rar4([("hola.txt", b"hola" * 100)]))
         data[-20] ^= 0xFF
@@ -189,14 +224,38 @@ class TestDescomprimir:
         assert get_text("extraction_corrupted_title") in extractor.last()
         assert os.listdir(extractor.root) == ["crc.rar"]
 
-    def test_un_rar_truncado_avisa_de_extraccion_incompleta(self, extractor):
+    @needs_unrar
+    def test_un_rar_truncado_se_da_por_corrupto(self, extractor):
         archive = extractor.root / "corto.rar"
         archive.write_bytes(rar4([("hola.txt", b"hola" * 100)])[:60])
 
         extractor.extract(archive)
 
-        assert get_text("extraction_partial_title") in extractor.last()
+        assert get_text("extraction_corrupted_title") in extractor.last()
         assert os.listdir(extractor.root) == ["corto.rar"]
+
+    def test_un_rar_con_contrasena_lo_dice_y_no_ofrece_borrarlo(self, extractor):
+        archive = extractor.root / "fotos.rar"
+        archive.write_bytes(rar4([("foto.jpg", b"jpg")], archive_flags=MHD_PASSWORD))
+
+        extractor.extract(archive)
+
+        assert get_text("extraction_password_title") in extractor.last()
+        assert get_text("extraction_success_title") not in extractor.last()
+        assert os.listdir(extractor.root) == ["fotos.rar"]
+        assert not any(p.startswith(b"delcompressed:") for p in extractor.payloads())
+
+    def test_si_no_cabe_en_el_disco_lo_dice(self, extractor, monkeypatch):
+        import shutil
+        from types import SimpleNamespace
+
+        archive = make_zip(extractor.root / "grande.zip", {"ceros.bin": b"\0" * 1024})
+        monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(total=1, used=1, free=0))
+
+        extractor.extract(archive)
+
+        assert get_text("extraction_no_space_title") in extractor.last()
+        assert os.listdir(extractor.root) == ["grande.zip"]
 
     def test_un_zip_corrupto_avisa_del_error_y_no_deja_carpeta(self, extractor):
         archive = extractor.root / "roto.zip"
@@ -351,6 +410,290 @@ class TestDescomprimir:
         assert (extractor.root / "lento" / "dentro.txt").exists()
         assert get_text("extraction_success_title") in extractor.last()
 
+    def test_si_la_ficha_ya_no_esta_no_queda_una_carpeta_que_bloquee_el_reintento(
+        self, extractor, monkeypatch
+    ):
+        """La ficha se cerró justo antes de pulsar Descomprimir y la edición de
+        "Descomprimiendo" falla. La carpeta ya estaba creada, y cada reintento
+        respondía que la carpeta de destino ya existe."""
+        from telethon.errors import MessageIdInvalidError
+
+        archive = make_zip(extractor.root / "serie.zip")
+        real_edit = extractor.module.safe_edit
+
+        async def gone_edit(message, text=None, **kwargs):
+            if text == get_text("decompressing_file", "serie.zip"):
+                raise MessageIdInvalidError(request=None)
+            return await real_edit(message, text, **kwargs)
+
+        monkeypatch.setattr(extractor.module, "safe_edit", gone_edit)
+        extractor.extract(archive)
+
+        assert os.listdir(extractor.root) == ["serie.zip"]
+
+        monkeypatch.setattr(extractor.module, "safe_edit", real_edit)
+        extractor.extract(archive)
+
+        assert (extractor.root / "serie" / "dentro.txt").exists()
+        assert get_text("extraction_success_title") in extractor.last()
+
+    def test_mientras_se_descomprime_la_carpeta_no_aparece_en_manage(self, extractor, monkeypatch):
+        """Se extraía directamente en la carpeta final: /manage la mostraba a
+        medias y dejaba borrarla o renombrarla, y al acabar se anunciaba el
+        éxito igual."""
+        from services.extraction_service import extract_file as real_extract
+
+        archive = make_zip(extractor.root / "Fotos2024.zip", {"a.jpg": b"a", "b.jpg": b"b"})
+        visible = []
+
+        def watched_extract(file_path, extract_to):
+            result = real_extract(file_path, extract_to)
+            # /list y /manage se saltan lo que empieza por punto
+            visible.append(sorted(name for name in os.listdir(extractor.root) if not name.startswith(".")))
+            return result
+
+        monkeypatch.setattr(extractor.module, "extract_file", watched_extract)
+        extractor.extract(archive)
+
+        assert visible == [["Fotos2024.zip"]]
+        assert sorted(os.listdir(extractor.root / "Fotos2024")) == ["a.jpg", "b.jpg"]
+        assert sorted(os.listdir(extractor.root)) == ["Fotos2024", "Fotos2024.zip"]
+
+    def test_mientras_se_descomprime_solo_el_bot_entra_en_la_carpeta(self, extractor, monkeypatch):
+        """unrar deja a cada fichero los permisos que trae el RAR, también un
+        setuid, y no se le quitan hasta que termina: mientras, cualquiera podía
+        entrar en la carpeta oculta y ejecutarlo. Al acabar, la carpeta tiene
+        los permisos de cualquier otra."""
+        from services.extraction_service import extract_file as real_extract
+
+        archive = make_zip(extractor.root / "Fotos2024.zip", {"a.jpg": b"a"})
+        modes = []
+
+        def watched_extract(file_path, extract_to):
+            modes.append(stat.S_IMODE(os.stat(extract_to).st_mode))
+            return real_extract(file_path, extract_to)
+
+        monkeypatch.setattr(extractor.module, "extract_file", watched_extract)
+        extractor.extract(archive)
+        (extractor.root / "otra").mkdir()
+
+        assert len(modes) == 1 and modes[0] & 0o077 == 0, oct(modes[0])
+        assert (extractor.root / "Fotos2024").stat().st_mode == (extractor.root / "otra").stat().st_mode
+
+    def test_en_un_disco_que_no_deja_cambiar_permisos_se_extrae_igual(self, extractor, monkeypatch):
+        """FAT y exFAT, según cómo se monten, no dejan hacer chmod."""
+        def fchmod(fd, mode):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+
+        monkeypatch.setattr(os, "fchmod", fchmod)
+        archive = make_zip(extractor.root / "Fotos2024.zip", {"a.jpg": b"a"})
+
+        extractor.extract(archive)
+
+        assert (extractor.root / "Fotos2024" / "a.jpg").read_bytes() == b"a"
+        assert get_text("extraction_success_title") in extractor.last()
+
+    def test_si_telethon_cancela_el_handler_la_extraccion_acaba_y_se_cuenta(
+        self, extractor, make_event, run_async, monkeypatch
+    ):
+        """Con un corte de Telegram, disconnect() cancela los handlers en
+        marcha: la extracción seguía en su hilo, pero se quedaba en la carpeta
+        oculta y nadie contaba cómo había ido."""
+        from services.extraction_service import extract_file as real_extract
+
+        archive = make_zip(extractor.root / "Fotos2024.zip", {"a.jpg": b"a"})
+        manage = extractor.module
+        extracting, finish = threading.Event(), threading.Event()
+
+        def slow_extract(file_path, extract_to):
+            extracting.set()
+            finish.wait(5)
+            return real_extract(file_path, extract_to)
+
+        monkeypatch.setattr(manage, "extract_file", slow_extract)
+        extractor.register(archive)
+
+        async def scenario():
+            handler = asyncio.create_task(manage.handle_extract_file(make_event(groups=(b"x1",))))
+            while not extracting.is_set():
+                await asyncio.sleep(0.01)
+            # Como Telethon al desconectarse
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+            finish.set()
+            while manage.extractions_in_progress:
+                await asyncio.sleep(0.01)
+
+        run_async(asyncio.wait_for(scenario(), 5))
+
+        assert sorted(os.listdir(extractor.root)) == ["Fotos2024", "Fotos2024.zip"]
+        assert get_text("extraction_success_title") in extractor.last()
+
+    def test_lo_que_deja_una_parada_a_mitad_se_borra_al_arrancar(self, extractor, monkeypatch):
+        """La carpeta oculta de una extracción cortada solo se borraba al volver
+        a descomprimir ese mismo fichero."""
+        from services.extraction_service import extract_file as real_extract
+        from utils.file_helpers import remove_partial_extractions
+
+        archive = make_zip(extractor.root / "Fotos2024.zip", {"a.jpg": b"a"})
+
+        def stopped_extract(file_path, extract_to):
+            real_extract(file_path, extract_to)
+            raise SystemError("parada a mitad")
+
+        monkeypatch.setattr(extractor.module, "extract_file", stopped_extract)
+        with pytest.raises(SystemError):
+            extractor.extract(archive)
+        assert sorted(os.listdir(extractor.root)) == [".123456.Fotos2024.extracting", "Fotos2024.zip"]
+
+        remove_partial_extractions(str(extractor.root))
+
+        assert os.listdir(extractor.root) == ["Fotos2024.zip"]
+
+    def test_si_la_carpeta_aparece_mientras_tanto_no_se_mezcla_ni_se_borra_el_comprimido(
+        self, extractor, monkeypatch
+    ):
+        """Si durante la extracción el admin crea o renombra algo con ese
+        nombre, lo extraído no se mete ahí ni se da por bueno: con "Borrar" se
+        perdía el comprimido y quedaba una carpeta incompleta."""
+        import settings
+        from services.extraction_service import extract_file as real_extract
+
+        settings.put("extract.after", "DELETE")
+        archive = make_zip(extractor.root / "Fotos2024.zip", {"a.jpg": b"a"})
+
+        def extract_while_renaming(file_path, extract_to):
+            result = real_extract(file_path, extract_to)
+            os.makedirs(extractor.root / "Fotos2024", exist_ok=True)
+            (extractor.root / "Fotos2024" / "mio.txt").write_bytes(b"del usuario")
+            return result
+
+        monkeypatch.setattr(extractor.module, "extract_file", extract_while_renaming)
+        extractor.extract(archive)
+
+        assert archive.exists()
+        assert os.listdir(extractor.root / "Fotos2024") == ["mio.txt"]
+        assert sorted(os.listdir(extractor.root)) == ["Fotos2024", "Fotos2024.zip"]
+        assert extractor.last() == get_text("error_extraction_folder_exists", "Fotos2024")
+
+    def test_si_la_carpeta_oculta_desaparece_a_mitad_no_se_da_por_buena(self, extractor, monkeypatch):
+        """Otro bot que compartía la carpeta la borraba al arrancar. zipfile
+        vuelve a crearla con lo que queda por extraer: se anunciaba el éxito
+        con la mitad de los ficheros y, con "Borrar", se perdía el comprimido."""
+        import settings
+        import shutil
+        import zipfile
+
+        settings.put("extract.after", "DELETE")
+        members = {f"ep{n}.txt": b"x" for n in range(5)}
+        archive = make_zip(extractor.root / "Serie.zip", members)
+
+        def extract_while_swept(file_path, extract_to):
+            with zipfile.ZipFile(file_path) as bundle:
+                for number, name in enumerate(sorted(members)):
+                    if number == 3:
+                        shutil.rmtree(extract_to)
+                    bundle.extract(name, extract_to)
+            return True
+
+        monkeypatch.setattr(extractor.module, "extract_file", extract_while_swept)
+        extractor.extract(archive)
+
+        assert archive.exists()
+        assert os.listdir(extractor.root) == ["Serie.zip"]
+        assert get_text("extraction_success_title") not in extractor.last()
+
+    def test_dos_pulsaciones_seguidas_solo_descomprimen_una_vez(
+        self, extractor, monkeypatch, sent_messages, make_event, run_async
+    ):
+        import time
+        from services.extraction_service import extract_file as real_extract
+
+        archive = make_zip(extractor.root / "paquete.zip")
+        extractor.register(archive)
+        calls = []
+
+        def slow_extract(file_path, extract_to):
+            calls.append(extract_to)
+            time.sleep(0.1)
+            return real_extract(file_path, extract_to)
+
+        monkeypatch.setattr(extractor.module, "extract_file", slow_extract)
+
+        async def double_click():
+            await asyncio.gather(
+                extractor.module.handle_extract_file(make_event(groups=(b"x1",))),
+                extractor.module.handle_extract_file(make_event(groups=(b"x1",))),
+            )
+
+        run_async(double_click())
+
+        assert len(calls) == 1
+        assert get_text("error_extraction_in_progress", "paquete") in [text for _, text, _ in sent_messages]
+        assert (extractor.root / "paquete" / "dentro.txt").exists()
+        assert extractor.module.extractions_in_progress == set()
+
+    @pytest.mark.parametrize("name", [
+        "a" * 246 + ".zip",
+        # Un título en japonés que el bot recortó al guardarlo (253 bytes)
+        sanitize_filename("長い題名の動画" * 14 + ".zip"),
+    ])
+    def test_un_comprimido_con_un_nombre_largo_se_extrae(self, extractor, name):
+        """La carpeta oculta lleva además el id del bot y ".extracting": con un
+        nombre largo pasaba de los 255 bytes, os.makedirs fallaba y la ficha
+        se quedaba en «Descomprimiendo…» sin extraer nada."""
+        archive = make_zip(extractor.root / name)
+        folder = name[:-len(".zip")]
+
+        extractor.extract(archive)
+
+        assert (extractor.root / folder / "dentro.txt").read_bytes() == b"hola"
+        assert get_text("extraction_success_title") in extractor.last()
+        assert sorted(os.listdir(extractor.root)) == sorted([folder, name])
+
+    def test_dos_nombres_largos_que_empiezan_igual_no_comparten_la_carpeta_oculta(
+        self, extractor, monkeypatch
+    ):
+        """Recortado, el nombre de la carpeta oculta podía salir igual para
+        los dos, y al empezar una extracción se borraba lo que llevaba la otra."""
+        from services.extraction_service import extract_file as real_extract
+
+        names = ["b" * 240 + "_parte1.zip", "b" * 240 + "_parte2.zip"]
+        work_paths = []
+
+        def watched_extract(file_path, extract_to):
+            work_paths.append(extract_to)
+            return real_extract(file_path, extract_to)
+
+        monkeypatch.setattr(extractor.module, "extract_file", watched_extract)
+        for number, name in enumerate(names):
+            extractor.extract(make_zip(extractor.root / name), file_id=f"x{number}")
+
+        assert len(set(work_paths)) == 2
+        assert all(len(os.fsencode(os.path.basename(path))) <= 255 for path in work_paths)
+        assert sorted(os.listdir(extractor.root)) == sorted(names + [name[:-len(".zip")] for name in names])
+
+    def test_si_no_se_puede_crear_la_carpeta_oculta_lo_dice(self, extractor, monkeypatch):
+        """Un error de disco al crearla (sin permisos, o una de antes que no se
+        pudo borrar) se escapaba del handler y la ficha se quedaba en
+        «Descomprimiendo…» para siempre."""
+        from utils.file_helpers import EXTRACTING_SUFFIX
+
+        archive = make_zip(extractor.root / "serie.zip")
+        real_makedirs = os.makedirs
+
+        def makedirs(path, *args, **kwargs):
+            if str(path).endswith(EXTRACTING_SUFFIX):
+                raise PermissionError(errno.EACCES, "Permission denied", path)
+            return real_makedirs(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "makedirs", makedirs)
+        extractor.extract(archive)
+
+        assert get_text("extraction_error_title") in extractor.last()
+        assert b"fileact:x1" in extractor.payloads()
+        assert os.listdir(extractor.root) == ["serie.zip"]
+
 
 # --- extract.after ---------------------------------------------------------------
 
@@ -379,20 +722,107 @@ class TestTrasDescomprimirSegunElAjuste:
         assert "x1" not in extractor.module.pending_file_actions
         assert set(extractor.payloads()) == {b"managecat:all", b"close"}
 
+    def test_borrar_no_se_lleva_otro_fichero_que_ocupo_su_nombre(self, extractor, monkeypatch):
+        """Durante la extracción se renombra y llega otro «Pack.zip»: al acabar
+        se borraba ese, que ni se había extraído."""
+        import settings
+
+        settings.put("extract.after", "DELETE")
+        archive = make_zip(extractor.root / "Pack.zip")
+        renamed = extractor.root / "Pack-viejo.zip"
+        real_extract = extractor.module.extract_file
+
+        def extract_while_renaming(file_path, extracted_path):
+            result = real_extract(file_path, extracted_path)
+            os.rename(archive, renamed)
+            make_zip(archive, {"nuevo.txt": b"sin extraer"})
+            return result
+
+        monkeypatch.setattr(extractor.module, "extract_file", extract_while_renaming)
+
+        extractor.extract(archive)
+
+        assert archive.exists() and renamed.exists()
+        with zipfile.ZipFile(archive) as bundle:
+            assert bundle.namelist() == ["nuevo.txt"]
+        assert get_text("delete_error_replaced", "Pack.zip") in extractor.last()
+        assert get_text("file_deleted_title") not in extractor.last()
+
+    @needs_unrar
     def test_borrar_un_rar_multiparte_borra_todas_sus_partes(self, extractor):
         import settings
 
         settings.put("extract.after", "DELETE")
-        first = extractor.root / "serie.rar"
-        first.write_bytes(rar4([("cap1.txt", b"uno")]))
-        for extra in ("serie.r00", "serie.r01"):
-            (extractor.root / extra).write_bytes(b"otra parte")
+        parts = write_rar_set(extractor.root, "serie", [("cap1.txt", b"uno"), ("cap2.mkv", MOVIE)], 3,
+                              new_numbering=False)
         (extractor.root / "otra cosa.mkv").write_bytes(b"no se toca")
 
-        extractor.extract(first)
+        extractor.extract(parts[0])
 
         assert sorted(os.listdir(extractor.root)) == ["otra cosa.mkv", "serie"]
         assert get_text("files_deleted_count", 3) in extractor.last()
+
+    @needs_unrar
+    def test_borrar_un_rar_de_cien_partes_lo_cuenta_en_un_mensaje_que_cabe(self, extractor):
+        """Con el nombre de cada parte, pasaba de los 4096 caracteres: Telegram
+        rechazaba la edición y el mensaje se quedaba en «Descomprimiendo…»."""
+        import settings
+
+        settings.put("extract.after", "DELETE")
+        parts = write_rar_set(extractor.root, LONG_RAR_BASE, [("a.txt", b"a"), ("b.mkv", MOVIE * 4)], 100)
+
+        extractor.extract(parts[0])
+
+        assert os.listdir(extractor.root) == [LONG_RAR_BASE]
+        msg = extractor.last()
+        assert _telegram_len(msg) <= TELEGRAM_TEXT_LIMIT
+        assert get_text("extraction_success_title") in msg
+        assert get_text("files_deleted_count", 100) in msg
+        assert f"`{parts[0].name}`" in msg and get_text("files_deleted_more", 90) in msg
+
+    @needs_unrar
+    def test_borrar_con_una_parte_cortada_no_borra_nada(self, extractor, monkeypatch):
+        """Con "Borrar", un juego de partes con una cortada se daba por
+        descomprimido y se borraban todas: lo extraído quedaba a medias y sin
+        nada de donde repetirlo."""
+        import settings
+
+        # Así lee rarfile los miembros comprimidos: con unrar. Con estos sin
+        # comprimir lo hace solo si se le obliga
+        monkeypatch.setattr(rarfile, "FORCE_TOOL", True)
+        settings.put("extract.after", "DELETE")
+        parts = write_rar_set(extractor.root, "pelicula", [("extras.txt", b"entero"), ("pelicula.mkv", MOVIE)], 3)
+        with open(parts[2], "r+b") as handle:
+            handle.truncate(os.path.getsize(parts[2]) - 300)
+
+        extractor.extract(parts[0])
+
+        assert get_text("extraction_corrupted_title") in extractor.last()
+        assert sorted(os.listdir(extractor.root)) == [part.name for part in parts]
+
+    def test_borrar_con_una_parte_que_falta_no_borra_las_demas(self, extractor):
+        import settings
+
+        settings.put("extract.after", "DELETE")
+        parts = write_rar_set(extractor.root, "pelicula", [("extras.txt", b"entero"), ("pelicula.mkv", MOVIE)], 3)
+        parts[1].unlink()
+
+        extractor.extract(parts[0])
+
+        assert get_text("extraction_missing_parts_title") in extractor.last()
+        assert sorted(os.listdir(extractor.root)) == [parts[0].name, parts[2].name]
+
+    def test_borrar_un_rar_con_contrasena_no_lo_borra(self, extractor):
+        import settings
+
+        settings.put("extract.after", "DELETE")
+        archive = extractor.root / "fotos.rar"
+        archive.write_bytes(rar4([("foto.jpg", b"jpg")], archive_flags=MHD_PASSWORD))
+
+        extractor.extract(archive)
+
+        assert archive.exists()
+        assert get_text("extraction_password_title") in extractor.last()
 
     def test_conservar_lo_deja_y_lo_dice(self, extractor):
         import settings
@@ -459,16 +889,27 @@ class TestBorrarOConservarDespues:
         assert "x1" not in extractor.module.pending_file_actions
 
     def test_borrar_un_rar_por_partes_las_borra_todas(self, extractor):
-        first = extractor.root / "Pelicula.part1.rar"
-        first.write_bytes(rar4([("a.txt", b"a")]))
-        for extra in ("Pelicula.part2.rar", "PELICULA.PART3.RAR"):
-            (extractor.root / extra).write_bytes(b"otra parte")
+        parts = write_rar_set(extractor.root, "Pelicula", [("a.txt", b"a"), ("b.mkv", MOVIE)], 3)
         (extractor.root / "Pelicula").mkdir()
 
-        extractor.act("delcompressed", first)
+        extractor.act("delcompressed", parts[0])
 
         assert os.listdir(extractor.root) == ["Pelicula"], "la carpeta extraída se queda"
         assert get_text("files_deleted_count", 3) in extractor.last()
+
+    def test_borrar_un_rar_de_cien_partes_lo_cuenta_en_un_mensaje_que_cabe(self, extractor):
+        """Con el nombre de cada parte, Telegram rechazaba la edición: la ficha
+        seguía con Eliminar y Conservar de algo que ya estaba borrado."""
+        parts = write_rar_set(extractor.root, LONG_RAR_BASE, [("a.txt", b"a"), ("b.mkv", MOVIE * 4)], 100)
+        (extractor.root / LONG_RAR_BASE).mkdir()
+
+        extractor.act("delcompressed", parts[0])
+
+        assert os.listdir(extractor.root) == [LONG_RAR_BASE]
+        msg = extractor.last()
+        assert _telegram_len(msg) <= TELEGRAM_TEXT_LIMIT
+        assert get_text("files_deleted_count", 100) in msg
+        assert get_text("files_deleted_more", 90) in msg
 
     def test_si_el_fichero_ya_no_esta(self, extractor):
         extractor.act("delcompressed", extractor.root / "ya_borrado.zip")
@@ -498,14 +939,46 @@ class TestBorrarComprimido:
         assert get_text("file_deleted_title") in msg and "`paquete.zip`" in msg
 
     def test_un_rar_viejo_con_r00_borra_todas_sus_partes(self, extractor):
-        first = extractor.root / "serie.rar"
-        first.write_bytes(rar4([("a.txt", b"a")]))
-        for extra in ("serie.r00", "serie.r01", "serie.R02"):
-            (extractor.root / extra).write_bytes(b"x")
+        parts = write_rar_set(extractor.root, "serie", [("a.txt", b"a"), ("b.mkv", MOVIE)], 4,
+                              new_numbering=False)
 
-        msg = extractor.module.delete_compressed(str(first))
+        msg = extractor.module.delete_compressed(str(parts[0]))
 
         assert os.listdir(extractor.root) == []
+        assert get_text("files_deleted_count", 4) in msg
+
+    def test_el_mensaje_dice_que_partes_se_han_borrado(self, extractor):
+        parts = write_rar_set(extractor.root, "pelicula", [("a.txt", b"a"), ("b.mkv", MOVIE)], 2)
+
+        msg = extractor.module.delete_compressed(str(parts[0]))
+
+        assert "`pelicula.part1.rar`" in msg and "`pelicula.part2.rar`" in msg
+
+    @pytest.mark.parametrize("chosen,kept", [
+        ("serie.rar", ["serie.part1.rar", "serie.part2.rar"]),
+        ("serie.part1.rar", ["serie.rar"]),
+    ])
+    def test_borrar_un_rar_no_se_lleva_otro_con_la_misma_base_y_otro_esquema(self, extractor, chosen, kept):
+        """Se borraba todo lo que encajara con base.rar, base.rNN o
+        base.partN.rar, mezclando los dos esquemas: un RAR suelto y otro por
+        partes con el mismo nombre caían juntos."""
+        (extractor.root / "serie.rar").write_bytes(rar4([("suelto.txt", b"suelto")]))
+        write_rar_set(extractor.root, "serie", [("a.txt", b"a"), ("b.mkv", MOVIE)], 2)
+
+        extractor.module.delete_compressed(str(extractor.root / chosen))
+
+        assert sorted(os.listdir(extractor.root)) == kept
+
+    def test_desde_una_parte_que_no_se_puede_abrir_solo_caen_las_de_su_esquema(self, extractor, monkeypatch):
+        """Sin el índice del juego se buscan por nombre: la misma base, el mismo
+        esquema y mayúsculas libres solo en la extensión."""
+        monkeypatch.setattr(rarfile, "is_rarfile", lambda path: True)
+        for name in ("serie.rar", "serie.r00", "serie.r01", "serie.R02", "serie.part1.rar", "Serie.r03"):
+            (extractor.root / name).write_bytes(b"x")
+
+        msg = extractor.module.delete_compressed(str(extractor.root / "serie.r00"))
+
+        assert sorted(os.listdir(extractor.root)) == ["Serie.r03", "serie.part1.rar"]
         assert get_text("files_deleted_count", 4) in msg
 
     def test_borrar_desde_una_parte_r00(self, extractor, monkeypatch):
@@ -557,14 +1030,12 @@ class TestBorrarComprimido:
         assert sorted(os.listdir(extractor.root)) == sorted(others)
 
     def test_borrar_un_rar_por_partes_no_toca_otro_juego_de_partes(self, extractor):
-        first = extractor.root / "pelicula.part1.rar"
-        first.write_bytes(rar4([("a.txt", b"a")]))
-        (extractor.root / "pelicula.part2.rar").write_bytes(b"x")
+        parts = write_rar_set(extractor.root, "pelicula", [("a.txt", b"a"), ("b.mkv", MOVIE)], 2)
         others = ["pelicula 2.part1.rar", "pelicula 2.part2.rar"]
         for name in others:
             (extractor.root / name).write_bytes(b"ajeno")
 
-        extractor.module.delete_compressed(str(first))
+        extractor.module.delete_compressed(str(parts[0]))
 
         assert sorted(os.listdir(extractor.root)) == sorted(others)
 
@@ -576,3 +1047,65 @@ class TestMensajeDeConservado:
         assert "`Canción del año.zip`" in msg
         assert get_text("file_kept_title") in msg
         assert get_text("file_kept_desc") in msg
+
+
+# --- Nombres que no son UTF-8 ----------------------------------------------------
+
+@pytest.fixture
+def telethon_edit(extractor, monkeypatch):
+    """safe_edit codificando el texto como Telethon antes de enviarlo: con un
+    nombre con sustitutos la edición falla, como en Telegram."""
+    real_edit = extractor.module.safe_edit
+
+    async def edit(message, text=None, **kwargs):
+        markdown.parse(text)
+        text.encode("utf-8")
+        return await real_edit(message, text, **kwargs)
+
+    monkeypatch.setattr(extractor.module, "safe_edit", edit)
+
+
+class TestNombreQueNoEsUtf8:
+    """La ficha de un comprimido con el nombre en Latin-1 ya se enseñaba, con
+    su Descomprimir, pero «Descomprimiendo» llevaba el nombre tal cual:
+    Telethon no podía enviarlo, y el botón no hacía nada ni decía nada."""
+
+    @pytest.mark.parametrize("after,action", [
+        ("ASK", None), ("ASK", "delcompressed"), ("ASK", "keepcompressed"),
+        ("DELETE", None), ("KEEP", None),
+    ])
+    def test_se_descomprime_y_se_cuenta_con_el_nombre_escapado(
+        self, extractor, telethon_edit, sent_messages, after, action
+    ):
+        import settings
+
+        settings.put("extract.after", after)
+        archive = _not_utf8_zip(extractor.root)
+
+        extractor.extract(archive)
+        if action:
+            extractor.act(action, archive)
+
+        root = os.fsencode(extractor.root)
+        assert os.listdir(os.path.join(root, b"caf\xe9")) == [b"dentro.txt"]
+        deleted = after == "DELETE" or action == "delcompressed"
+        assert (b"caf\xe9.zip" in os.listdir(root)) is not deleted
+        assert sent_messages[0][1] == get_text("decompressing_file", "caf\\xe9.zip")
+        assert "caf\\xe9.zip" in markdown.parse(extractor.last())[0]
+
+    def test_si_la_carpeta_ya_existe_lo_dice_con_el_nombre_escapado(self, extractor, telethon_edit):
+        archive = _not_utf8_zip(extractor.root)
+        os.mkdir(os.path.join(os.fsencode(extractor.root), b"caf\xe9"))
+
+        extractor.extract(archive)
+
+        assert extractor.last() == get_text("error_extraction_folder_exists", "caf\\xe9")
+
+    def test_borrar_un_rar_por_partes_las_nombra_escapadas(self, extractor):
+        parts = write_rar_set(extractor.root, os.fsdecode(b"caf\xe9"), [("a.txt", b"a"), ("b.mkv", MOVIE)], 2)
+
+        msg = extractor.module.delete_compressed(str(parts[0]))
+
+        msg.encode("utf-8")  # lo que hace Telethon al enviarlo
+        assert os.listdir(extractor.root) == []
+        assert "`caf\\xe9.part1.rar`" in msg and "`caf\\xe9.part2.rar`" in msg

@@ -9,17 +9,24 @@ El pipeline de envío a Telegram (`_send_file_fast`, la conversión, los
 metadatos y la miniatura) se sustituye por dobles que anotan sus llamadas.
 """
 
+import asyncio
+import errno
 import os
+import shutil
+import threading
 
 import pytest
 from telethon.extensions import markdown
 from telethon.tl.types import (
     DocumentAttributeAudio, DocumentAttributeFilename, DocumentAttributeVideo,
+    MessageEntityTextUrl, MessageMediaWebPage, WebPagePending,
 )
 
 import settings
 from button_data import button_data
+from conftest import FORUM_CHAT_ID, FORUM_TOPIC, forum_reply_to
 
+TELEGRAM_TEXT_LIMIT = 4096
 CALLBACK_DATA_LIMIT = 64
 ADMIN = 999
 
@@ -47,10 +54,10 @@ class _Callback:
     """Un CallbackQuery como los de Telethon: `id` es el de la consulta y
     `message_id` el del mensaje que tiene el botón."""
 
-    def __init__(self, groups, sender_id=ADMIN, query_id=10_000, message_id=1):
+    def __init__(self, groups, sender_id=ADMIN, query_id=10_000, message_id=1, chat_id=42):
         self.id = query_id
         self.message_id = message_id
-        self.chat_id = 42
+        self.chat_id = chat_id
         self.sender_id = sender_id
         self.data = None
         self._groups = (b"",) + tuple(groups)
@@ -64,14 +71,18 @@ class _Callback:
 
 
 class _Reply:
-    """El mensaje de texto con el que el usuario contesta al renombrado."""
+    """El mensaje de texto con el que el usuario contesta al renombrado.
 
-    def __init__(self, text, sender_id=ADMIN, reply_to_msg_id=None):
+    Por defecto, en el chat privado con el bot (el 42, como los `_Callback`).
+    """
+
+    def __init__(self, text, sender_id=ADMIN, reply_to_msg_id=None, chat_id=42, is_private=True):
         self.raw_text = text
         self.sender_id = sender_id
         self.reply_to_msg_id = reply_to_msg_id
         self.id = 500
-        self.chat_id = 42
+        self.chat_id = chat_id
+        self.is_private = is_private
         self.deleted = False
 
     async def delete(self):
@@ -84,11 +95,13 @@ class _Reply:
 @pytest.fixture
 def manage(quiet_manage):
     for state in (quiet_manage.pending_file_actions, quiet_manage.pending_renames,
-                  quiet_manage.list_messages):
+                  quiet_manage.list_messages, quiet_manage.sending_files,
+                  quiet_manage.deleted_file_ids):
         state.clear()
     yield quiet_manage
     for state in (quiet_manage.pending_file_actions, quiet_manage.pending_renames,
-                  quiet_manage.list_messages):
+                  quiet_manage.list_messages, quiet_manage.sending_files,
+                  quiet_manage.deleted_file_ids):
         state.clear()
 
 
@@ -112,6 +125,19 @@ def _press(manage, run_async, handler, file_id, **kwargs):
     event = _Callback((file_id,), **kwargs)
     run_async(getattr(manage, handler)(event))
     return event
+
+
+def _not_utf8(directory, raw_name=b"caf\xe9.mp3"):
+    """Crea un fichero con el nombre en Latin-1, que no es UTF-8, como los de un
+    ZIP de Windows descomprimido en el host. Devuelve su ruta tal como la ve
+    Python, con sustitutos ("caf\\udce9.mp3")."""
+    path = os.path.join(os.fsencode(directory), raw_name)
+    try:
+        with open(path, "wb") as handle:
+            handle.write(b"\0")
+    except OSError:
+        pytest.skip("este sistema de ficheros no admite nombres que no son UTF-8")
+    return os.fsdecode(path)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +176,29 @@ class TestAcciones:
         [text] = _texts(sent_messages)
         assert "📁" in text and "2.00 KB" in _plain(text)
         assert _payloads(sent_messages) == [b"rename:f1", b"delete:f1", b"managecat:all", b"close"]
+
+    def test_el_tamano_de_una_carpeta_se_calcula_fuera_del_event_loop(
+        self, manage, downloads, register, sent_messages, run_async, monkeypatch
+    ):
+        """Hay que recorrerla entera, y con una biblioteca grande (o en un
+        volumen de red) el bot dejaba de atender botones, la cola y el progreso
+        de las descargas mientras tanto."""
+        folder = downloads / "Temporada 1"
+        folder.mkdir()
+        (folder / "a.mkv").write_bytes(b"\0" * 1024)
+        file_id = register(folder)
+        threads = []
+        real_size = manage.get_directory_size
+
+        def get_directory_size(path):
+            threads.append(threading.get_ident())
+            return real_size(path)
+
+        monkeypatch.setattr(manage, "get_directory_size", get_directory_size)
+        _press(manage, run_async, "handle_file_action", file_id)
+
+        assert threads and threading.get_ident() not in threads
+        assert "1.00 KB" in _plain(_texts(sent_messages)[0])
 
     def test_un_comprimido_de_mas_de_2gb_ofrece_descomprimir_pero_no_descargar(
         self, manage, downloads, register, sent_messages, run_async
@@ -235,6 +284,22 @@ def test_los_caracteres_de_markdown_en_el_nombre_se_ven_tal_cual(
     assert name in _plain(text)
 
 
+@pytest.mark.parametrize("handler", ["handle_file_action", "handle_delete_file", "handle_rename_file",
+                                     "handle_confirm_delete"])
+def test_un_nombre_que_no_es_utf8_se_ensena_sin_romper_el_mensaje(
+    manage, downloads, register, sent_messages, run_async, handler
+):
+    """Telethon no puede codificar los sustitutos del nombre y el mensaje no
+    llegaba: desde el bot no había forma de borrar o renombrar el fichero."""
+    file_id = register(_not_utf8(downloads))
+
+    _press(manage, run_async, handler, file_id)
+
+    [text] = _texts(sent_messages)
+    text.encode("utf-8")  # lo que hace Telethon al enviarlo
+    assert "caf\\xe9.mp3" in _plain(text)
+
+
 @pytest.mark.parametrize("name", [
     "normal.mkv", "a`b.mkv", "`empieza.mkv", "acaba`", "dos``seguidas", "tres```seguidas",
     "mi__fichero__raro.txt", "`",
@@ -273,12 +338,12 @@ class _Pipeline:
     def progress(self, message, filename):
         return "progreso"
 
-    async def send(self, chat_id, path, filename, attributes, thumb, is_video, progress):
+    async def send(self, chat_id, path, filename, attributes, thumb, is_video, progress, reply_to=None):
         if self.fail_with:
             raise self.fail_with
         self.sent.append({"path": path, "exists": os.path.exists(path), "filename": filename,
                           "attributes": attributes, "thumb": thumb, "is_video": is_video,
-                          "progress": progress})
+                          "progress": progress, "reply_to": reply_to})
 
     async def get_metadata(self, path):
         return self.metadata
@@ -302,6 +367,21 @@ def pipeline(manage, tmp_path, monkeypatch):
 
 
 class TestDescargar:
+    def test_en_un_foro_todo_va_al_tema_de_la_ficha(
+        self, manage, pipeline, downloads, register, sent_messages, forum_callback, run_async
+    ):
+        """En un supergrupo con temas, lo que se manda sin reply_to cae en
+        General: el «Enviando…», el fichero y el resultado salían allí."""
+        target = downloads / "notas.txt"
+        target.write_text("hola")
+        file_id = register(target)
+
+        run_async(manage.handle_download_file(forum_callback((file_id,))))
+
+        [sent] = pipeline.sent
+        assert sent["reply_to"] == FORUM_TOPIC
+        assert [kwargs["reply_to"] for kind, _, kwargs in sent_messages if kind == "send_message"] == [FORUM_TOPIC] * 2
+
     def test_un_documento_se_envia_tal_cual(
         self, manage, pipeline, downloads, register, sent_messages, run_async
     ):
@@ -323,6 +403,24 @@ class TestDescargar:
         assert kinds == ["send_message", "delete", "send_message"]
         assert sent_messages[-1][1] == manage.get_text("file_sent_success", "notas.txt")
         assert _payloads(sent_messages) == [b"managecat:all", b"close"]
+
+    def test_un_nombre_que_no_es_utf8_se_pasa_a_la_subida_con_un_nombre_que_telegram_admite(
+        self, manage, pipeline, downloads, register, sent_messages, run_async
+    ):
+        """Aquí, lo que /manage le pasa a `_send_file_fast` y lo que dice: que
+        la subida use ese nombre lo prueba TestNombreQueNoEsUtf8 de
+        test_incoming_transfer.py, con el cliente de Telethon de verdad."""
+        real_path = _not_utf8(downloads, b"notas\xe9.txt")
+        file_id = register(real_path)
+
+        _press(manage, run_async, "handle_download_file", file_id)
+
+        [sent] = pipeline.sent
+        assert sent["path"] == real_path and sent["exists"]
+        assert sent["filename"] == "notas\\xe9.txt"
+        bytes(sent["attributes"][0])  # Telethon serializa así el atributo al enviarlo
+        for text in _texts(sent_messages):
+            text.encode("utf-8")
 
     def test_un_video_convertido_se_envia_como_mp4_y_se_limpia(
         self, manage, pipeline, downloads, register, sent_messages, run_async, tmp_path
@@ -454,7 +552,159 @@ class TestDescargar:
         assert target.exists()
         assert not converted.exists() and not pipeline.thumbnail.exists()
         assert sent_messages[-1][0] == "send_message"
-        assert sent_messages[-1][1] == manage.get_text("error_sending_file", "se cayó la red")
+        assert sent_messages[-1][1] == manage.get_text("error_sending_file", manage.md_code("se cayó la red"))
+
+    def test_la_ruta_del_error_de_envio_no_se_toma_por_markdown(
+        self, manage, pipeline, downloads, register, sent_messages, run_async
+    ):
+        """El error lleva la ruta, y el nombre puede venir de fuera (un reenvío,
+        un título de yt-dlp): "[Factura](evil.com)" salía como un enlace."""
+        target = downloads / "[Factura](evil.com).pdf"
+        target.write_text("x")
+        pipeline.fail_with = FileNotFoundError(errno.ENOENT, "No such file or directory", str(target))
+        file_id = register(target)
+
+        _press(manage, run_async, "handle_download_file", file_id)
+
+        text, entities = markdown.parse(sent_messages[-1][1])
+        assert f"'{target}'" in text
+        assert not any(isinstance(entity, MessageEntityTextUrl) for entity in entities)
+
+    def test_si_el_convertido_pasa_del_limite_se_envia_el_original(
+        self, manage, pipeline, downloads, register, sent_messages, run_async, tmp_path
+    ):
+        """El límite se comprueba con el original, pero lo que se sube es el
+        convertido, que recodificado (un AV1 a H.264) puede pesar más: tras la
+        conversión no se enviaba nada, aunque el original cabía, y el aviso de
+        «más de 2000 MB» contradecía la ficha. Cada Descargar acababa igual."""
+        target = downloads / "serie.mkv"
+        target.write_bytes(b"\0" * 64)
+        converted = tmp_path / "temp_serie.mp4"
+        with open(converted, "wb") as handle:
+            handle.truncate(manage.MAX_TELEGRAM_FILE_SIZE)
+        pipeline.converted_to = str(converted)
+        pipeline.thumbnail = tmp_path / "serie_thumb.jpg"
+        file_id = register(target)
+
+        _press(manage, run_async, "handle_download_file", file_id)
+
+        [sent] = pipeline.sent
+        assert sent["path"] == str(target) and sent["filename"] == "serie.mkv"
+        names = [a.file_name for a in sent["attributes"] if isinstance(a, DocumentAttributeFilename)]
+        assert names == ["serie.mkv"]
+        assert target.exists()
+        assert not converted.exists() and not pipeline.thumbnail.exists()
+        assert [kind for kind, _, _ in sent_messages] == ["send_message", "delete", "send_message"]
+        assert sent_messages[-1][1] == manage.get_text("file_sent_unconverted", "serie.mkv")
+
+    def test_si_tampoco_cabe_el_original_no_se_sube_y_se_dice_cual(
+        self, manage, pipeline, downloads, register, sent_messages, run_async, tmp_path, monkeypatch
+    ):
+        """Solo pasa si el original crece mientras se convierte."""
+        target = downloads / "serie.mkv"
+        target.write_bytes(b"\0" * 64)
+        converted = tmp_path / "temp_serie.mp4"
+        with open(converted, "wb") as handle:
+            handle.truncate(manage.MAX_TELEGRAM_FILE_SIZE)
+        pipeline.converted_to = str(converted)
+        file_id = register(target)
+        convert = pipeline.convert
+
+        async def growing_convert(path, message):
+            with open(path, "r+b") as handle:
+                handle.truncate(manage.MAX_TELEGRAM_FILE_SIZE)
+            return await convert(path, message)
+
+        monkeypatch.setattr(manage, "convert_video_to_telegram_compatible", growing_convert)
+
+        _press(manage, run_async, "handle_download_file", file_id)
+
+        assert pipeline.sent == []
+        assert target.exists() and not converted.exists()
+        assert sent_messages[-1][1] == manage.get_text("error_file_too_large_named", "serie.mkv")
+
+    def test_otro_toque_mientras_se_envia_no_lo_envia_dos_veces(
+        self, manage, pipeline, downloads, register, run_async, monkeypatch
+    ):
+        """El botón Descargar sigue en la ficha durante la conversión y la
+        subida: otro toque convertía y enviaba el vídeo una segunda vez."""
+        target = downloads / "serie.mkv"
+        target.write_bytes(b"\0" * 64)
+        file_id = register(target)
+
+        async def scenario():
+            conversion_done = asyncio.Event()
+
+            async def slow_convert(path, message):
+                pipeline.converted.append(path)
+                await conversion_done.wait()
+                return path
+
+            monkeypatch.setattr(manage, "convert_video_to_telegram_compatible", slow_convert)
+            first = asyncio.create_task(manage.handle_download_file(_Callback((file_id,))))
+            while not pipeline.converted:
+                await asyncio.sleep(0)
+            second = asyncio.create_task(
+                manage.handle_download_file(_Callback((file_id,), query_id=10_001)))
+            for _ in range(10):
+                await asyncio.sleep(0)
+            conversion_done.set()
+            await asyncio.gather(first, second)
+
+        run_async(scenario())
+
+        assert len(pipeline.converted) == 1
+        assert len(pipeline.sent) == 1
+
+    def test_si_telethon_cancela_el_handler_el_envio_sigue(
+        self, manage, pipeline, downloads, register, sent_messages, run_async, monkeypatch
+    ):
+        """Con un corte de Telegram, disconnect() cancela los handlers en
+        marcha: la conversión, que puede durar horas, moría con el suyo y el
+        mensaje se quedaba en «Convirtiendo…»."""
+        target = downloads / "serie.mkv"
+        target.write_bytes(b"\0" * 64)
+        file_id = register(target)
+
+        async def scenario():
+            converting, finish = asyncio.Event(), asyncio.Event()
+
+            async def slow_convert(path, message):
+                converting.set()
+                await finish.wait()
+                return path
+
+            monkeypatch.setattr(manage, "convert_video_to_telegram_compatible", slow_convert)
+            handler = asyncio.create_task(manage.handle_download_file(_Callback((file_id,))))
+            await converting.wait()
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+            assert manage.sending_files, "sigue enviándose: otro toque no lo repetiría"
+            finish.set()
+            while manage.sending_files:
+                await asyncio.sleep(0.01)
+
+        run_async(asyncio.wait_for(scenario(), 5))
+
+        [sent] = pipeline.sent
+        assert sent["path"] == str(target)
+        assert sent_messages[-1][1] == manage.get_text("file_sent_success", "serie.mkv")
+
+    def test_terminado_un_envio_se_puede_volver_a_descargar(
+        self, manage, pipeline, downloads, register, run_async
+    ):
+        target = downloads / "notas.txt"
+        target.write_text("hola")
+        file_id = register(target)
+        pipeline.fail_with = RuntimeError("fallo")
+
+        _press(manage, run_async, "handle_download_file", file_id)
+        pipeline.fail_with = None
+        _press(manage, run_async, "handle_download_file", file_id)
+        _press(manage, run_async, "handle_download_file", file_id)
+
+        assert len(pipeline.sent) == 2, "ni un envío fallido ni uno terminado lo bloquean"
+        assert manage.sending_files == set()
 
     def test_sin_mensaje_de_progreso_edita_el_original(
         self, manage, pipeline, downloads, register, sent_messages, run_async, monkeypatch
@@ -489,7 +739,7 @@ class TestDescargar:
         monkeypatch.setattr(manage, "safe_send_message", no_message)
         _press(manage, run_async, "handle_download_file", file_id)
 
-        assert sent_messages[-1][:2] == ("edit", manage.get_text("error_sending_file", "fallo"))
+        assert sent_messages[-1][:2] == ("edit", manage.get_text("error_sending_file", manage.md_code("fallo")))
 
     @pytest.mark.parametrize("fail", [False, True])
     def test_si_no_se_pueden_borrar_los_temporales_el_resultado_llega(
@@ -519,7 +769,7 @@ class TestDescargar:
         _press(manage, run_async, "handle_download_file", file_id)
 
         assert target.exists()
-        expected = (manage.get_text("error_sending_file", "fallo") if fail
+        expected = (manage.get_text("error_sending_file", manage.md_code("fallo")) if fail
                     else manage.get_text("file_sent_success", "pelicula.mp4"))
         assert sent_messages[-1][1] == expected
 
@@ -605,7 +855,79 @@ class TestBorrar:
         _press(manage, run_async, "handle_confirm_delete", file_id)
 
         assert target.exists(), "el id ya se olvidó: un segundo toque no puede borrar nada"
-        assert _texts(sent_messages)[-1] == manage.get_text("error_item_not_found_short")
+        # Ni tapa el resultado del primero con un «no encontrado» sin botones
+        assert len(_texts(sent_messages)) == 1
+        assert "borrar.txt" in _plain(_texts(sent_messages)[0])
+
+    def test_un_doble_toque_deja_el_resultado_del_borrado(
+        self, manage, downloads, register, sent_messages, run_async
+    ):
+        """El segundo toque llegaba con el fichero ya borrado y su «no
+        encontrado» tapaba el resultado y se llevaba Volver y Cerrar."""
+        folder = downloads / "Serie"
+        (folder / "T1").mkdir(parents=True)
+        (folder / "T1" / "cap.mkv").write_bytes(b"\0")
+        file_id = register(folder)
+
+        async def double_tap():
+            await asyncio.gather(
+                manage.handle_confirm_delete(_Callback((file_id,))),
+                manage.handle_confirm_delete(_Callback((file_id,), query_id=10_001)),
+            )
+
+        run_async(double_tap())
+
+        assert not folder.exists()
+        [text] = _texts(sent_messages)
+        assert "Serie" in _plain(text)
+        assert _payloads(sent_messages) == [b"managecat:all", b"close"]
+
+    def test_la_confirmacion_de_otro_mensaje_avisa_de_que_ya_no_esta(
+        self, manage, downloads, sent_messages, run_async
+    ):
+        """Una ruta lleva el mismo id en todos los listados: con /manage abierto
+        dos veces (o por dos admins), el «Sí, eliminar» del otro mensaje se
+        tomaba por un doble toque, y se quedaba preguntando sin respuesta."""
+        target = downloads / "informe.pdf"
+        target.write_bytes(b"\0")
+        file_id = manage.register_manage_action(str(target))
+        assert manage.register_manage_action(str(target)) == file_id
+
+        run_async(manage.handle_confirm_delete(_Callback((file_id.encode(),), message_id=1)))
+        run_async(manage.handle_confirm_delete(_Callback((file_id.encode(),), message_id=2, chat_id=43)))
+
+        assert not target.exists()
+        first, second = _texts(sent_messages)
+        assert "informe.pdf" in _plain(first)
+        assert second == manage.get_text("error_item_not_found_short")
+
+    def test_un_boton_de_antes_de_reiniciar_avisa(self, manage, sent_messages, run_async):
+        _press(manage, run_async, "handle_confirm_delete", b"m7_12345")
+
+        assert _texts(sent_messages) == [manage.get_text("error_item_not_found_short")]
+
+    def test_una_carpeta_se_borra_fuera_del_event_loop(
+        self, manage, downloads, register, sent_messages, run_async, monkeypatch
+    ):
+        """Con muchos ficheros (o en un volumen de red) borrarla tarda, y en el
+        loop el bot dejaba de atender todo lo demás mientras tanto."""
+        folder = downloads / "Serie"
+        (folder / "T1").mkdir(parents=True)
+        (folder / "T1" / "cap.mkv").write_bytes(b"\0")
+        file_id = register(folder)
+        threads = []
+        real_rmtree = shutil.rmtree
+
+        def rmtree(path, *args, **kwargs):
+            threads.append(threading.get_ident())
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(manage.shutil, "rmtree", rmtree)
+        _press(manage, run_async, "handle_confirm_delete", file_id)
+
+        assert threads and threading.get_ident() not in threads
+        assert not folder.exists()
+        assert "f1" not in manage.pending_file_actions
 
     def test_confirmar_una_carpeta_la_borra_entera_y_nada_mas(
         self, manage, downloads, register, run_async
@@ -645,6 +967,7 @@ class TestBorrar:
         folder = downloads / "protegida"
         folder.mkdir()
         file_id = register(folder)
+        real_rmtree = shutil.rmtree
 
         def denied(path, *args, **kwargs):
             raise PermissionError(13, "Permission denied", str(path))
@@ -654,6 +977,11 @@ class TestBorrar:
 
         assert folder.exists()
         assert "Permission denied" in _texts(sent_messages)[0]
+
+        # El botón sigue valiendo para reintentarlo
+        monkeypatch.setattr(manage.shutil, "rmtree", real_rmtree)
+        _press(manage, run_async, "handle_confirm_delete", file_id)
+        assert not folder.exists()
 
     def test_el_error_muestra_la_ruta_tal_cual(
         self, manage, downloads, register, sent_messages, run_async, monkeypatch
@@ -732,6 +1060,12 @@ def _answer(manage, run_async, text, **kwargs):
     return reply
 
 
+def _rename_filter(manage):
+    """El filtro con el que se registra handle_rename_input."""
+    return next(event.func for event, handler in manage._registrations()
+                if handler is manage.handle_rename_input)
+
+
 class TestRenombrar:
     @pytest.fixture
     def target(self, downloads, register):
@@ -808,7 +1142,14 @@ class TestRenombrar:
 
         assert (downloads / "Nueva" / "dentro.txt").exists() and not folder.exists()
 
-    @pytest.mark.parametrize("name", ["", "   ", "a/b.mkv", "../../etc/x", "a\\b.mkv", "/abs.mkv"])
+    @pytest.mark.parametrize("name", [
+        "", "   ", "a/b.mkv", "../../etc/x", "a\\b.mkv", "/abs.mkv",
+        # Los listados se saltan lo que empieza por punto: el fichero
+        # desaparecería del bot
+        ".Serie.S01E01.mkv", "...And Justice for All.flac",
+        # El nombre pegado en dos líneas, un tabulador o un nulo
+        "Serie S01E01\n.mkv", "con\ttabulador.mkv", "con\x00nulo.mkv",
+    ])
     def test_un_nombre_invalido_se_rechaza_sin_tocar_nada(
         self, manage, target, downloads, sent_messages, run_async, name
     ):
@@ -820,7 +1161,44 @@ class TestRenombrar:
         assert sorted(os.listdir(downloads)) == before
         assert target.read_bytes() == b"contenido"
         assert manage.get_text("rename_invalid_title") in sent_messages[-1][1]
+        assert manage.get_text("rename_invalid_chars") in sent_messages[-1][1]
         assert manage.pending_renames == {}
+
+    @pytest.mark.parametrize("name", [
+        # Se ve como "Facturaexe.pdf" en /manage, en los mensajes y por SMB
+        "Factura\N{RIGHT-TO-LEFT OVERRIDE}fdp.exe",
+        "a\N{LEFT-TO-RIGHT MARK}b.mkv", "a\N{LEFT-TO-RIGHT ISOLATE}b.mkv",
+        "a\N{LINE SEPARATOR}b.mkv", "con\x85nel.mkv", "con\x7fdel.mkv",
+        # Invisibles en un extremo o delante de la extensión: dos nombres que
+        # se ven iguales
+        "\N{ZERO WIDTH NO-BREAK SPACE}peli.mkv", "peli\N{ZERO WIDTH SPACE}.mkv",
+        "peli.mkv\N{WORD JOINER}",
+    ])
+    def test_un_nombre_con_invisibles_se_rechaza_como_los_que_llegan(
+        self, manage, target, downloads, sent_messages, run_async, name
+    ):
+        """El renombrado no pasaba por sanitize_filename: aceptaba las marcas
+        bidi y los invisibles que esta quita de los nombres que llegan."""
+        _ask_rename(manage, run_async, b"f1")
+
+        _answer(manage, run_async, name)
+
+        assert sorted(os.listdir(downloads)) == ["original.mkv"]
+        assert manage.get_text("rename_invalid_chars") in sent_messages[-1][1]
+
+    @pytest.mark.parametrize("name", [
+        "👨\N{ZERO WIDTH JOINER}👩\N{ZERO WIDTH JOINER}👧 familia.jpg",
+        "ข่าว\N{ZERO WIDTH SPACE}วันนี้.mkv",
+        "Star Wars: Episodio IV.mkv",
+    ])
+    def test_los_invisibles_que_conserva_sanitize_filename_se_aceptan(
+        self, manage, target, downloads, run_async, name
+    ):
+        _ask_rename(manage, run_async, b"f1")
+
+        _answer(manage, run_async, name)
+
+        assert sorted(os.listdir(downloads)) == [name]
 
     @pytest.mark.parametrize("name", [".", ".."])
     def test_punto_y_dos_puntos_no_salen_de_la_carpeta(
@@ -873,16 +1251,51 @@ class TestRenombrar:
         assert not (target.parent / "otro.mkv").exists()
         assert sent_messages[-1][1] == manage.get_text("error_file_gone")
 
-    @pytest.mark.parametrize("name", ["con\x00nulo.mkv", "x" * 300 + ".mkv"])
-    def test_un_nombre_que_el_sistema_rechaza_avisa_sin_romper(
-        self, manage, target, sent_messages, run_async, name
+    @pytest.mark.parametrize("name", [
+        "x" * 300 + ".mkv",
+        # 128 caracteres, pero 256 bytes: el límite es en bytes
+        "ñ" * 128,
+        # Un texto largo pegado por error: el error del sistema, con las dos
+        # rutas, pasaba de 4096 y Telegram no dejaba llegar el aviso
+        "palabra " * 500,
+    ], ids=["300_caracteres", "128_enes_256_bytes", "texto_pegado"])
+    def test_un_nombre_demasiado_largo_avisa_sin_intentarlo(
+        self, manage, target, downloads, sent_messages, run_async, name
     ):
         _ask_rename(manage, run_async, b"f1")
 
         _answer(manage, run_async, name)
 
         assert target.read_bytes() == b"contenido"
-        assert manage.get_text("rename_error_title") in sent_messages[-1][1]
+        assert sorted(os.listdir(downloads)) == ["original.mkv"]
+        text = sent_messages[-1][1]
+        assert manage.get_text("rename_too_long") in text
+        assert len(_plain(text).encode("utf-16-le")) // 2 <= TELEGRAM_TEXT_LIMIT
+        assert manage.pending_renames == {}
+
+    def test_un_nombre_de_255_bytes_justos_se_acepta(self, manage, target, run_async):
+        _ask_rename(manage, run_async, b"f1")
+
+        _answer(manage, run_async, "x" * 251 + ".mkv")
+
+        assert (target.parent / ("x" * 251 + ".mkv")).read_bytes() == b"contenido"
+
+    def test_un_nombre_que_el_sistema_rechaza_avisa_sin_las_rutas(
+        self, manage, target, sent_messages, run_async, monkeypatch
+    ):
+        def refuse(src, dst):
+            raise OSError(errno.EACCES, "Permission denied", src, None, dst)
+
+        monkeypatch.setattr(manage.os, "rename", refuse)
+        _ask_rename(manage, run_async, b"f1")
+
+        _answer(manage, run_async, "nuevo.mkv")
+
+        assert target.read_bytes() == b"contenido"
+        text = sent_messages[-1][1]
+        assert manage.get_text("rename_error_title") in text
+        assert "Permission denied" in _plain(text)
+        assert str(target.parent) not in _plain(text), "las rutas pueden ser muy largas"
         assert manage.pending_renames == {}
 
     def test_otro_usuario_no_puede_contestar(self, manage, target, run_async):
@@ -964,6 +1377,157 @@ class TestRenombrar:
         assert not reply.deleted
         assert ADMIN not in manage.pending_renames
 
+    @pytest.mark.parametrize("handler, groups", [
+        ("handle_manage_category", (b"all",)),
+        ("handle_list_category", (b"all",)),
+        ("handle_close", ()),
+    ])
+    def test_al_borrar_el_aviso_deja_de_esperar_el_nombre(
+        self, manage, target, run_async, handler, groups
+    ):
+        """El aviso de Renombrar es el mensaje del listado: abrir otra categoría
+        o cerrar lo borra sin pulsar Cancelar, y un "hola" horas después
+        renombraba el fichero."""
+        _ask_rename(manage, run_async, b"f1")
+        manage.list_messages[ADMIN] = ["aviso de renombrar"]
+
+        run_async(getattr(manage, handler)(_Callback(groups)))
+        reply = _answer(manage, run_async, "hola")
+
+        assert target.read_bytes() == b"contenido" and not reply.deleted
+        assert not (target.parent / "hola").exists()
+        assert ADMIN not in manage.pending_renames
+
+    def test_tras_abrir_otro_listado_el_nombre_va_al_fichero_elegido_despues(
+        self, manage, downloads, register, run_async
+    ):
+        first = downloads / "A.mkv"
+        second = downloads / "B.mkv"
+        first.write_text("A")
+        second.write_text("B")
+        register(first, "a")
+        register(second, "b")
+        _ask_rename(manage, run_async, b"a", message_id=101)
+        manage.list_messages[ADMIN] = ["aviso de A"]
+
+        # Sin cancelar, vuelve a /manage y pide renombrar B
+        run_async(manage.handle_manage_category(_Callback((b"all",))))
+        _ask_rename(manage, run_async, b"b", message_id=102)
+        _answer(manage, run_async, "B_final.mkv")
+
+        assert first.read_text() == "A"
+        assert (downloads / "B_final.mkv").read_text() == "B"
+        assert manage.pending_renames == {}
+
+    def test_un_renombrado_olvidado_caduca(self, manage, target, sent_messages, run_async):
+        _ask_rename(manage, run_async, b"f1", message_id=77)
+        rename_filter = _rename_filter(manage)
+        # Como si hubiera pasado el tiempo de espera desde que se pidió
+        manage.pending_renames[ADMIN][0]["created"] -= manage.RENAME_TIMEOUT + 1
+        sent_messages.clear()
+
+        late = _Reply("hola")
+        assert rename_filter(late) is False
+        run_async(manage.handle_rename_input(late))
+
+        assert target.read_bytes() == b"contenido"
+        assert sent_messages == [] and not late.deleted
+
+        # Citando el mensaje de Renombrar no hay duda, y el mensaje sigue
+        # pidiendo que se le responda: antes se perdía sin decir nada
+        quoted = _Reply("nuevo.mkv", reply_to_msg_id=77)
+        assert rename_filter(quoted) is True
+        run_async(manage.handle_rename_input(quoted))
+
+        assert (target.parent / "nuevo.mkv").read_bytes() == b"contenido"
+        assert quoted.deleted and manage.pending_renames == {}
+
+    def test_en_un_grupo_la_respuesta_al_aviso_vale_aunque_haya_pasado_el_tiempo(
+        self, manage, target, run_async
+    ):
+        group = -100123
+        _ask_rename(manage, run_async, b"f1", chat_id=group, message_id=77)
+        manage.pending_renames[ADMIN][0]["created"] -= manage.RENAME_TIMEOUT + 1
+
+        reply = _answer(manage, run_async, "nuevo.mkv", chat_id=group, is_private=False,
+                        reply_to_msg_id=77)
+
+        assert (target.parent / "nuevo.mkv").read_bytes() == b"contenido"
+        assert reply.deleted and manage.pending_renames == {}
+
+    def test_una_cita_al_aviso_desde_otro_chat_no_renombra(
+        self, manage, target, sent_messages, run_async
+    ):
+        """Los ids de mensaje son de cada chat: el 77 de un grupo no es el aviso."""
+        _ask_rename(manage, run_async, b"f1", message_id=77)
+        rename_filter = _rename_filter(manage)
+        manage.pending_renames[ADMIN][0]["created"] -= manage.RENAME_TIMEOUT + 1
+        sent_messages.clear()
+
+        elsewhere = _Reply("nuevo.mkv", chat_id=-100123, is_private=False, reply_to_msg_id=77)
+        assert rename_filter(elsewhere) is False
+        run_async(manage.handle_rename_input(elsewhere))
+
+        assert target.read_bytes() == b"contenido"
+        assert sent_messages == [] and not elsewhere.deleted
+
+    def test_un_texto_en_otro_chat_no_contesta_al_renombrado(
+        self, manage, target, sent_messages, run_async
+    ):
+        """Pedido en el privado, el admin escribe después en un grupo en el que
+        también está el bot: renombraba el fichero y lo contaba en el grupo."""
+        _ask_rename(manage, run_async, b"f1")
+        rename_filter = _rename_filter(manage)
+        sent_messages.clear()
+
+        in_group = _Reply("vale, ahora voy", chat_id=-100123, is_private=False)
+        assert rename_filter(in_group) is False
+        run_async(manage.handle_rename_input(in_group))
+
+        assert target.read_bytes() == b"contenido"
+        assert sent_messages == [] and not in_group.deleted
+        assert len(manage.pending_renames[ADMIN]) == 1, "sigue esperando en el privado"
+
+    def test_en_un_grupo_solo_vale_responder_al_aviso(
+        self, manage, target, run_async
+    ):
+        group = -100123
+        _ask_rename(manage, run_async, b"f1", chat_id=group, message_id=77)
+        rename_filter = _rename_filter(manage)
+
+        assert rename_filter(_Reply("hola a todos", chat_id=group, is_private=False)) is False
+        assert rename_filter(_Reply("a otro mensaje", chat_id=group, is_private=False,
+                                    reply_to_msg_id=5)) is False
+        run_async(manage.handle_rename_input(_Reply("hola a todos", chat_id=group, is_private=False)))
+        assert target.exists()
+
+        reply = _answer(manage, run_async, "nuevo.mkv", chat_id=group, is_private=False,
+                        reply_to_msg_id=77)
+
+        assert (target.parent / "nuevo.mkv").read_bytes() == b"contenido"
+        assert reply.deleted and manage.pending_renames == {}
+
+    @pytest.mark.parametrize("answer, outcome", [
+        ("nuevo.mkv", "rename_success_desc_file"),
+        (".oculto.mkv", "rename_invalid_chars"),
+    ])
+    def test_en_un_foro_el_resultado_va_al_tema(
+        self, manage, target, sent_messages, run_async, answer, outcome
+    ):
+        """El nombre que escribe el usuario se borra antes de contestarle, y
+        la respuesta a un mensaje borrado salía en General."""
+        _ask_rename(manage, run_async, b"f1", chat_id=FORUM_CHAT_ID, message_id=88)
+        sent_messages.clear()
+        reply = _Reply(answer, chat_id=FORUM_CHAT_ID, is_private=False, reply_to_msg_id=88)
+        reply.reply_to = forum_reply_to(reply_to_msg_id=88)
+
+        run_async(manage.handle_rename_input(reply))
+
+        assert reply.deleted
+        [(kind, text, kwargs)] = [message for message in sent_messages if message[0] != "delete"]
+        assert manage.get_text(outcome) in text
+        assert kind == "send_message" and kwargs["reply_to"] == FORUM_TOPIC
+
     def test_si_no_se_pueden_borrar_los_mensajes_renombra_igual(
         self, manage, target, run_async, monkeypatch
     ):
@@ -1007,6 +1571,21 @@ class TestRenombrar:
         assert rename_filter(_Reply("https://youtu.be/abc123")) is False
         assert len(manage.pending_renames[ADMIN]) == 1
 
+    def test_un_nombre_con_vista_previa_de_enlace_cuenta_como_respuesta(
+        self, manage, target, run_async
+    ):
+        """Un nombre como "Serie.tv" es también un dominio: Telegram le pone
+        vista previa y el mensaje llega con media, pero es el texto del nombre."""
+        _ask_rename(manage, run_async, b"f1")
+        rename_filter = _rename_filter(manage)
+        reply = _Reply("Serie.tv")
+        reply.media = MessageMediaWebPage(webpage=WebPagePending(id=1, date=None))
+
+        assert rename_filter(reply) is True
+        run_async(manage.handle_rename_input(reply))
+
+        assert (target.parent / "Serie.tv").read_bytes() == b"contenido"
+
     def test_pedir_dos_veces_el_mismo_renombrado_solo_espera_un_nombre(
         self, manage, target, run_async
     ):
@@ -1024,6 +1603,35 @@ class TestRenombrar:
 
         assert (target.parent / "a `b` c.mkv").exists()
         assert "a `b` c.mkv" in _plain(sent_messages[-1][1])
+
+    def test_un_nombre_que_no_es_utf8_se_puede_renombrar(
+        self, manage, downloads, register, sent_messages, run_async
+    ):
+        register(_not_utf8(downloads))
+        _ask_rename(manage, run_async, b"f1")
+
+        _answer(manage, run_async, "café.mp3")
+
+        assert os.listdir(downloads) == ["café.mp3"]
+        text = sent_messages[-1][1]
+        text.encode("utf-8")  # lo que hace Telethon al enviarlo
+        assert "caf\\xe9.mp3" in _plain(text) and "café.mp3" in _plain(text)
+
+    @pytest.mark.parametrize("name", ["notas``final`.txt", "tres```seguidas.txt", "acaba`"])
+    def test_un_nombre_copiado_del_mensaje_no_arrastra_espacios_invisibles(
+        self, manage, target, downloads, run_async, name
+    ):
+        """md_code separa algunas comillas invertidas con un espacio de ancho
+        cero: al copiar el nombre del mensaje viaja con él y acababa en el disco."""
+        from basic import md_code
+
+        _ask_rename(manage, run_async, b"f1")
+        copied = _plain(md_code(name))
+        assert "\u200b" in copied
+
+        _answer(manage, run_async, copied)
+
+        assert os.listdir(downloads) == [name]
 
     def test_renombrar_una_carpeta_concuerda_en_espanol(
         self, manage, downloads, register, sent_messages, run_async, config_dir

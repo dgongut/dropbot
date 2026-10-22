@@ -17,8 +17,6 @@ EXPECTED_CALLBACKS = {
     b"simplecancel:(.+)",
     b"cancelconv:(.+)",
     b"sendoriginal:(.+)",
-    b"keep:(.+)",
-    b"del:(.+)",
     b"playlist_(full|first):(.+)",
     b"playlistfmt_(full|first)_(audio|video):(.+)",
     b"url_(audio|video):(.+)",
@@ -36,7 +34,7 @@ EXPECTED_CALLBACKS = {
     b"cfg:(.+)",
 }
 
-EXPECTED_HANDLER_COUNT = 26
+EXPECTED_HANDLER_COUNT = 24
 
 
 def _pattern_of(event):

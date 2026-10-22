@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import inspect
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 from telethon import utils, helpers
 from telethon.network import MTProtoSender
@@ -32,6 +33,21 @@ from telethon.tl.types import InputFileBig, InputFile
 # para que una conexión rápida no se desboque si el disco va lento.
 _PIPELINE_BUFFER = 4
 
+# Tope de cada petición por las conexiones extra. A diferencia de la principal,
+# no hacen ping: si el router pierde la tabla NAT mientras una espera su
+# respuesta, nada la avisa y la transferencia se quedaba parada para siempre.
+# Al vencer, el llamador recurre al método estándar, que va por la conexión
+# principal y esa sí reconecta. Holgado para no dar fallos falsos en enlaces
+# lentos (8 partes de 512 KB a la vez) ni cortar un FLOOD_WAIT de hasta 60 s,
+# que Telethon duerme dentro de la propia petición.
+_REQUEST_TIMEOUT = 120
+
+# Hilos propios para leer y escribir los trozos. En el pool por defecto del loop
+# corren también extracciones y copias de varios GB que lo ocupan durante
+# minutos: detrás de ellas, cada trozo esperaba su turno y la transferencia se
+# paraba.
+_IO_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="fast-io")
+
 
 class _DownloadSender:
     def __init__(self, client, sender, file, offset, limit, stride, count):
@@ -44,7 +60,8 @@ class _DownloadSender:
     async def next(self):
         if not self.remaining:
             return None
-        result = await self.client._call(self.sender, self.request)
+        result = await asyncio.wait_for(
+            self.client._call(self.sender, self.request), _REQUEST_TIMEOUT)
         self.remaining -= 1
         self.request.offset += self.stride
         return result.bytes
@@ -73,7 +90,8 @@ class _UploadSender:
 
     async def _next(self, data):
         self.request.bytes = data
-        await self.client._call(self.sender, self.request)
+        await asyncio.wait_for(
+            self.client._call(self.sender, self.request), _REQUEST_TIMEOUT)
         self.request.file_part += self.stride
 
     async def disconnect(self):
@@ -120,23 +138,26 @@ class _ParallelTransferrer:
 
     async def _create_sender(self):
         dc = await self.client._get_dc(self.dc_id)
-        sender = MTProtoSender(self.auth_key, loggers=self.client._log)
-        await sender.connect(self.client._connection(
-            dc.ip_address, dc.port, dc.id,
-            loggers=self.client._log,
-            proxy=self.client._proxy,
-            local_addr=self.client._local_addr,
-        ))
+        sender = MTProtoSender(self.auth_key, loggers=self.client._log,
+                               connect_timeout=self.client._timeout)
         try:
+            # Conectar también dentro del try: una cancelación durante el DH
+            # dejaba abierta la conexión TCP a medio autenticar
+            await sender.connect(self.client._connection(
+                dc.ip_address, dc.port, dc.id,
+                loggers=self.client._log,
+                proxy=self.client._proxy,
+                local_addr=self.client._local_addr,
+            ))
             if not self.auth_key:
                 auth = await self.client(ExportAuthorizationRequest(self.dc_id))
                 self.client._init_request.query = ImportAuthorizationRequest(
                     id=auth.id, bytes=auth.bytes)
                 req = InvokeWithLayerRequest(LAYER, self.client._init_request)
-                await sender.send(req)
+                await asyncio.wait_for(sender.send(req), _REQUEST_TIMEOUT)
                 self.auth_key = sender.auth_key
         except BaseException:
-            # Conectado pero sin autorizar: nadie más lo va a desconectar
+            # A medio conectar o sin autorizar: nadie más lo va a desconectar
             await sender.disconnect()
             raise
         return sender
@@ -150,7 +171,19 @@ class _ParallelTransferrer:
         fallo dejaba conexiones MTProto vivas.
         """
         self.senders = [await create_first()]
-        results = await asyncio.gather(*(f() for f in create_rest), return_exceptions=True)
+        tasks = [asyncio.ensure_future(f()) for f in create_rest]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException:
+            # Cancelado mientras se abrían (el botón Cancelar en los primeros
+            # segundos): return_exceptions no cubre eso y gather se lleva las
+            # que ya se habían abierto. Recogerlas para cerrarlas con la primera
+            for task in tasks:
+                task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            self.senders.extend(r for r in results if not isinstance(r, BaseException))
+            await self._cleanup()
+            raise
         self.senders.extend(r for r in results if not isinstance(r, BaseException))
         failures = [r for r in results if isinstance(r, BaseException)]
         if failures:
@@ -285,7 +318,7 @@ async def download_file(client, location, out, max_connections, progress_callbac
     async for chunk in transferrer.download(input_location, size, max_connections):
         # Escribir en un hilo para no bloquear el event loop (importante con
         # varias descargas concurrentes y/o sistemas de ficheros lentos).
-        await loop.run_in_executor(None, out.write, chunk)
+        await loop.run_in_executor(_IO_EXECUTOR, out.write, chunk)
         downloaded += len(chunk)
         if progress_callback:
             r = progress_callback(downloaded, size)
@@ -315,7 +348,7 @@ async def upload_file(client, file, file_size, max_connections, progress_callbac
         while True:
             # Leer en un hilo para no bloquear el event loop (importante con
             # sistemas de ficheros lentos como bind mounts en Docker/Mac).
-            data = await loop.run_in_executor(None, file.read, part_size)
+            data = await loop.run_in_executor(_IO_EXECUTOR, file.read, part_size)
             if not data:
                 break
             uploaded += len(data)

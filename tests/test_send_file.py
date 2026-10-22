@@ -1,11 +1,16 @@
-"""send_file_to_telegram: metadatos, limpieza de temporales y borrado."""
+"""send_file_to_telegram: metadatos, limpieza de temporales, borrado y límite de tamaño."""
 
 import asyncio
+import math
 import os
 from unittest.mock import MagicMock
 
 import pytest
-from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
+from telethon import utils as telethon_utils
+from telethon.extensions import markdown
+from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo, MessageEntityTextUrl
+
+from conftest import FORUM_CHAT_ID, FORUM_TOPIC, forum_reply_to
 
 
 @pytest.fixture
@@ -41,12 +46,12 @@ def sender(quiet_bot, monkeypatch, tmp_path):
     async def thumbnail(path):
         return harness.thumbnail
 
-    async def upload(entity, path, filename, attributes, thumb, is_video, callback):
+    async def upload(entity, path, filename, attributes, thumb, is_video, callback, reply_to=None):
         if harness.upload_error is not None:
             raise harness.upload_error
         harness.uploaded = {
             "path": path, "filename": filename, "attributes": attributes,
-            "thumb": thumb, "is_video": is_video,
+            "thumb": thumb, "is_video": is_video, "reply_to": reply_to,
         }
         return MagicMock(id=123)
 
@@ -57,6 +62,42 @@ def sender(quiet_bot, monkeypatch, tmp_path):
 
     harness.dropbot = quiet_bot
     return harness
+
+
+class TestTemaDelForo:
+    """Se subía con send_file al chat, sin reply_to: en un supergrupo con temas,
+    el progreso salía en el tema del enlace y el fichero en General."""
+
+    def test_el_fichero_va_al_tema_de_la_peticion(self, sender, make_event, media_file, run_async):
+        event = make_event(chat_id=FORUM_CHAT_ID)
+        event.reply_to = forum_reply_to()
+
+        run_async(sender.dropbot.send_file_to_telegram(event, media_file("d.pdf")))
+
+        assert sender.uploaded["reply_to"] == FORUM_TOPIC
+
+    def test_con_un_boton_va_al_tema_del_mensaje_del_boton(self, sender, forum_callback, media_file, run_async):
+        run_async(sender.dropbot.send_file_to_telegram(forum_callback(), media_file("d.pdf")))
+
+        assert sender.uploaded["reply_to"] == FORUM_TOPIC
+
+    def test_en_privado_va_como_siempre(self, sender, make_event, media_file, run_async):
+        run_async(sender.dropbot.send_file_to_telegram(make_event(), media_file("d.pdf")))
+
+        assert sender.uploaded["reply_to"] is None
+
+    def test_con_un_boton_el_aviso_de_error_va_al_tema(
+        self, sender, sent_messages, forum_callback, media_file, run_async
+    ):
+        """El mensaje del botón era el del «Enviando…» y ya se ha borrado: el
+        aviso, contestado a él, salía sin tema, en General."""
+        sender.upload_error = RuntimeError("la subida falló")
+
+        run_async(sender.dropbot.send_file_to_telegram(forum_callback(), media_file("d.pdf")))
+
+        kind, text, kwargs = sent_messages[-1]
+        assert text == sender.dropbot.get_text("error_sending_the_file_user")
+        assert kind == "send_message" and kwargs["reply_to"] == FORUM_TOPIC
 
 
 class TestMetadatos:
@@ -207,4 +248,156 @@ class TestBorradoTrasEnviar:
             make_event(), original, delete_after=True
         ))
 
+        assert os.path.exists(original)
+
+    def test_el_error_al_borrar_no_se_lee_como_markdown(
+        self, sender, sent_messages, make_event, media_file, run_async, monkeypatch
+    ):
+        """El error lleva la ruta, y el nombre puede ponerlo el servidor remoto
+        (Content-Disposition): un «[Pulsa aquí](evil.com)» salía como enlace."""
+        name = "[Pulsa aquí](evil.com) **negrita**.mp4"
+        original = media_file(name)
+
+        async def upload(entity, path, *args, **kwargs):
+            # Mientras se sube, alguien lo quita del servidor
+            os.remove(path)
+            return MagicMock(id=123)
+
+        monkeypatch.setattr(sender.dropbot, "_send_file_fast", upload)
+
+        run_async(sender.dropbot.send_file_to_telegram(
+            make_event(), original, delete_after=True
+        ))
+
+        plain, entities = markdown.parse(sent_messages[-1][1])
+        assert name in plain, "el nombre tiene que verse tal cual"
+        assert not any(isinstance(e, MessageEntityTextUrl) for e in entities)
+
+    def test_si_otro_fichero_ocupa_su_nombre_mientras_se_envia_no_lo_borra(
+        self, sender, texts, make_event, tmp_path, run_async, monkeypatch
+    ):
+        """Durante la conversión se renombra en /manage y otro fichero pasa a
+        llamarse como él: borrar por ruta se llevaba ese otro."""
+        original = tmp_path / "video.mp4"
+        original.write_bytes(b"el que se envia")
+        other = tmp_path / "video (1).mp4"
+        other.write_bytes(b"otro video")
+        renamed = tmp_path / "Charla.mp4"
+
+        async def convert(path, status_message=None):
+            os.rename(original, renamed)
+            os.rename(other, original)
+            return path
+
+        monkeypatch.setattr(sender.dropbot, "convert_video_to_telegram_compatible", convert)
+
+        result = run_async(sender.dropbot.send_file_to_telegram(
+            make_event(), str(original), delete_after=True
+        ))
+
+        assert result is not None
+        assert original.read_bytes() == b"otro video", "se ha borrado otro fichero"
+        assert renamed.exists()
+        assert sender.dropbot.get_text("error_deleting_after_send_replaced") in texts()
+        assert sender.dropbot.get_text("deleted_from_server") not in texts()
+
+    def test_si_lo_borran_y_otro_reusa_su_nombre_no_lo_borra(
+        self, sender, texts, make_event, tmp_path, run_async, monkeypatch
+    ):
+        """El sistema puede dar el inodo del borrado al fichero nuevo: por eso
+        el original se mantiene abierto hasta el final."""
+        original = tmp_path / "video.mp4"
+        original.write_bytes(b"el que se envia")
+
+        async def convert(path, status_message=None):
+            os.remove(original)
+            original.write_bytes(b"una descarga nueva")
+            return path
+
+        monkeypatch.setattr(sender.dropbot, "convert_video_to_telegram_compatible", convert)
+
+        run_async(sender.dropbot.send_file_to_telegram(
+            make_event(), str(original), delete_after=True
+        ))
+
+        assert original.read_bytes() == b"una descarga nueva"
+        assert sender.dropbot.get_text("error_deleting_after_send_replaced") in texts()
+
+
+class TestLimiteDeTamano:
+    def test_el_mayor_fichero_que_se_deja_subir_cabe_en_4000_partes(self, dropbot):
+        """Sin Premium, y un bot nunca lo tiene, Telegram acepta como mucho
+        4000 partes: con un límite de 2 GiB se dejaban pasar hasta 4096."""
+        largest = dropbot.MAX_TELEGRAM_FILE_SIZE - 1
+        part_size = telethon_utils.get_appropriated_part_size(largest) * 1024
+        assert math.ceil(largest / part_size) <= 4000
+
+    def test_si_el_convertido_no_cabe_se_sube_el_original(
+        self, sender, texts, make_event, media_file, run_async, monkeypatch
+    ):
+        """Antes se mide el original, pero al recodificar (un AV1 a H.264) el
+        vídeo puede crecer y pasar del límite: tras horas de conversión no se
+        enviaba ninguno de los dos, aunque el original cabía, y el aviso decía
+        que pesaba más de 2000 MB sin decir cuál."""
+        original = media_file("serie.mkv")
+        converted = media_file("convertido.mp4", sender.dropbot.MAX_TELEGRAM_FILE_SIZE + 1)
+        sender.converted_to = converted
+        upload = sender.dropbot._send_file_fast
+        while_uploading = []
+
+        async def watched_upload(entity, path, *args, **kwargs):
+            while_uploading.append(os.path.exists(converted))
+            return await upload(entity, path, *args, **kwargs)
+
+        monkeypatch.setattr(sender.dropbot, "_send_file_fast", watched_upload)
+
+        result = run_async(sender.dropbot.send_file_to_telegram(make_event(), original))
+
+        assert result is not None
+        assert sender.uploaded["path"] == original
+        assert sender.uploaded["filename"] == "serie.mkv"
+        assert while_uploading == [False], "el convertido no ocupa TEMP_DIR durante la subida"
+        assert sender.dropbot.get_text("file_sent_unconverted", "serie.mkv") in texts()
+        assert "demasiado grande" not in texts()
+        assert os.path.exists(original)
+
+    def test_con_enviar_y_borrar_el_original_sin_convertir_se_borra_tras_subirlo(
+        self, sender, make_event, media_file, run_async, monkeypatch
+    ):
+        original = media_file("serie.mkv")
+        sender.converted_to = media_file("convertido.mp4", sender.dropbot.MAX_TELEGRAM_FILE_SIZE + 1)
+        upload = sender.dropbot._send_file_fast
+        while_uploading = []
+
+        async def watched_upload(entity, path, *args, **kwargs):
+            while_uploading.append(os.path.exists(original))
+            return await upload(entity, path, *args, **kwargs)
+
+        monkeypatch.setattr(sender.dropbot, "_send_file_fast", watched_upload)
+
+        run_async(sender.dropbot.send_file_to_telegram(make_event(), original, delete_after=True))
+
+        assert sender.uploaded["path"] == original
+        assert while_uploading == [True]
+        assert not os.path.exists(original)
+
+    def test_si_tampoco_cabe_el_original_no_se_sube_y_se_dice_cual(
+        self, sender, texts, make_event, media_file, run_async
+    ):
+        """Solo pasa si el original cambia mientras se convierte. En una
+        playlist el aviso iba sin nombre y no se sabía qué vídeo había fallado."""
+        original = media_file("serie.mkv", sender.dropbot.MAX_TELEGRAM_FILE_SIZE)
+        sender.converted_to = media_file(
+            "convertido.mp4", sender.dropbot.MAX_TELEGRAM_FILE_SIZE + 1
+        )
+
+        result = run_async(sender.dropbot.send_file_to_telegram(
+            make_event(), original, delete_after=True
+        ))
+
+        assert result is None
+        assert sender.uploaded is None
+        assert sender.dropbot.get_text("error_file_too_large_named", "serie.mkv") in texts()
+        assert "Error enviando el fichero" not in texts()
+        assert not os.path.exists(sender.converted_to)
         assert os.path.exists(original)

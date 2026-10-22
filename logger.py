@@ -10,6 +10,7 @@ Características:
 """
 
 import logging
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -34,11 +35,45 @@ class ColoredFormatter(logging.Formatter):
         self.use_colors = use_colors and sys.stdout.isatty()
     
     def format(self, record):
-        if self.use_colors:
-            levelname = record.levelname
-            if levelname in self.COLORS:
-                record.levelname = f"{self.COLORS[levelname]}{levelname}{self.RESET}"
-        return super().format(record)
+        # El registro es el mismo para todos los handlers: si se quedaba
+        # coloreado, el fichero de log se llenaba de códigos ANSI
+        levelname = record.levelname
+        if self.use_colors and levelname in self.COLORS:
+            record.levelname = f"{self.COLORS[levelname]}{levelname}{self.RESET}"
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = levelname
+
+
+# Lo que no se escribe tal cual en el log: los de control (salvo tabulador y
+# salto de línea), DEL, los C1, las marcas bidi y los separadores de línea
+UNSAFE_LOG_CHARS = re.compile(
+    r'[\x00-\x08\x0B-\x1F\x7F-\x9F'
+    r'\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\u2028\u2029]'
+)
+
+
+class SafeMessageFilter(logging.Filter):
+    """Deja el mensaje de forma que no pueda falsificar el log.
+
+    Al log llegan textos que elige un tercero (el título de una playlist, el
+    stderr de yt-dlp...): con un salto de línea fabricaban una línea que no se
+    distinguía de un registro real, y con un ESC mandaban secuencias a la
+    terminal de quien sigue `docker logs -f`. Esos caracteres se escriben en su
+    forma visible (\\x1b) y las líneas de continuación van sangradas.
+    """
+
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            # Un formato roto lo avisa el handler, como siempre
+            return True
+        message = UNSAFE_LOG_CHARS.sub(lambda m: ascii(m.group())[1:-1], message)
+        record.msg = message.replace('\n', '\n    | ')
+        record.args = None
+        return True
 
 
 def setup_logger(
@@ -81,6 +116,9 @@ def setup_logger(
     
     logger.setLevel(getattr(logging, log_level.upper()))
     logger.propagate = False
+    # En el logger y no en cada handler: así se sanea una sola vez y vale
+    # igual para la consola y para el fichero
+    logger.addFilter(SafeMessageFilter())
     
     # Formato detallado para logs
     detailed_format = logging.Formatter(

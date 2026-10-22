@@ -91,6 +91,33 @@ class TestMigracion:
         key = settings.SETTINGS_FROM_ENV[variable]
         assert settings.get(key) == store.default(key)
 
+    @pytest.mark.parametrize("variable, raw, expected", [
+        ("FAST_CONNECTIONS", "0", 1),
+        ("FAST_CONNECTIONS", "-3", 1),
+        ("FAST_CONNECTIONS", "32", 20),
+        ("PARALLEL_DOWNLOADS", "30", 20),
+        ("PARALLEL_DOWNLOADS", " 25 ", 20),
+    ])
+    def test_lo_que_la_3x_aceptaba_fuera_de_rango_se_ajusta_en_vez_de_descartarse(
+        self, config_dir, env, variable, raw, expected
+    ):
+        """Ninguna tenía tope en la 3.x, y FAST_CONNECTIONS=0 era el método
+        estándar. Descartadas, quedaban 8 conexiones por fichero y 2 descargas
+        a la vez: lo contrario de lo que había pedido el admin."""
+        env(**{variable: raw})
+
+        migration.run()
+
+        assert settings.get(settings.SETTINGS_FROM_ENV[variable]) == expected
+
+    def test_parallel_downloads_menor_que_1_sigue_sin_valer(self, config_dir, env):
+        """La 3.x ya abortaba el arranque con él: no había nada que conservar."""
+        env(PARALLEL_DOWNLOADS="0")
+
+        migration.run()
+
+        assert settings.parallel_downloads() == store.default("downloads.parallel")
+
     def test_despues_de_sembrar_manda_settings_json(self, config_dir, env):
         """Si la variable siguiera ganando, un cambio hecho desde /settings
         se desharía en silencio en el siguiente reinicio."""
@@ -101,6 +128,21 @@ class TestMigracion:
         store.reload()
         assert migration.run() is False
         assert settings.auto_send() == "STORE"
+
+    def test_el_aviso_de_lo_importado_queda_pendiente_en_disco(self, config_dir, env):
+        """Hasta que le llegue a un admin, aunque el bot se reinicie antes."""
+        env(AUTO_SEND="SEND")
+        migration.run()
+
+        store.reload()
+        assert migration.import_notice_pending() is True
+        migration.import_notice_sent()
+        store.reload()
+        assert migration.import_notice_pending() is False
+
+    def test_sin_variables_no_hay_nada_que_avisar(self, config_dir, env):
+        migration.run()
+        assert migration.import_notice_pending() is False
 
 
 class TestAjustes:
@@ -160,7 +202,7 @@ class TestCalidadDeLosEnlaces:
         settings.put("urls.prefer_compatible", False)
         settings.put("urls.audio_tags", False)
         assert args(False) == ["-f", "bv*+ba/best"]
-        assert args(True) == ["-f", "bestaudio", "--extract-audio", "--audio-format", "mp3"]
+        assert args(True) == ["-f", "bestaudio/best", "--extract-audio", "--audio-format", "mp3"]
 
     def test_el_limite_de_video_va_por_el_lado_corto(self, args):
         """res es el lado corto: un vertical de 1080x1920 cuenta como 1080p, y
@@ -185,8 +227,17 @@ class TestCalidadDeLosEnlaces:
         settings.put("urls.audio_format", "M4A")
         settings.put("urls.audio_quality", "BEST")
         produced = args(True)
-        assert produced[:5] == ["-f", "bestaudio[ext=m4a]/bestaudio", "--extract-audio", "--audio-format", "m4a"]
+        assert produced[:5] == ["-f", "bestaudio[ext=m4a]/bestaudio/best", "--extract-audio", "--audio-format", "m4a"]
         assert "--audio-quality" not in produced
+
+    @pytest.mark.parametrize("audio_format", ["MP3", "M4A"])
+    def test_el_audio_sale_tambien_de_un_video_sin_pista_de_audio_suelta(self, args, audio_format):
+        """Hay sitios que solo sirven el vídeo con el audio dentro. Con bestaudio
+        a secas yt-dlp no encuentra formato y falla; con /best baja el combinado
+        y le saca el audio."""
+        settings.put("urls.audio_format", audio_format)
+        produced = args(True)
+        assert produced[produced.index("-f") + 1].split("/")[-1] == "best"
 
     def test_etiquetas_y_caratula_solo_en_el_audio(self, args):
         assert "--embed-thumbnail" in args(True)
@@ -207,14 +258,14 @@ class TestCalidadDeLosEnlaces:
 
     def test_tamano_maximo(self, args):
         assert "--max-filesize" not in args(False)
-        settings.put("urls.max_size_mb", 2048)
+        settings.put("urls.max_size_mb", 2000)
         produced = args(False)
-        assert produced[produced.index("--max-filesize") + 1] == "2048M"
+        assert produced[produced.index("--max-filesize") + 1] == "2000M"
 
     def test_pasarse_del_tamano_maximo_se_dice(self, dropbot, config_dir):
-        settings.put("urls.max_size_mb", 2048)
-        lines = ["[download] File is larger than max-filesize (3000000000 bytes > 2147483648 bytes). Aborting."]
-        assert "2 GB" in dropbot.url_failure_message(lines)
+        settings.put("urls.max_size_mb", 1024)
+        lines = ["[download] File is larger than max-filesize (3000000000 bytes > 1073741824 bytes). Aborting."]
+        assert "1 GB" in dropbot.url_failure_message(lines)
         assert dropbot.url_failure_message(["ERROR: otra cosa"]) == dropbot.get_text("error_url_failed_user")
 
     def test_el_limite_de_video_no_toca_el_audio(self, args):
@@ -242,6 +293,16 @@ class TestCarpetas:
         assert paths["video"] == config.DOWNLOAD_VIDEO
         assert paths["url_video"] == config.DOWNLOAD_URL_VIDEO
 
+    def test_downloads_sin_volumen_no_es_persistente(self, monkeypatch):
+        """Con una errata en el compose, `/downloads` vive en el contenedor."""
+        monkeypatch.setattr(config, "DOWNLOAD_PATH", "/downloads")
+
+        assert config.downloads_persistent(mounted=lambda path: path == "/download") is False
+        assert config.downloads_persistent(mounted=lambda path: path == "/downloads") is True
+        # Montar un padre vale igual
+        monkeypatch.setattr(config, "DOWNLOAD_PATH", "/mnt/disco/downloads")
+        assert config.downloads_persistent(mounted=lambda path: path == "/mnt/disco") is True
+
 
 class TestArranque:
     def test_sin_token_aborta_con_mensaje(self):
@@ -254,6 +315,71 @@ class TestArranque:
 
         assert result.returncode != 0
         assert "TELEGRAM_TOKEN" in result.stdout + result.stderr
+
+    @pytest.mark.parametrize("admins, wrong", [
+        ("111,-1001234567890", "-1001234567890"),
+        ("111, 1087968824", "1087968824"),
+    ])
+    def test_un_id_que_no_es_de_una_persona_en_telegram_admin_se_ignora_con_mensaje(self, admins, wrong):
+        """Con el id de un grupo, cualquier admin anónimo de ese grupo pasaba por
+        admin y podía mandar ficheros y enlaces al servidor. El espacio tras la
+        coma colaba también al admin anónimo de la Bot API. Pero parar el bot
+        por ellos lo dejaba caído también para el admin bueno, que solo lo veía
+        en docker logs: se ignoran y se sigue con los demás."""
+        # Con un API id que no vale se para justo después: así se ve que ha
+        # pasado la comprobación de los admins sin conectarse a Telegram
+        env = {"TELEGRAM_TOKEN": "123456:test-token", "TELEGRAM_ADMIN": admins,
+               "TELEGRAM_API_ID": "abc", "TELEGRAM_API_HASH": "testhash",
+               "TELEMETRY": "false", "PATH": "/usr/bin:/bin"}
+        result = subprocess.run(
+            [sys.executable, "dropbot.py"],
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
+        )
+
+        lines = (result.stdout + result.stderr).splitlines()
+        assert any("[CONFIG]" in line and "TELEGRAM_ADMIN" in line and wrong in line for line in lines)
+        assert any("[CONFIG]" in line and "TELEGRAM_API_ID" in line for line in lines)
+
+    def test_si_en_telegram_admin_no_hay_ningun_id_de_persona_aborta_con_mensaje(self):
+        """Ignorando el del grupo no queda nadie que pueda usar el bot."""
+        env = {"TELEGRAM_TOKEN": "123456:test-token", "TELEGRAM_ADMIN": "-1001234567890",
+               "TELEGRAM_API_ID": "abc", "TELEGRAM_API_HASH": "testhash",
+               "TELEMETRY": "false", "PATH": "/usr/bin:/bin"}
+        result = subprocess.run(
+            [sys.executable, "dropbot.py"],
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
+        )
+
+        lines = (result.stdout + result.stderr).splitlines()
+        assert result.returncode != 0
+        assert any("[CONFIG]" in line and "-1001234567890" in line for line in lines)
+        assert not any("[CONFIG]" in line and "TELEGRAM_API_ID" in line for line in lines)
+
+    @pytest.mark.parametrize("variable, value", [
+        ("TELEGRAM_TOKEN", ""),
+        ("TELEGRAM_TOKEN", "sin-el-id-del-bot"),
+        ("TELEGRAM_ADMIN", ""),
+        ("TELEGRAM_ADMIN", " , "),
+        ("TELEGRAM_API_ID", ""),
+        ("TELEGRAM_API_ID", "abc"),
+        ("TELEGRAM_API_HASH", " "),
+    ])
+    def test_una_variable_de_telegram_vacia_o_mal_aborta_diciendo_cual(self, variable, value):
+        """El compose del README las trae vacías para rellenarlas, y vacías
+        pasaban la comprobación: sin token, Telethon lo pedía por teclado y el
+        contenedor se reiniciaba en bucle; sin admin, el bot no era de nadie."""
+        env = {"TELEGRAM_TOKEN": "123456:test-token", "TELEGRAM_ADMIN": "999",
+               "TELEGRAM_API_ID": "1", "TELEGRAM_API_HASH": "testhash",
+               "TELEMETRY": "false", "PATH": "/usr/bin:/bin", variable: value}
+        result = subprocess.run(
+            [sys.executable, "dropbot.py"],
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
+        )
+
+        # Un traceback también nombraría la variable, en la línea de código
+        lines = (result.stdout + result.stderr).splitlines()
+        assert result.returncode != 0
+        assert any("[CONFIG]" in line and variable in line for line in lines)
 
 
 class TestTraducciones:

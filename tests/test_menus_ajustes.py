@@ -17,7 +17,8 @@ import settings
 import stats
 import store
 from button_data import button_data
-from conftest import REPO_ROOT
+from conftest import FORUM_TOPIC, REPO_ROOT, forum_reply_to
+from utils import telegram_helpers
 
 ADMIN = 999
 CALLBACK_DATA_LIMIT = 64
@@ -46,15 +47,19 @@ EXPECTED_BACK = {
 # ---------------------------------------------------------------------------
 
 class _Event:
-    def __init__(self, data, sender_id=ADMIN):
+    def __init__(self, data, sender_id=ADMIN, text="/settings", is_private=True):
         self.id = 1
         self.message_id = 1
         self.chat_id = 42
         self.sender_id = sender_id
         self.data = data
+        self.raw_text = text
+        self.is_private = is_private
         self._match = (data, data[len(b"cfg:"):]) if data else (b"", b"")
         self.pattern_match = self
         self.deleted = False
+        # Lo que se contesta directamente, sin pasar por la cola
+        self.responses = []
 
     def group(self, index):
         return self._match[index]
@@ -64,6 +69,9 @@ class _Event:
 
     async def delete(self):
         self.deleted = True
+
+    async def respond(self, text, **kwargs):
+        self.responses.append(text)
 
 
 def _all_buttons(buttons):
@@ -100,6 +108,9 @@ def screens(quiet_bot, sent_messages, monkeypatch, config_dir):
         changed.append(key)
 
     monkeypatch.setattr(module, "_on_change", on_change)
+    # Nadie avisado todavía de que el bot no es suyo, y el @ que deja main()
+    monkeypatch.setattr(telegram_helpers, "_not_admin_warned", {})
+    monkeypatch.setattr(telegram_helpers, "_bot_username", "DropBot")
     _patch_messaging(module, sent_messages, monkeypatch)
     module.changed = changed
     return module
@@ -194,7 +205,7 @@ class TestPantallas:
         assert screens.get_text("settings_quality_default") in " ".join(labels("q"))
         assert screens.get_text("settings_pll_none") in " ".join(labels("pll"))
         assert screens.get_text("settings_max_none") in " ".join(labels("max"))
-        assert "2 GB" in " ".join(labels("max")) and "512 MB" in " ".join(labels("max"))
+        assert "2000 MB" in " ".join(labels("max")) and "512 MB" in " ".join(labels("max"))
         assert "1080p" in " ".join(labels("vq"))
         assert any(label.endswith("Español") for label in labels("lang"))
         assert any(label.endswith("English") for label in labels("lang"))
@@ -223,6 +234,16 @@ class TestPantallas:
         assert len(lines) == len(screens.FOLDER_ORDER)
         assert sum(line.startswith("📌") for line in lines) == 1
         assert any(line.startswith("📌") and "/url_audio" in line for line in lines)
+
+    def test_la_principal_avisa_si_downloads_no_es_un_volumen(self, screens, monkeypatch):
+        """Con /config montado y /downloads olvidado no avisaba nada: lo
+        descargado se perdía al recrear el contenedor."""
+        warning = screens.get_text("settings_downloads_not_persistent")
+        monkeypatch.setattr(screens, "downloads_persistent", lambda: False)
+        assert warning in screens.build_main()[0]
+
+        monkeypatch.setattr(screens, "downloads_persistent", lambda: True)
+        assert warning not in screens.build_main()[0]
 
     def test_la_calidad_del_mp3_aparece_y_desaparece_al_cambiar_el_formato(
         self, screens, run_async, sent_messages
@@ -258,6 +279,17 @@ class TestEstadisticas:
         text, buttons = screens.build_telemetry()
 
         assert screens.get_text("settings_telemetry_forced_env", "TELEMETRY") in text
+        assert not any(d.startswith(b"cfg:set:tel:") for d in _callbacks(buttons))
+
+    def test_apagadas_por_settings_json_no_hablan_de_una_variable(self, screens, monkeypatch):
+        """Cualquier motivo que no fuera el volumen se pintaba como variable:
+        «Desactivadas con la variable `settings` del docker-compose»."""
+        monkeypatch.setattr(stats, "forced_off", lambda: "settings")
+
+        text, buttons = screens.build_telemetry()
+
+        assert screens.get_text("settings_telemetry_forced_settings", store.settings_path()) in text
+        assert screens.get_text("settings_telemetry_forced_env", "settings") not in text
         assert not any(d.startswith(b"cfg:set:tel:") for d in _callbacks(buttons))
 
     @pytest.mark.parametrize("on,label,data", [(True, "✅", b"cfg:set:tel:0"),
@@ -320,6 +352,14 @@ class TestEstadisticas:
         assert payload["project"] == "dropbot" and "metrics" in payload
         assert _callbacks(kwargs["buttons"]) == [b"cfg:close"]
         assert kwargs.get("link_preview") is False
+
+    def test_en_un_foro_lo_que_se_envia_va_al_tema_del_boton(
+        self, screens, run_async, sent_messages, forum_callback
+    ):
+        run_async(screens.handle_settings_callback(forum_callback((b"telshow",))))
+
+        [(_, _, kwargs)] = sent_messages
+        assert kwargs["reply_to"] == FORUM_TOPIC
 
     def test_la_vista_previa_recorta_los_contadores_y_cabe(
         self, screens, run_async, sent_messages, monkeypatch
@@ -509,12 +549,60 @@ class TestComando:
         assert text == screens.build_main()[0]
         assert kwargs.get("link_preview") is False
 
-    def test_un_no_admin_recibe_el_aviso_y_nada_mas(self, screens, run_async, sent_messages):
-        run_async(screens.handle_settings_command(_Event(None, sender_id=12345)))
+    def test_en_un_foro_la_principal_va_al_tema_del_comando(self, screens, run_async, sent_messages):
+        """En un supergrupo con temas, lo que se manda sin reply_to cae en General."""
+        event = _Event(None, is_private=False)
+        event.reply_to = forum_reply_to()
 
-        assert [(kind, text) for kind, text, _ in sent_messages] == \
-            [("send_message", screens.get_text("user_not_admin"))]
-        assert "buttons" not in sent_messages[0][2]
+        run_async(screens.handle_settings_command(event))
+
+        [(_, _, kwargs)] = sent_messages
+        assert kwargs["reply_to"] == FORUM_TOPIC
+
+    def test_un_no_admin_recibe_el_aviso_y_nada_mas(self, screens, run_async, sent_messages):
+        event = _Event(None, sender_id=12345)
+
+        run_async(screens.handle_settings_command(event))
+
+        assert event.responses == [screens.get_text("user_not_admin")]
+        # Directo, no por la cola de los mensajes del admin; y su comando no se borra
+        assert sent_messages == [] and not event.deleted
+
+    def test_a_un_no_admin_se_le_avisa_una_vez_y_no_a_cada_comando(
+        self, screens, run_async, sent_messages
+    ):
+        events = [_Event(None, sender_id=12345) for _ in range(10)]
+
+        for event in events:
+            run_async(screens.handle_settings_command(event))
+
+        assert sum(len(event.responses) for event in events) == 1
+
+    def test_en_un_grupo_a_un_no_admin_ni_se_le_contesta_ni_se_le_borra(
+        self, screens, run_async, sent_messages
+    ):
+        event = _Event(None, sender_id=12345, is_private=False)
+
+        run_async(screens.handle_settings_command(event))
+
+        assert event.responses == [] and sent_messages == [] and not event.deleted
+
+    def test_un_settings_para_otro_bot_ni_se_borra_ni_se_contesta(
+        self, screens, run_async, sent_messages
+    ):
+        event = _Event(None, text="/settings@OtroBot", is_private=False)
+
+        run_async(screens.handle_settings_command(event))
+
+        assert sent_messages == [] and not event.deleted
+
+    def test_un_settings_con_el_arroba_del_bot_es_para_el(self, screens, run_async, sent_messages):
+        event = _Event(None, text="/settings@DROPBOT", is_private=False)
+
+        run_async(screens.handle_settings_command(event))
+
+        assert event.deleted
+        assert [text for _, text, _ in sent_messages] == [screens.build_main()[0]]
 
     def test_si_no_se_puede_borrar_el_comando_sigue(self, screens, run_async, sent_messages):
         class Undeletable(_Event):
@@ -566,6 +654,71 @@ class TestAjustesIlegibles:
             text, buttons = screens.build_screen(screen)
             assert text and buttons
 
+    def test_las_estadisticas_se_desactivan_aunque_el_defecto_las_active(
+        self, screens, broken, monkeypatch
+    ):
+        """Ilegible se usan los valores por defecto, con las estadísticas
+        activadas aunque el fichero dijera que no, y apagarlas no se guardaba."""
+        monkeypatch.delenv("TELEMETRY", raising=False)
+        monkeypatch.setattr(store, "_persistent", True)
+
+        text, buttons = screens.build_telemetry()
+
+        assert stats.is_on() is False
+        assert screens.get_text("settings_telemetry_forced_settings", store.settings_path()) in text
+        assert not any(d.startswith(b"cfg:set:tel:") for d in _callbacks(buttons))
+
+
+# ---------------------------------------------------------------------------
+# /config sin escritura
+# ---------------------------------------------------------------------------
+
+def _read_only(src, dst):
+    raise OSError(30, "Read-only file system")
+
+
+class TestSinEscritura:
+    """Un volumen :ro, un NFS con root_squash o el disco lleno: se contestaba
+    sin texto y se repintaba con la marca en lo elegido, como guardado, y al
+    reiniciar volvía atrás sin que nadie lo hubiera dicho."""
+
+    @pytest.fixture
+    def answers(self, screens, monkeypatch):
+        recorded = []
+
+        async def answer(event, *args, **kwargs):
+            recorded.append((args, kwargs))
+
+        monkeypatch.setattr(screens, "safe_answer", answer)
+        monkeypatch.setattr(stats.client(), "forget", lambda: None)
+        return recorded
+
+    @pytest.mark.parametrize("data", [b"cfg:set:send:STORE", b"cfg:set:compat:0", b"cfg:set:tel:0"])
+    def test_si_no_se_puede_guardar_se_avisa_al_pulsar(
+        self, screens, answers, run_async, sent_messages, monkeypatch, data
+    ):
+        with monkeypatch.context() as patched:
+            patched.setattr(store.os, "replace", _read_only)
+            _press(screens, run_async, data)
+
+        assert answers == [((screens.get_text("settings_not_saved"),), {"alert": True})]
+        # Lo elegido vale hasta el reinicio: se repinta igual
+        assert len(_edits(sent_messages)) == 1
+
+    def test_si_se_guarda_se_contesta_sin_aviso(self, screens, answers, run_async, config_dir):
+        _press(screens, run_async, b"cfg:set:send:STORE")
+
+        assert answers == [((), {})]
+        assert _on_disk(config_dir)["urls"]["auto_send"] == "STORE"
+
+    def test_la_principal_lo_avisa(self, screens, monkeypatch):
+        monkeypatch.setattr(store, "is_persistent", lambda: True)
+        monkeypatch.setattr(store, "write_error", lambda: "[Errno 30] Read-only file system")
+
+        text, _ = screens.build_main()
+
+        assert screens.get_text("settings_not_writable") in text
+
 
 # ---------------------------------------------------------------------------
 # Traducciones
@@ -586,7 +739,7 @@ def _render_everything(screens, monkeypatch):
     settings.put("urls.audio_format", "M4A")
     collect()
     settings.put("urls.audio_format", "MP3")
-    for forced in (None, "TELEMETRY", "volume"):
+    for forced in (None, "TELEMETRY", "volume", "settings"):
         monkeypatch.setattr(stats, "forced_off", lambda forced=forced: forced)
         collect()
     return rendered

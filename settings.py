@@ -40,8 +40,10 @@ SPONSORBLOCK_MODES = tuple(SPONSORBLOCK_CATEGORIES)
 PLAYLIST_MODES = ("ASK", "FULL", "FIRST")
 EXTRACT_AFTER_MODES = ("ASK", "DELETE", "KEEP")
 PLAYLIST_LIMIT_CHOICES = (0, 10, 25, 50, 100, 200)
-# En MiB, que es como lo cuenta --max-filesize de yt-dlp
-MAX_SIZE_CHOICES = (0, 512, 1024, 2048, 5120, 10240)
+# En MiB, que es como lo cuenta --max-filesize de yt-dlp. 2000 y no 2048: es
+# lo más que se puede enviar por Telegram (MAX_TELEGRAM_FILE_SIZE), y con "2 GB"
+# se descargaba lo que luego no se podía enviar
+MAX_SIZE_CHOICES = (0, 512, 1024, 2000, 5120, 10240)
 
 
 def size_label(mb):

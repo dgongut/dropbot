@@ -5,8 +5,9 @@ import os
 import time
 import json
 import asyncio
+import itertools
 
-from config import TEMP_DIR
+from config import MAX_TELEGRAM_FILE_SIZE, TEMP_DIR
 from logger import debug, warning, error
 
 
@@ -147,6 +148,29 @@ def plan_is_noop(plan):
     )
 
 
+def original_if_converted_too_large(original_path, converted_path):
+    """El vídeo que hay que subir: el convertido, o el original si el convertido no cabe en Telegram.
+
+    Al recodificar (un AV1 o un VP9 a H.264) el vídeo puede crecer y pasar del
+    límite aunque el original quepa, y entonces no se enviaba ninguno de los
+    dos. Se borra ya el convertido, para que no ocupe TEMP_DIR durante la
+    subida, y se sube el original sin convertir, como con «Enviar original».
+    Si tampoco cabe el original, se queda el convertido y quien llama avisa.
+    """
+    try:
+        if (os.path.getsize(converted_path) < MAX_TELEGRAM_FILE_SIZE
+                or os.path.getsize(original_path) >= MAX_TELEGRAM_FILE_SIZE):
+            return converted_path
+    except OSError:
+        return converted_path
+    warning(f"[CONVERSION] The converted video exceeds Telegram's upload limit, sending the original unconverted: {original_path}")
+    try:
+        os.remove(converted_path)
+    except OSError as e:
+        warning(f"[CONVERSION] ⚠️ Error deleting the converted file: {e}")
+    return original_path
+
+
 def format_duration(seconds):
     """Formatea la duración en formato HH:MM:SS o MM:SS"""
     hours = seconds // 3600
@@ -161,6 +185,9 @@ def format_duration(seconds):
 
 # Telegram rechaza miniaturas con algún lado de más de 320 px
 THUMBNAIL_MAX_SIDE = 320
+
+# Distingue las miniaturas de dos envíos que empiezan en el mismo milisegundo
+_thumbnail_ids = itertools.count(1)
 
 
 async def _thumbnail_timestamp(video_path):
@@ -188,11 +215,10 @@ async def generate_video_thumbnail(video_path, output_path=None, timestamp=None)
             timestamp = await _thumbnail_timestamp(video_path)
 
         if output_path is None:
-            # Generar thumbnail en /tmp
-            video_filename = os.path.basename(video_path)
-            base_name = os.path.splitext(video_filename)[0]
+            # Generar thumbnail en /tmp. Sin el nombre del vídeo: con uno largo
+            # el sufijo pasaba de los 255 bytes y el vídeo iba sin miniatura
             timestamp_ms = int(time.time() * 1000)
-            output_path = os.path.join(TEMP_DIR, f"{base_name}_{timestamp_ms}_thumb.jpg")
+            output_path = os.path.join(TEMP_DIR, f"{timestamp_ms}_{next(_thumbnail_ids)}_thumb.jpg")
 
         debug(f"[THUMBNAIL] Output path: {output_path}")
         debug(f"[THUMBNAIL] Timestamp: {timestamp}")

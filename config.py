@@ -1,11 +1,13 @@
 import os
 import re
 
-from utils.mounts import is_mounted
+from utils.mounts import is_mounted, is_persisted
 
 # Constants
+# Los usuarios que pone la Bot API en lugar de un admin anónimo de un grupo
+# (GroupAnonymousBot) y de un canal (Channel_Bot)
 ANONYMOUS_USER_ID = "1087968824"
-DEFAULT_EMPTY_STR = "abc"
+CHANNEL_USER_ID = "136817688"
 DONORS_URL = "https://donate.dgongut.com/donors.json"
 MAX_DOWNLOAD_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
@@ -56,6 +58,14 @@ TEMP_DIR = "/tmp/dropbot_conversions"
 HEARTBEAT_FILE = "/tmp/dropbot_heartbeat"
 HEARTBEAT_INTERVAL = 15  # segundos entre escrituras
 
+# Hasta la 4.0.0 la sesión de Telegram vivía en el directorio de trabajo, /app,
+# que no es un volumen. Si el contenedor aún la tiene, se mueve a /config
+LEGACY_SESSION_FILE = "/app/dropbot.session"
+
+# Espera antes de volver a conectar cuando Telegram corta la conexión y
+# Telethon no reintenta por su cuenta (un flood a nivel de transporte, 429)
+RECONNECT_DELAY = 10  # segundos
+
 # Proveedor de PO Token (bgutil) que yt-dlp necesita para descargar de YouTube
 # sin recibir HTTP 403. Se arranca como servidor HTTP local dentro del contenedor
 POT_PROVIDER_DIR = "/opt/bgutil-ytdlp-pot-provider/server"
@@ -69,10 +79,17 @@ POT_PROVIDER_STARTUP_TIMEOUT = 30  # segundos máximos de espera a que responda
 # cambia desde /settings (ver settings.py). La línea divisoria es que un valor
 # equivocado en cualquiera de estas te deja sin acceso al bot, y lo que impide
 # que el chat funcione no se puede arreglar desde el chat.
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", DEFAULT_EMPTY_STR)
-TELEGRAM_ADMIN = os.environ.get("TELEGRAM_ADMIN", DEFAULT_EMPTY_STR)
-TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", DEFAULT_EMPTY_STR)
-TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", DEFAULT_EMPTY_STR)
+# Vacía cuenta como no puesta: el compose del README las trae así
+# (`- TELEGRAM_TOKEN=`) para rellenarlas, y olvidarse de una es fácil
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_ADMIN = os.environ.get("TELEGRAM_ADMIN", "").strip()
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
+TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
+
+# El id del bot (lo que va antes de los dos puntos del token). Va en lo que el
+# bot deja a medias en las carpetas de descarga: si otro bot las comparte, al
+# arrancar cada uno borra solo lo suyo y no lo que el otro está escribiendo
+INSTANCE_TAG = TELEGRAM_TOKEN.split(":")[0]
 
 # Estadísticas anónimas. Activadas por defecto; se desactivan desde /settings o
 # con TELEMETRY=false, que lee el propio telemetry.py: es la misma variable en
@@ -104,8 +121,10 @@ DEPRECATED_FOLDER_FILTERS = (
     "FILTER_EBOOK", "FILTER_URL_VIDEO", "FILTER_URL_AUDIO",
 )
 
-# Tamaño máximo que Telegram acepta en una subida (2 GiB)
-MAX_TELEGRAM_FILE_SIZE = 2 * 1024 * 1024 * 1024
+# Tamaño máximo que Telegram acepta en una subida: una cuenta sin Premium, y
+# un bot nunca lo es, sube como mucho 4000 partes de 512 KiB (2000 MiB). Con
+# 2 GiB pasaban 48 MiB de más que Telegram rechazaba tras intentar subirlos
+MAX_TELEGRAM_FILE_SIZE = 4000 * 512 * 1024
 
 # Configuración interna de la cola de mensajes para evitar FloodWaitError
 # Valores conservadores para evitar problemas con la API de Telegram
@@ -146,3 +165,14 @@ DOWNLOAD_PATHS = resolve_download_paths()
 def has_own_folder(*kinds):
     """True si alguno de esos tipos no va a la carpeta general."""
     return any(DOWNLOAD_PATHS[kind] != DOWNLOAD_PATH for kind in kinds)
+
+
+def downloads_persistent(mounted=is_mounted):
+    """Si lo que va a /downloads sobrevive a recrear el contenedor.
+
+    Basta con mirar /downloads: las demás carpetas solo cuentan cuando están
+    montadas. Sin volumen, que es olvidar una línea del compose o escribirla
+    mal, lo descargado vive dentro del contenedor y se pierde sin avisar en
+    la siguiente actualización.
+    """
+    return is_persisted(DOWNLOAD_PATH, mounted)

@@ -24,6 +24,8 @@ from utils.mounts import is_mounted, is_persisted
 CONFIG_ROOT = "/config"
 SETTINGS_FILE = "settings.json"
 STATE_DIR = "state"
+# Lo que se escribe y se borra al arrancar para saber si /config admite escritura
+WRITE_PROBE = ".write-test"
 
 DEFAULTS = {
     "language": "ES",
@@ -79,6 +81,11 @@ _settings = None
 # el fichero no se escribe: una errata editándolo a mano no puede acabar con
 # todos los ajustes sustituidos por los valores por defecto.
 _settings_unreadable = None
+# Por qué no se pudo escribir en /config la última vez, si no se pudo. Montado
+# no quiere decir que se pueda escribir: un volumen :ro, un NFS con
+# root_squash o un disco lleno. Lo cambiado sigue valiendo hasta el reinicio,
+# pero no lo sobrevive, y eso hay que decírselo al admin, no solo al log
+_write_error = None
 _batch_depth = 0
 _batch_dirty = False
 
@@ -88,7 +95,7 @@ def init(root=None):
 
     `root` es para los tests; en el contenedor siempre es CONFIG_ROOT.
     """
-    global _root, _persistent, _settings, _settings_unreadable
+    global _root, _persistent, _settings, _settings_unreadable, _write_error
 
     with _lock:
         if _root is not None and root is None:
@@ -104,6 +111,16 @@ def init(root=None):
             error(f"[CONFIG] Cannot create the storage directory {_root}: {e}")
         if not _persistent:
             warning(f"[CONFIG] {_root} is not a mapped volume: settings will be lost when the container is recreated.")
+        # Que se pueda escribir se prueba escribiendo, como se hará con settings.json
+        probe = os.path.join(_root, WRITE_PROBE)
+        _write_error = write_document(probe, {})
+        if _write_error is None:
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
+        else:
+            warning(f"[CONFIG] {_root} cannot be written: settings changed from Telegram will be lost on restart.")
         return _root
 
 
@@ -129,6 +146,12 @@ def is_persistent():
     return _persistent
 
 
+def write_error():
+    """Por qué no se pudo escribir en /config la última vez, o None si se pudo."""
+    init()
+    return _write_error
+
+
 # ---------------------------------------------------------------------------
 # Lectura y escritura
 # ---------------------------------------------------------------------------
@@ -148,7 +171,7 @@ def _merge(base, stored):
 
 
 def write_document(path, document):
-    """Escribe `document` de forma atómica.
+    """Escribe `document` de forma atómica. Devuelve por qué no se pudo, o None.
 
     El flush y el fsync son los que hacen atómico el rename en la práctica: sin
     ellos los metadatos pueden llegar al disco antes que el contenido, y un
@@ -168,6 +191,8 @@ def write_document(path, document):
             os.remove(temporary)
         except OSError:
             pass
+        return str(e)
+    return None
 
 
 def _document():
@@ -197,7 +222,7 @@ def _document():
 
 
 def _flush():
-    global _batch_dirty
+    global _batch_dirty, _write_error
 
     if _batch_depth:
         _batch_dirty = True
@@ -205,7 +230,7 @@ def _flush():
     if _settings_unreadable is not None:
         debug(f"[CONFIG] Not writing {SETTINGS_FILE}: it could not be read, and writing would replace it")
         return
-    write_document(settings_path(), _settings)
+    _write_error = write_document(settings_path(), _settings)
 
 
 @contextmanager

@@ -62,12 +62,16 @@ docker compose up -d
 Abre Telegram, envíale `/start` a tu bot y mándale un fichero o un enlace. Todo lo demás se ajusta desde `/settings`.
 
 > [!WARNING]
-> Mapea siempre un volumen en `/config`: ahí se guardan los ajustes. Sin él se pierden al recrear el contenedor, y el bot te lo recuerda al arrancar.
+> Mapea siempre un volumen en `/config`: ahí se guardan los ajustes y la sesión de Telegram del bot, que se mueve ahí sola si estaba en `/app`. Sin él se pierden al recrear el contenedor, y el bot te lo recuerda al arrancar. La sesión da el mismo acceso que el token: no compartas esa carpeta, ni la uses en dos contenedores a la vez.
+>
+> Si revocas el token en @BotFather, basta con poner el nuevo en `TELEGRAM_TOKEN`: el bot empieza una sesión nueva. Si Telegram deja de aceptar la sesión, el bot la aparta como `.bad` y crea otra al reiniciar. Si aun así el log sigue mostrando errores de sesión, borra `/config/state/dropbot-*.session` y reinicia.
+>
+> Monta también `/downloads`: si no es un volumen, lo descargado se queda dentro del contenedor y se pierde al recrearlo. El bot te avisa al arrancar y en `/settings`.
 
 | CLAVE                          | OBLIGATORIO | VALOR |
 |---------------------------------|:------------:|-------|
 | TELEGRAM_TOKEN                 |✅            | Token del bot |
-| TELEGRAM_ADMIN                 |✅            | ChatId del administrador (se puede obtener hablándole al bot Rose escribiendo /id). Admite múltiples administradores separados por comas. Por ejemplo 12345,54431,55944 |
+| TELEGRAM_ADMIN                 |✅            | ChatId del administrador (se puede obtener escribiéndole /id al bot Rose por privado). Admite múltiples administradores separados por comas. Por ejemplo 12345,54431,55944. Solo vale el id de una persona: el de un grupo o un canal, o el de un admin anónimo, se ignora |
 | TELEGRAM_API_HASH              |✅            | Hash de la API de Telegram (obtenido al crear tu aplicación en https://my.telegram.org) |
 | TELEGRAM_API_ID                |✅            | ID de la API de Telegram (obtenido al crear tu aplicación en https://my.telegram.org)   |
 | TELEMETRY                      |❌            | `false` para desactivar las estadísticas anónimas sin pasar por `/settings`. Lo normal es desactivarlas desde `/settings`; esto es para quien prefiera dejarlo fijado en el compose |
@@ -87,6 +91,8 @@ Aquí solo quedan las variables que el bot necesita **antes** de poder leer sus 
 
 Para descargar no hace falta ningún comando: basta con mandarle el fichero o el enlace.
 
+Ojo con los enlaces de terceros: en los directos, el bot no sigue una redirección de una web pública a tu red local, pero yt-dlp sigue las redirecciones por su cuenta, y también los enlaces que encuentra en la página. Un enlace preparado puede hacer así que el contenedor le pida algo a un equipo de tu red (el router, un NAS). La única forma de evitarlo del todo es limitar la red del contenedor: una regla del cortafuegos o una red de Docker que no le deje salir a las direcciones privadas (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` y `169.254.0.0/16`), o un proxy de salida. A cambio, el bot tampoco podrá descargar de tu red local.
+
 ## Ajustes y más
 
 <details>
@@ -98,7 +104,7 @@ Se guardan en `settings.json`, dentro de `/config`, y se aplican al momento, sin
 |:------------- | :-------------|
 | Idioma | Español o English. Por defecto español |
 | Enlaces → Descargar como | Qué hacer al recibir un enlace: preguntar si quieres vídeo o audio (por defecto), o descargar siempre como vídeo o siempre como audio |
-| Enlaces → Tras descargar | Qué hacer con lo descargado desde un enlace, incluidas las playlists completas: preguntar (por defecto), enviar y guardar, enviar y borrar del servidor, o solo guardar. No afecta a los ficheros que envías al bot desde Telegram. Los de más de 2 GB no caben en Telegram y se quedan solo en el servidor. En vídeos largos se sigue ofreciendo cancelar la conversión o enviar el original |
+| Enlaces → Tras descargar | Qué hacer con lo descargado desde un enlace, incluidas las playlists completas: preguntar (por defecto), enviar y guardar, enviar y borrar del servidor, o solo guardar. No afecta a los ficheros que envías al bot desde Telegram. Los de más de 2000 MB no caben en Telegram y se quedan solo en el servidor. En vídeos largos se sigue ofreciendo cancelar la conversión o enviar el original |
 | Enlaces → Calidad → Vídeo | Resolución máxima: máxima disponible (por defecto), 2160p, 1440p, 1080p, 720p, 480p o 360p. Cuenta el lado corto, así que un vídeo vertical de 1080×1920 es 1080p. Si un vídeo no tiene nada por debajo del límite se baja el más pequeño que haya |
 | Enlaces → Calidad → Preferir compatible con Telegram | Pide el vídeo en H.264 y el audio en AAC, que Telegram reproduce tal cual: el vídeo se envía en segundos en vez de pasar por la conversión. Como YouTube no ofrece H.264 por encima de 1080p, con esto activo un vídeo 4K se baja en 1080p. Por defecto activado |
 | Enlaces → Calidad → Formato del audio | MP3 (por defecto) o M4A, que guarda el audio AAC tal como viene, sin recodificar: suena igual que el original, pesa menos y tarda menos |
@@ -106,7 +112,7 @@ Se guardan en `settings.json`, dentro de `/config`, y se aplican al momento, sin
 | Enlaces → Calidad → Etiquetas y carátula | Mete en el audio el título, el artista y la miniatura del vídeo como portada. Por defecto activado |
 | Enlaces → Playlists | Al recibir una playlist: preguntar si la quieres entera o solo el primer vídeo (por defecto), o hacer siempre lo mismo. Y un tope de vídeos al bajarla entera (10, 25, 50, 100 o 200; por defecto sin tope) |
 | Enlaces → SponsorBlock | Quita de los vídeos de YouTube los tramos marcados por la comunidad de [SponsorBlock](https://sponsor.ajay.app): desactivado (por defecto), patrocinios, patrocinios y autopromoción, o todo lo que no es contenido (también intros, despedidas, avances, relleno y lo que no es música en los vídeos musicales) |
-| Enlaces → Tamaño máximo | Lo que pase de este tamaño no se descarga, y el bot te lo dice: 512 MB, 1, 2, 5 o 10 GB, o sin límite (por defecto). En una playlist se salta ese vídeo y se sigue con el resto |
+| Enlaces → Tamaño máximo | Lo que pase de este tamaño no se descarga, y el bot te lo dice: 512 MB, 1 GB, 2000 MB (lo más que se puede enviar por Telegram), 5 o 10 GB, o sin límite (por defecto). En una playlist se salta ese vídeo y se sigue con el resto |
 | Descargas simultáneas | Ficheros que se transfieren a la vez. Por defecto 2 |
 | Conexiones por fichero | Conexiones paralelas por fichero para acelerar la transferencia (estilo FastTelethon). 1 = método estándar de Telethon. Recomendado 4-8. Por defecto 8 |
 | Conversión de vídeo → Encoder | CPU (`libx264`, por defecto), VAAPI (Intel/AMD, recomendado), NVENC (NVIDIA) o QSV (Intel Quick Sync, experimental: necesita el runtime de Intel y no viene en la imagen). Si el encoder hardware falla, se reintenta automáticamente con `libx264`. Ver desplegable de aceleración por hardware |
@@ -175,14 +181,23 @@ Puedes comprobar qué encoder se está usando en los logs (`[CONVERSION] Encoder
 <summary>🍪 Cookies opcionales para yt-dlp</summary>
 
 Para sitios que requieren una sesión autenticada, crea `cookies/cookies.txt` y
-monta la carpeta en `/app/cookies`. El volumen debe ser escribible porque
-yt-dlp puede actualizar el cookie jar. Si el fichero no existe, DropBot
+monta la carpeta en `/app/cookies`. Puede ser de solo lectura (`:ro`): yt-dlp
+trabaja con una copia. Si se puede escribir, las cookies que renueve yt-dlp se
+guardan en el fichero, salvo que lo hayas cambiado mientras tanto: un
+`cookies.txt` recién exportado no se pisa. Si el fichero no existe, DropBot
 continúa usando yt-dlp sin cookies.
 
 ```yaml
     volumes:
       - /ruta/para/cookies:/app/cookies
 ```
+
+</details>
+
+<details>
+<summary>🔄 ¿Vienes de la 4.0.0?</summary>
+
+- `TELEGRAM_ADMIN` solo admite ids de persona. Si tenías el id de un grupo o de un canal (empiezan por `-`) para manejar el bot como admin anónimo, ahora se ignora: el bot arranca con los demás ids y te lo dice en el mensaje de arranque. Si era el único, el bot no arranca y lo explica en el log. Pon tu propio id, que te da el bot Rose si le escribes `/id` por privado (en un grupo te da el del grupo).
 
 </details>
 
@@ -196,6 +211,7 @@ continúa usando yt-dlp sin cookies.
 - Lo que descargas de enlaces ahora se pide por defecto en H.264 y AAC, que Telegram reproduce sin convertir. Se envía mucho antes, pero un vídeo 4K de YouTube llega en 1080p. Si prefieres lo de antes, desactiva *Preferir compatible con Telegram* en `/settings` → *Enlaces* → *Calidad*.
 - Los enlaces a páginas web (`.html`) ya no se descargan como si fueran un fichero: pasan por yt-dlp como cualquier otro enlace.
 - `tty: true` no hace falta. Puedes quitarlo, o dejarlo: no molesta.
+- `init: true` tampoco: la imagen ya arranca con tini, que le pasa al bot la orden de parar para que cierre limpio. Puedes quitarlo, o dejarlo: tampoco molesta.
 
 </details>
 

@@ -1,11 +1,44 @@
 import asyncio
+import time
+from collections import deque
 from telethon.errors import BadRequestError, ForbiddenError, UnauthorizedError
 from logger import debug, error, warning
 
 # Errores de Telegram que no se arreglan reintentando: el mensaje ya no existe,
 # no ha cambiado, el callback caducó, no hay permisos... Reintentarlos solo
-# bloqueaba la cola (el worker es único) unos 10 s por cada uno
-PERMANENT_ERRORS = (BadRequestError, ForbiddenError, UnauthorizedError)
+# bloqueaba la cola (el worker es único) unos 10 s por cada uno. Lo mismo con
+# un texto que no se puede codificar (un nombre de fichero que no es UTF-8)
+PERMANENT_ERRORS = (BadRequestError, ForbiddenError, UnauthorizedError, UnicodeError)
+
+
+def is_permanent(e):
+    """Si reintentar no puede arreglar el error.
+
+    Además de los de Telegram, el ValueError de Telethon cuando no sabe a quién
+    escribir: un usuario que nunca ha abierto el chat con el bot no aparece por
+    mucho que se reintente, y con un id que contuviera "429" se tomaba por un
+    rate limit y paraba la cola unos 30 s
+    """
+    return isinstance(e, PERMANENT_ERRORS) or (isinstance(e, ValueError) and "input entity" in str(e))
+
+
+# La petición de Telegram que hace cada llamada que pasa por la cola. Telethon
+# guarda el FloodWait por tipo de petición para todo el cliente: mientras dura,
+# una edición de cualquier mensaje lo lanza al momento si falta más de un
+# minuto, y si falta menos se duerme dentro de la llamada y sale al vencer
+REQUEST_KINDS = {
+    "edit": "edit",
+    "reply": "send", "respond": "send", "send_message": "send",
+    "send_file": "media",
+    "delete": "delete",
+}
+
+
+def request_kind(func):
+    """El tipo de petición de `func` (ver REQUEST_KINDS); si no está, su nombre"""
+    name = getattr(func, '__name__', str(func))
+    return REQUEST_KINDS.get(name, name)
+
 
 class TelegramMessageQueue:
     """
@@ -24,6 +57,11 @@ class TelegramMessageQueue:
             max_retries: Número máximo de reintentos por mensaje (default: 5)
         """
         self.queue = asyncio.Queue()
+        # Lo que un FloodWait obliga a esperar, por tipo de petición (ver
+        # request_kind): hasta cuándo está bloqueado cada tipo y, en el orden
+        # en que llegó, lo que espera a que venza
+        self.blocked = {}
+        self.deferred = {}
         self.delay_between_messages = delay_between_messages
         self.max_retries = max_retries
         self.running = True
@@ -43,11 +81,24 @@ class TelegramMessageQueue:
         """Procesa la cola de mensajes de forma continua"""
         while self.running:
             try:
-                # Obtener el siguiente mensaje de la cola
-                message_data = await asyncio.wait_for(self.queue.get(), timeout=1.0)
-                
-                if message_data is None:  # Señal de parada
-                    break
+                # Lo aparcado por un FloodWait sale en cuanto vence su espera;
+                # mientras, se sigue con la cola
+                message_data = self._due_deferred()
+                if message_data is None:
+                    # Obtener el siguiente mensaje de la cola
+                    message_data = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+
+                    if message_data is None:  # Señal de parada
+                        break
+
+                    # Mientras su tipo tenga algo aparcado, va detrás. Si no,
+                    # Telethon lo dormía dentro de la llamada (con el worker
+                    # parado para todos) y salía antes que lo aparcado, que al
+                    # vencer lo pisaba: una edición antigua quedaba como la última
+                    kind = request_kind(message_data['func'])
+                    if kind in self.deferred:
+                        self.deferred[kind].append(message_data)
+                        continue
 
                 await self._execute_message(message_data)
                 await asyncio.sleep(self.delay_between_messages)
@@ -57,6 +108,18 @@ class TelegramMessageQueue:
                 continue
             except Exception as e:
                 error(f"Error in message queue: {str(e)}")
+
+    def _due_deferred(self):
+        """El primer mensaje aparcado de un tipo cuya espera ya ha vencido; si no hay, None"""
+        now = time.monotonic()
+        for kind, parked in self.deferred.items():
+            if self.blocked[kind] <= now:
+                message_data = parked.popleft()
+                if not parked:
+                    del self.deferred[kind]
+                    del self.blocked[kind]
+                return message_data
+        return None
 
     async def _execute_message(self, message_data):
         """Ejecuta un mensaje con reintentos y backoff exponencial"""
@@ -68,7 +131,8 @@ class TelegramMessageQueue:
         # Log para debug
         func_name = getattr(func, '__name__', str(func))
 
-        for attempt in range(self.max_retries):
+        # Un mensaje que vuelve de estar aparcado sigue por su siguiente intento
+        for attempt in range(message_data.get('attempt', 0), self.max_retries):
             # Quien esperaba el resultado se cansó (add_message cancela el future
             # al agotar su timeout) y ya ha seguido por su cuenta: ejecutarlo
             # ahora duplicaría el mensaje
@@ -91,7 +155,7 @@ class TelegramMessageQueue:
 
                 error(f"[QUEUE] ❌ Error in {func_name}: {error_type} - {error_msg}")
 
-                if isinstance(e, PERMANENT_ERRORS):
+                if is_permanent(e):
                     if result_future and not result_future.done():
                         result_future.set_exception(e)
                     break
@@ -105,10 +169,18 @@ class TelegramMessageQueue:
                         except:
                             wait_time = (2 ** attempt) * 2
 
-                        # Esperar el tiempo que Telegram solicita
-                        warning(f"[QUEUE] FloodWaitError detected for {func_name}. Waiting {wait_time}s ({wait_time // 60} minutes) before retrying...")
-                        await asyncio.sleep(wait_time)
-                        continue
+                        # Se reintenta pasado el tiempo que Telegram solicita, pero sin
+                        # dormir aquí: el worker es único y, mientras, no salía nada,
+                        # ni a otros chats ni las ediciones, borrados o respuestas que
+                        # Telegram no estaba limitando
+                        warning(f"[QUEUE] FloodWaitError detected for {func_name}. Retrying in {wait_time}s ({wait_time // 60} minutes), the rest of the queue goes on")
+                        message_data['attempt'] = attempt + 1
+                        kind = request_kind(func)
+                        self.blocked[kind] = time.monotonic() + wait_time
+                        # El primero de su tipo: o no había nada aparcado, o
+                        # vuelve de estarlo y era el que iba delante
+                        self.deferred.setdefault(kind, deque()).appendleft(message_data)
+                        return None
                     else:
                         error(f"[QUEUE] FloodWaitError persists after {self.max_retries} attempts for {func_name}")
                 
@@ -188,12 +260,17 @@ class TelegramMessageQueue:
         await self.queue.put(None)  # Señal de parada
         if self.worker_task:
             await self.worker_task
-        # Lo que quedó en la cola ya no se va a enviar: se descarta (también la
-        # señal de parada, si el worker salió sin leerla, para que un start()
-        # posterior no se pare con ella) y se cancela el future de quien
-        # esperaba el resultado, que si no se quedaba esperando 300 s
+        # Lo que quedó en la cola, o aparcado por un FloodWait, ya no se va a
+        # enviar: se descarta (también la señal de parada, si el worker salió
+        # sin leerla, para que un start() posterior no se pare con ella) y se
+        # cancela el future de quien esperaba el resultado, que si no se quedaba
+        # esperando 300 s
+        pending = [message_data for parked in self.deferred.values() for message_data in parked]
+        self.deferred.clear()
+        self.blocked.clear()
         while not self.queue.empty():
-            message_data = self.queue.get_nowait()
+            pending.append(self.queue.get_nowait())
+        for message_data in pending:
             result_future = message_data and message_data.get('result_future')
             if result_future is not None and not result_future.done():
                 result_future.cancel()

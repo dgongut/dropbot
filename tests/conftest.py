@@ -19,10 +19,17 @@ importado (con las rutas reales) antes de que ningún fixture pueda tocarlo.
 Solo se sustituye `TelegramClient`: el resto de telethon es el de verdad,
 así que los tests comprueban los atributos reales (`DocumentAttributeAudio`
 y compañía) en lugar de mocks.
+
+Tampoco puede contar nada de la máquina que los ejecuta: qué hay montado, el
+espacio libre, un proxy en el entorno o los ficheros de un contenedor. En la
+CI de GitHub, con /tmp montado aparte, el /config de los tests salía como un
+volumen.
 """
 
 import asyncio
+import functools
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -54,6 +61,14 @@ os.environ.update({
 for _variable in ("LANGUAGE", "PARALLEL_DOWNLOADS", "FAST_CONNECTIONS", "AUTO_DOWNLOAD_FORMAT",
                   "AUTO_SEND", "FFMPEG_HW", "FFMPEG_QUALITY"):
     os.environ.pop(_variable, None)
+# Ningún test sale a la red, pero varios hablan con un servidor en 127.0.0.1:
+# con un proxy heredado del entorno (un runner propio, un portátil de empresa)
+# esas peticiones se iban al proxy. no_proxy, además, hace que urllib no mire
+# el proxy del sistema en macOS
+for _variable in ("http_proxy", "https_proxy", "all_proxy", "ftp_proxy"):
+    os.environ.pop(_variable, None)
+    os.environ.pop(_variable.upper(), None)
+os.environ["no_proxy"] = os.environ["NO_PROXY"] = "127.0.0.1,localhost"
 
 # --- Punto 2: rutas dentro de un directorio temporal -------------------------
 _SANDBOX = Path(tempfile.mkdtemp(prefix="dropbot-tests-"))
@@ -65,16 +80,52 @@ for _name in ("DOWNLOAD_PATH", "DOWNLOAD_AUDIO", "DOWNLOAD_VIDEO", "DOWNLOAD_PHO
               "DOWNLOAD_URL_AUDIO"):
     setattr(config, _name, str(_SANDBOX / _name.lower()))
 config.TEMP_DIR = str(_SANDBOX / "temp")
+# Lo que el bot busca en el contenedor fuera de esas carpetas. En la máquina de
+# los tests puede existir (la sesión de una 4.0.0, unas cookies montadas en el
+# contenedor de desarrollo): al importar dropbot, la sesión se movía al sandbox
+# y se perdía, y las cookies se colaban en los comandos de yt-dlp
+config.LEGACY_SESSION_FILE = str(_SANDBOX / "app" / "dropbot.session")
+config.YTDLP_COOKIES_FILE = str(_SANDBOX / "app" / "cookies" / "cookies.txt")
+config.HEARTBEAT_FILE = str(_SANDBOX / "heartbeat")
+config.POT_PROVIDER_DIR = str(_SANDBOX / "pot-provider")
+# Y lo que wget lee de ~/.wgetrc, que puede llevar un proxy
+os.environ["WGETRC"] = str(_SANDBOX / "wgetrc")
+(_SANDBOX / "wgetrc").touch()
+
+# Qué está montado como volumen lo dicen los tests, no la máquina: con /tmp
+# montado aparte (un tmpfs, como en la CI de GitHub, u otro disco) todo lo que
+# hay bajo tmp_path contaba como volumen, y un /config de prueba salía
+# persistente. Como si solo estuvieran montadas /url_video y /url_audio, que
+# los tests de URLs usan por separado; un test monta algo más con `volumes`
+MOUNTED = {config.DOWNLOAD_URL_VIDEO, config.DOWNLOAD_URL_AUDIO}
+
+
+def _mounted(path):
+    return path in MOUNTED
+
 
 # DOWNLOAD_PATHS se calcula al importar config a partir de las rutas de arriba,
-# asi que hay que recalcularlo despues de sustituirlas. Como si solo estuvieran
-# montadas /url_video y /url_audio, que los tests de URLs usan por separado
-_MOUNTED = {config.DOWNLOAD_URL_VIDEO, config.DOWNLOAD_URL_AUDIO}
-config.DOWNLOAD_PATHS = config.resolve_download_paths(mounted=lambda path: path in _MOUNTED)
+# asi que hay que recalcularlo despues de sustituirlas
+config.DOWNLOAD_PATHS = config.resolve_download_paths(mounted=_mounted)
+# Con el detector como argumento por defecto: quien lo pase (test_config) manda.
+# dropbot y handlers.settings lo importan por su nombre, así que tiene que estar
+# sustituido antes de que se importen
+config.downloads_persistent = functools.partial(config.downloads_persistent, mounted=_mounted)
 
 import store  # noqa: E402
+from utils import mounts  # noqa: E402
+
+# store tiene los dos importados por su nombre, y el `mounted` por defecto de
+# is_persisted ya está ligado al detector de verdad: hay que cambiar ambos
+store.is_mounted = _mounted
+store.is_persisted = functools.partial(mounts.is_persisted, mounted=_mounted)
 
 store.init(str(_SANDBOX / "config"))
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """El sandbox no se queda en /tmp después de cada pasada."""
+    shutil.rmtree(_SANDBOX, ignore_errors=True)
 
 
 # Cada `@bot.on(evento)` que se evalúe al importar deja aquí (evento, función)
@@ -268,6 +319,31 @@ def config_dir(tmp_path):
     store.init(str(root))
     yield root
     store.init(str(_SANDBOX / "config"))
+
+
+@pytest.fixture
+def volumes():
+    """Las rutas que el test da por montadas como volumen, solo durante el test.
+
+    Tras añadir una hay que volver a llamar a lo que lo mira al arrancar, como
+    `store.init`.
+    """
+    before = set(MOUNTED)
+    yield MOUNTED
+    MOUNTED.clear()
+    MOUNTED.update(before)
+
+
+@pytest.fixture(autouse=True)
+def plenty_of_disk(monkeypatch):
+    """Espacio libre de sobra, salvo que el test diga otra cosa.
+
+    El de verdad depende del disco de la máquina: en un tmp con menos de
+    100 MiB libres (un tmpfs pequeño, un disco de CI casi lleno) no se extraía
+    ningún comprimido. Los tests de espacio lo vuelven a sustituir.
+    """
+    monkeypatch.setattr(shutil, "disk_usage",
+                        lambda path: SimpleNamespace(total=2**41, used=0, free=2**40))
 
 
 @pytest.fixture

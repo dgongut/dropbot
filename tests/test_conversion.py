@@ -7,11 +7,14 @@ en software nunca salta (visto con un WebM que VAAPI no pudo decodificar).
 
 import ast
 import asyncio
+import contextlib
 import inspect
 import itertools
 import sys
 
 import pytest
+
+from proc_helpers import wait_until
 
 
 def test_un_ffmpeg_verboso_que_falla_no_bloquea(dropbot, run_async):
@@ -108,11 +111,46 @@ def _fake_conversion(dropbot, monkeypatch):
     async def metadata(path):
         return 10, 640, 480
 
+    # Sin plan, como con el fichero de ceros, pero sin lanzar el ffprobe de la
+    # máquina: en la CI tardaba en arrancar más que lo que se esperaba aquí
+    async def probe(path):
+        return None
+
     monkeypatch.setattr(dropbot, "get_video_metadata", metadata)
+    monkeypatch.setattr(dropbot, "probe_media", probe)
     monkeypatch.setattr(
         dropbot, "build_ffmpeg_conversion_command",
         lambda *args, **kwargs: [sys.executable, "-c", FAKE_FFMPEG, "-c:v", "fake"],
     )
+
+
+async def _started_conversion(dropbot):
+    """El id de la conversión en marcha, en cuanto ha lanzado ffmpeg."""
+    ids = await wait_until(
+        lambda: [k for k in dropbot.active_tasks if str(k).startswith("conv_")],
+        message="la conversión no ha llegado a lanzar ffmpeg",
+    )
+    return ids[0]
+
+
+async def _until_done(task, proc, timeout=30):
+    """El resultado de la conversión, o falla (sin colgarse) si no acaba.
+
+    Sin asyncio.wait_for(task): al vencer cancela la tarea y espera a que
+    acabe, y una conversión que no ha parado ffmpeg está en proc.wait(), que
+    no vuelve. El test se quedaba colgado en vez de fallar.
+    """
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if task not in done:
+        # Ni cancelándola acabaría: espera a ffmpeg, y asyncio no ve que ha
+        # muerto hasta que alguien lee lo que dejó en la tubería. Si el bot
+        # sigue leyéndola (RuntimeError), ya le llega el final él solo
+        proc.kill()
+        with contextlib.suppress(RuntimeError, TimeoutError):
+            await asyncio.wait_for(proc.stdout.read(), 5)
+        await asyncio.wait({task}, timeout=5)
+        pytest.fail("la conversión no ha terminado: ffmpeg sigue vivo o nadie lo para")
+    return task.result()
 
 
 def test_cancelar_corta_la_conversion_y_mata_ffmpeg(quiet_bot, media_file, run_async, monkeypatch):
@@ -123,16 +161,11 @@ def test_cancelar_corta_la_conversion_y_mata_ffmpeg(quiet_bot, media_file, run_a
         task = asyncio.ensure_future(
             dropbot.convert_video_to_telegram_compatible(media_file("v.mkv"))
         )
-        for _ in range(200):
-            ids = [k for k in dropbot.active_tasks if str(k).startswith("conv_")]
-            if ids:
-                break
-            await asyncio.sleep(0.01)
-        conversion_id = ids[0]
+        conversion_id = await _started_conversion(dropbot)
         proc = dropbot.active_tasks[conversion_id]
         # Solo la marca, sin terminar el proceso: el bucle tiene que pararlo
         dropbot.cancelled_conversions.add(conversion_id)
-        result = await asyncio.wait_for(task, timeout=10)
+        result = await _until_done(task, proc)
         return result, proc, conversion_id
 
     result, proc, conversion_id = run_async(scenario())
@@ -185,12 +218,7 @@ def test_un_boton_de_antes_de_reiniciar_no_corta_la_conversion_de_ahora(
         task = asyncio.ensure_future(
             dropbot.convert_video_to_telegram_compatible(media_file("v.mkv"))
         )
-        for _ in range(200):
-            ids = [k for k in dropbot.active_tasks if str(k).startswith("conv_")]
-            if ids:
-                break
-            await asyncio.sleep(0.01)
-        conversion_id = ids[0]
+        conversion_id = await _started_conversion(dropbot)
         proc = dropbot.active_tasks[conversion_id]
 
         await getattr(dropbot, handler)(make_event(groups=(old_button.encode(),)))
@@ -202,7 +230,7 @@ def test_un_boton_de_antes_de_reiniciar_no_corta_la_conversion_de_ahora(
         )
 
         dropbot.cancelled_conversions.add(conversion_id)
-        await asyncio.wait_for(task, timeout=10)
+        await _until_done(task, proc)
         return conversion_id, untouched
 
     conversion_id, untouched = run_async(scenario())

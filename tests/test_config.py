@@ -304,14 +304,26 @@ class TestCarpetas:
         assert config.downloads_persistent(mounted=lambda path: path == "/mnt/disco") is True
 
 
+def _run_dropbot(env, tmp_path):
+    """`python dropbot.py` con el entorno dado y su /config en tmp_path.
+
+    El subproceso no pasa por conftest, y antes de mirar las variables ya pone
+    /config al día: como root, o dentro del contenedor, escribía en el /config
+    de la máquina.
+    """
+    code = ("import runpy, sys, store; store.CONFIG_ROOT = sys.argv[1]; "
+            "runpy.run_path('dropbot.py', run_name='__main__')")
+    return subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path / "config")],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
+    )
+
+
 class TestArranque:
-    def test_sin_token_aborta_con_mensaje(self):
+    def test_sin_token_aborta_con_mensaje(self, tmp_path):
         env = {"TELEGRAM_ADMIN": "999", "TELEGRAM_API_ID": "1", "TELEGRAM_API_HASH": "testhash",
                "TELEMETRY": "false", "PATH": "/usr/bin:/bin"}
-        result = subprocess.run(
-            [sys.executable, "dropbot.py"],
-            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
-        )
+        result = _run_dropbot(env, tmp_path)
 
         assert result.returncode != 0
         assert "TELEGRAM_TOKEN" in result.stdout + result.stderr
@@ -320,7 +332,7 @@ class TestArranque:
         ("111,-1001234567890", "-1001234567890"),
         ("111, 1087968824", "1087968824"),
     ])
-    def test_un_id_que_no_es_de_una_persona_en_telegram_admin_se_ignora_con_mensaje(self, admins, wrong):
+    def test_un_id_que_no_es_de_una_persona_en_telegram_admin_se_ignora_con_mensaje(self, admins, wrong, tmp_path):
         """Con el id de un grupo, cualquier admin anónimo de ese grupo pasaba por
         admin y podía mandar ficheros y enlaces al servidor. El espacio tras la
         coma colaba también al admin anónimo de la Bot API. Pero parar el bot
@@ -331,24 +343,18 @@ class TestArranque:
         env = {"TELEGRAM_TOKEN": "123456:test-token", "TELEGRAM_ADMIN": admins,
                "TELEGRAM_API_ID": "abc", "TELEGRAM_API_HASH": "testhash",
                "TELEMETRY": "false", "PATH": "/usr/bin:/bin"}
-        result = subprocess.run(
-            [sys.executable, "dropbot.py"],
-            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
-        )
+        result = _run_dropbot(env, tmp_path)
 
         lines = (result.stdout + result.stderr).splitlines()
         assert any("[CONFIG]" in line and "TELEGRAM_ADMIN" in line and wrong in line for line in lines)
         assert any("[CONFIG]" in line and "TELEGRAM_API_ID" in line for line in lines)
 
-    def test_si_en_telegram_admin_no_hay_ningun_id_de_persona_aborta_con_mensaje(self):
+    def test_si_en_telegram_admin_no_hay_ningun_id_de_persona_aborta_con_mensaje(self, tmp_path):
         """Ignorando el del grupo no queda nadie que pueda usar el bot."""
         env = {"TELEGRAM_TOKEN": "123456:test-token", "TELEGRAM_ADMIN": "-1001234567890",
                "TELEGRAM_API_ID": "abc", "TELEGRAM_API_HASH": "testhash",
                "TELEMETRY": "false", "PATH": "/usr/bin:/bin"}
-        result = subprocess.run(
-            [sys.executable, "dropbot.py"],
-            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
-        )
+        result = _run_dropbot(env, tmp_path)
 
         lines = (result.stdout + result.stderr).splitlines()
         assert result.returncode != 0
@@ -364,17 +370,14 @@ class TestArranque:
         ("TELEGRAM_API_ID", "abc"),
         ("TELEGRAM_API_HASH", " "),
     ])
-    def test_una_variable_de_telegram_vacia_o_mal_aborta_diciendo_cual(self, variable, value):
+    def test_una_variable_de_telegram_vacia_o_mal_aborta_diciendo_cual(self, variable, value, tmp_path):
         """El compose del README las trae vacías para rellenarlas, y vacías
         pasaban la comprobación: sin token, Telethon lo pedía por teclado y el
         contenedor se reiniciaba en bucle; sin admin, el bot no era de nadie."""
         env = {"TELEGRAM_TOKEN": "123456:test-token", "TELEGRAM_ADMIN": "999",
                "TELEGRAM_API_ID": "1", "TELEGRAM_API_HASH": "testhash",
                "TELEMETRY": "false", "PATH": "/usr/bin:/bin", variable: value}
-        result = subprocess.run(
-            [sys.executable, "dropbot.py"],
-            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
-        )
+        result = _run_dropbot(env, tmp_path)
 
         # Un traceback también nombraría la variable, en la línea de código
         lines = (result.stdout + result.stderr).splitlines()

@@ -459,7 +459,7 @@ class TestSubidaRapidaOEstandar:
             status.gate = asyncio.Event()
             sent = await asyncio.wait_for(dropbot._send_file_fast(
                 42, path, "p.bin", [], None, False, callback
-            ), timeout=5)
+            ), timeout=30)
             status.gate.set()
             for _ in range(3):
                 await asyncio.sleep(0)
@@ -722,7 +722,7 @@ class TestProgreso:
 
         async def go():
             status.gate = asyncio.Event()
-            await asyncio.wait_for(callback(10, 100), timeout=5)
+            await asyncio.wait_for(callback(10, 100), timeout=30)
             await asyncio.sleep(0)
             callback.cancel_pending()
 
@@ -747,7 +747,7 @@ class TestProgreso:
             for _ in range(3):
                 await asyncio.sleep(0)
 
-        run_async(asyncio.wait_for(go(), timeout=5))
+        run_async(asyncio.wait_for(go(), timeout=30))
         assert len(status.attempts) == 2
         assert len(status.edits) == 1 and "100.0" in status.edits[0]
 
@@ -760,7 +760,7 @@ class TestProgreso:
 
         async def go():
             status.gate = asyncio.Event()
-            await asyncio.wait_for(chunk(callback, 100, 100), timeout=5)
+            await asyncio.wait_for(chunk(callback, 100, 100), timeout=30)
             callback.cancel_pending()
             status.gate.set()
             for _ in range(3):

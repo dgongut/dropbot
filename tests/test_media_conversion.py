@@ -729,7 +729,7 @@ def test_un_fallo_inesperado_con_ffmpeg_en_marcha_lo_mata(
     async def scenario():
         result = await dropbot.convert_video_to_telegram_compatible(source)
         ffmpeg = spawned[-1]
-        code = await asyncio.wait_for(ffmpeg.wait(), timeout=5)
+        code = await asyncio.wait_for(ffmpeg.wait(), timeout=30)
         return result, code
 
     result, code = run_async(scenario())
@@ -900,7 +900,7 @@ def test_el_drenado_de_stderr_acumula_todo_y_termina(dropbot, run_async):
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         chunks = []
-        await asyncio.wait_for(dropbot.accumulate_process_stderr(proc, chunks), timeout=10)
+        await asyncio.wait_for(dropbot.accumulate_process_stderr(proc, chunks), timeout=30)
         await proc.wait()
         return b"".join(chunks)
 
@@ -941,6 +941,6 @@ def test_parar_un_proceso_vivo_lo_mata(dropbot, run_async):
     async def scenario():
         proc = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(30)")
         dropbot._stop_process(proc)
-        return await asyncio.wait_for(proc.wait(), timeout=10)
+        return await asyncio.wait_for(proc.wait(), timeout=30)
 
     assert run_async(scenario()) != 0

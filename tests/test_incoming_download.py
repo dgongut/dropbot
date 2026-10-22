@@ -21,6 +21,7 @@ from telethon.errors import InvalidBufferError
 from telethon.tl import types
 from telethon.tl.functions.upload import GetFileRequest
 
+from proc_helpers import wait_until
 from utils.file_helpers import partial_name
 from utils.limiter import ResizableLimiter
 
@@ -123,19 +124,6 @@ def env(quiet_bot, tmp_path, monkeypatch, config_dir):
     e.files = lambda folder: sorted(os.listdir(folder))
     e.temp_files = lambda: sorted(os.listdir(temp))
     return e
-
-
-async def wait_until(condition, timeout=2):
-    """Espera, como mucho `timeout` segundos, a que se cumpla `condition`.
-
-    El temporal se abre en un hilo (asyncio.to_thread): un número fijo de
-    vueltas del bucle no siempre bastaba para que la descarga empezara, y el
-    test fallaba de vez en cuando.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while not condition() and loop.time() < deadline:
-        await asyncio.sleep(0.001)
 
 
 def settings_put(dropbot, key, value):
@@ -356,7 +344,7 @@ class TestDescargaCorrecta:
             gate = asyncio.Event()
             await asyncio.wait_for(
                 env.dropbot.download_media(_event(make_event, file_message("a.pdf"))),
-                timeout=5,
+                timeout=30,
             )
             gate.set()
             for _ in range(3):
@@ -560,9 +548,12 @@ class TestDescargaParada:
 
     @pytest.fixture(autouse=True)
     def short_stall(self, env, monkeypatch):
-        monkeypatch.setattr(env.dropbot, "DOWNLOAD_STALL_TIMEOUT", 0.2)
+        # Entre dos avances hay escrituras y aperturas en hilos: con 0,2 s, un
+        # parón de la máquina cortaba la descarga que sí avanzaba, o el intento
+        # se cortaba antes de llegar a pedírselo a Telegram
+        monkeypatch.setattr(env.dropbot, "DOWNLOAD_STALL_TIMEOUT", 1)
 
-    def _slow(self, env, monkeypatch, chunks=25, pause=0.02):
+    def _slow(self, env, monkeypatch, chunks=60, pause=0.02):
         """Una línea lenta: un trozo cada `pause` s, y en total más que el plazo."""
         async def download(message, file=None, progress_callback=None):
             for done in range(1, chunks + 1):
@@ -627,6 +618,9 @@ class TestDescargaParada:
     def test_si_se_para_en_todos_los_intentos_lo_dice_y_limpia(
         self, env, sent_messages, make_event, run_async, monkeypatch
     ):
+        # Cada intento parado espera el plazo entero: con dos ya se ve que se
+        # agotan todos, y con los de config eran 3 s
+        monkeypatch.setattr(env.dropbot, "MAX_DOWNLOAD_RETRIES", 2)
         calls = self._stalls(env, monkeypatch, times=env.dropbot.MAX_DOWNLOAD_RETRIES)
 
         run_async(env.dropbot.download_media(_event(make_event, file_message("a.mkv"))))
@@ -768,13 +762,14 @@ class TestReferenciaCaducada:
     def test_se_vuelve_a_pedir_el_mensaje_y_se_descarga_sin_esperar(
         self, env, make_event, run_async, monkeypatch
     ):
-        monkeypatch.setattr(env.dropbot, "RETRY_DELAY_SECONDS", 30)
+        # Si esperara entre intentos se vería: el plazo queda muy por debajo
+        monkeypatch.setattr(env.dropbot, "RETRY_DELAY_SECONDS", 300)
         seen = self._downloads(env, monkeypatch, [errors.FileReferenceExpiredError(request=GET_FILE)])
         fresh = photo_file_message()
         asked = self._message_again(env, monkeypatch, fresh)
         event = _event(make_event, photo_file_message(), event_id=70)
 
-        run_async(asyncio.wait_for(env.dropbot.download_media(event), timeout=5))
+        run_async(asyncio.wait_for(env.dropbot.download_media(event), timeout=30))
 
         assert asked == [(event.chat_id, 70)]
         assert seen[1] is fresh
@@ -826,11 +821,11 @@ class TestReferenciaCaducada:
         async def scenario():
             await env.dropbot.handle_files(event)
             task = env.dropbot.active_tasks["42_73"]
-            await asyncio.wait_for(asked.wait(), timeout=5)
+            await asyncio.wait_for(asked.wait(), timeout=30)
             cancel = button_data(sent_messages[0][2]["buttons"][0])
             await env.dropbot.cancel_download(make_event(data=cancel))
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, timeout=5)
+                await asyncio.wait_for(task, timeout=30)
 
         run_async(scenario())
 
@@ -916,7 +911,7 @@ class TestCancelacion:
             cancel = button_data(sent_messages[0][2]["buttons"][0])
             await env.dropbot.cancel_download(make_event(data=cancel))
             env.telegram.hang.set()
-            await asyncio.wait(downloads, timeout=10)
+            await asyncio.wait(downloads, timeout=30)
             return cancel
 
         cancel = run_async(scenario())
@@ -1074,7 +1069,10 @@ class TestLimitedDownload:
             release = asyncio.Event()
             tasks = [asyncio.create_task(env.dropbot.limited_download(
                 _event(make_event, file_message(f"f{i}.pdf"), 100 + i))) for i in range(5)]
-            await wait_until(lambda: running[0] == 2)
+            # El temporal se abre en un hilo: no basta con unas vueltas del bucle.
+            # Con >= y no ==: si deja pasar a más, el assert de abajo lo dice
+            # en el acto; con == se pasaba de largo y esperaba el plazo entero
+            await wait_until(lambda: running[0] >= 2)
             for _ in range(50):
                 await asyncio.sleep(0)
             assert running[0] == 2, "solo dos a la vez"
@@ -1107,14 +1105,14 @@ class TestLimitedDownload:
             release = asyncio.Event()
             tasks = [asyncio.create_task(env.dropbot.limited_download(
                 _event(make_event, file_message(f"g{i}.pdf"), 200 + i))) for i in range(4)]
-            await wait_until(lambda: running[0] == 1)
+            await wait_until(lambda: running[0] >= 1)
             for _ in range(30):
                 await asyncio.sleep(0)
             assert running[0] == 1
 
             settings_put(env.dropbot, "downloads.parallel", 3)
             await env.dropbot.apply_setting("downloads.parallel")
-            await wait_until(lambda: running[0] == 3)
+            await wait_until(lambda: running[0] >= 3)
             for _ in range(30):
                 await asyncio.sleep(0)
             assert running[0] == 3
@@ -1149,7 +1147,7 @@ class TestLimitedDownload:
             await env.dropbot.limited_download(_event(make_event, file_message("a.pdf"), 300))
             await asyncio.wait_for(
                 env.dropbot.limited_download(_event(make_event, file_message("b.pdf"), 301)),
-                timeout=5,
+                timeout=30,
             )
 
         run_async(scenario())
@@ -1250,7 +1248,7 @@ class TestEnCola:
             assert one_slot.started == ["a.pdf"]
 
             one_slot.release.set()
-            await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+            await asyncio.wait_for(asyncio.gather(first, second), timeout=30)
 
         run_async(scenario())
 

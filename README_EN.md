@@ -310,4 +310,6 @@ without installing anything, inside the development image (`docker compose build
 docker run --rm --entrypoint sh -v "$PWD":/src:ro -w /src dropbot-dropbot -c "pip install -q --break-system-packages -r requirements-dev.txt && python3 -m pytest -q -p no:cacheprovider"
 ```
 
-With `--cov=. --cov-report=term-missing` you see what is left uncovered.
+With `--cov=. --cov-report=term-missing` you see what is left uncovered. The
+fake yt-dlp and wget run from pytest's temporary directory: if `/tmp` is
+mounted `noexec`, give it another one with `--basetemp`.

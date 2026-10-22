@@ -310,4 +310,6 @@ instalar nada, dentro de la imagen de desarrollo (`docker compose build`):
 docker run --rm --entrypoint sh -v "$PWD":/src:ro -w /src dropbot-dropbot -c "pip install -q --break-system-packages -r requirements-dev.txt && python3 -m pytest -q -p no:cacheprovider"
 ```
 
-Con `--cov=. --cov-report=term-missing` se ve qué queda sin cubrir.
+Con `--cov=. --cov-report=term-missing` se ve qué queda sin cubrir. Los yt-dlp y
+wget falsos se ejecutan desde el directorio temporal de pytest: si `/tmp` está
+montado con `noexec`, hay que darle otro con `--basetemp`.

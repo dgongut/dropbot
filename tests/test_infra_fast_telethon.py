@@ -113,9 +113,13 @@ def _document(size, dc_id=2):
                           mime_type="video/mp4", size=size, dc_id=dc_id, attributes=[])
 
 
-async def _settle(coro, seconds=1):
+async def _settle(coro, seconds=15):
     """Lanza `coro` y devuelve su tarea ya terminada, o falla si sigue en
-    marcha pasados `seconds` en vez de dejar el test colgado."""
+    marcha pasados `seconds` en vez de dejar el test colgado.
+
+    Vuelve en cuanto acaba: el plazo es para una máquina lenta, porque las
+    escrituras y lecturas van en hilos, y lo que se cuelga no acaba nunca.
+    """
     task = asyncio.ensure_future(coro)
     await asyncio.wait({task}, timeout=seconds)
     assert task.done(), "la transferencia se ha quedado parada"
@@ -260,7 +264,7 @@ class TestDescarga:
 
         async def scenario():
             await asyncio.wait_for(
-                fast_telethon.download_file(client, _document(size), io.BytesIO(), 1), timeout=0.5)
+                fast_telethon.download_file(client, _document(size), io.BytesIO(), 1), timeout=15)
 
         with pytest.raises(ValueError, match="Incomplete"):
             run_async(scenario())
@@ -285,7 +289,7 @@ class TestDescarga:
         client = FakeClient(_payload(size), lost_part=5)
 
         task = run_async(_settle(
-            fast_telethon.download_file(client, _document(size), io.BytesIO(), 8), seconds=2))
+            fast_telethon.download_file(client, _document(size), io.BytesIO(), 8)))
 
         with pytest.raises(TimeoutError):
             task.result()
@@ -441,7 +445,7 @@ class TestSubida:
         client = FakeClient(lost_part=3)
 
         task = run_async(_settle(
-            fast_telethon.upload_file(client, io.BytesIO(_payload(size)), size, 8), seconds=2))
+            fast_telethon.upload_file(client, io.BytesIO(_payload(size)), size, 8)))
 
         with pytest.raises(TimeoutError):
             task.result()

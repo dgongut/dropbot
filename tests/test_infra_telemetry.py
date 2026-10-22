@@ -454,7 +454,7 @@ class TestHilo:
         client.start()
         first = client._thread
         client.start()
-        first.join(timeout=1)
+        first.join(timeout=15)
 
         assert client._thread is first
         assert runs == [1]

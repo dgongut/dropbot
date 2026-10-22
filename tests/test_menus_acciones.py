@@ -684,7 +684,7 @@ class TestDescargar:
             while manage.sending_files:
                 await asyncio.sleep(0.01)
 
-        run_async(asyncio.wait_for(scenario(), 5))
+        run_async(asyncio.wait_for(scenario(), 30))
 
         [sent] = pipeline.sent
         assert sent["path"] == str(target)

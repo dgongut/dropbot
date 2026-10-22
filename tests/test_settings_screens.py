@@ -76,7 +76,16 @@ class TestPantallas:
         text, _ = screens.build_main()
         # El /config de los tests es un directorio temporal, no un volumen
         assert not store.is_persistent()
-        assert "/config" in text
+        assert screens.get_text("settings_not_persistent") in text
+
+    def test_con_volumen_no_avisa(self, screens, config_dir, volumes):
+        volumes.add(str(config_dir))
+        store.init(str(config_dir))
+
+        text, _ = screens.build_main()
+
+        assert store.is_persistent()
+        assert screens.get_text("settings_not_persistent") not in text
 
 
 class TestGuardar:

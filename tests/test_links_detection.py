@@ -24,7 +24,7 @@ from telethon.extensions import markdown
 import settings
 from button_data import button_data
 from conftest import FORUM_TOPIC
-from proc_helpers import alive
+from proc_helpers import alive, install_fake, wait_until
 from translations import load_locale
 
 
@@ -56,8 +56,7 @@ def fake_ytdlp(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_YTDLP_LOG", str(log))
 
     def install(stdout="", code=0, stderr=""):
-        script = bindir / "yt-dlp"
-        script.write_text(f"#!{sys.executable}\n" + textwrap.dedent(f'''
+        install_fake(bindir, "yt-dlp", f"#!{sys.executable}\n" + textwrap.dedent(f'''
             import json, os, sys
             with open(os.environ["FAKE_YTDLP_LOG"], "a") as log:
                 log.write(json.dumps(sys.argv[1:]) + "\\n")
@@ -72,7 +71,6 @@ def fake_ytdlp(tmp_path, monkeypatch):
                     handle.write("# renovada\\n")
             sys.exit({code})
         '''))
-        script.chmod(0o755)
 
     install.calls = lambda: [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     return install
@@ -99,16 +97,11 @@ def hanging_ytdlp(tmp_path, monkeypatch):
     pids = tmp_path / "ytdlp-pids"
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FAKE_YTDLP_PIDS", str(pids))
-    script = bindir / "yt-dlp"
-    script.write_text(f"#!{sys.executable}\n{HANGING_YTDLP}")
-    script.chmod(0o755)
+    install_fake(bindir, "yt-dlp", f"#!{sys.executable}\n{HANGING_YTDLP}")
 
     async def started():
-        for _ in range(500):
-            if pids.exists():
-                return [int(pid) for pid in pids.read_text().split()]
-            await asyncio.sleep(0.01)
-        raise AssertionError("el yt-dlp falso no llegó a arrancar")
+        await wait_until(pids.exists, message="el yt-dlp falso no llegó a arrancar")
+        return [int(pid) for pid in pids.read_text().split()]
 
     return started
 
@@ -234,7 +227,9 @@ class TestDescargaDirectaPorCabeceras:
         release = threading.Event()
 
         def dripping_head(session, url, **kwargs):
-            release.wait(5)
+            # Mucho más que lo que se le da al análisis: si se quedara con el
+            # executor, se vería por mucho que tarde la máquina
+            release.wait(60)
             raise requests.ConnectionError("goteo")
 
         monkeypatch.setattr(dropbot.requests.Session, "head", dripping_head)
@@ -244,18 +239,21 @@ class TestDescargaDirectaPorCabeceras:
             # Un executor de un solo hilo: el HEAD no puede quedarse con él
             asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
             started = time.monotonic()
-            result = await dropbot.is_direct_download_url("https://evil.example/descarga")
-            copied = await asyncio.wait_for(asyncio.to_thread(lambda: "copiado"), 2)
-            return result, copied, time.monotonic() - started
+            try:
+                result = await dropbot.is_direct_download_url("https://evil.example/descarga")
+                copied = await asyncio.wait_for(asyncio.to_thread(lambda: "copiado"), 10)
+                return result, copied, time.monotonic() - started
+            finally:
+                # Aquí y no al volver de run_async: asyncio.run espera a los
+                # hilos del executor al cerrar, y con el HEAD retenido el test
+                # tardaba el minuto entero en fallar
+                release.set()
 
-        try:
-            result, copied, elapsed = run_async(scenario())
-        finally:
-            release.set()
+        result, copied, elapsed = run_async(scenario())
 
         assert result == (False, None, None, None, None)
         assert copied == "copiado"
-        assert elapsed < 2
+        assert elapsed < 10
 
     @pytest.mark.parametrize("ctype,kind,folder", [
         ("video/mp4", "video", "video"),
@@ -379,12 +377,15 @@ class TestDetectPlaylist:
     ):
         """Su timeout es por lectura: un servidor que soltaba un byte de vez en
         cuando lo tenía esperando para siempre, y cada reintento sumaba otro."""
-        monkeypatch.setattr(dropbot, "YTDLP_DETECT_TIMEOUT", 0.5)
+        # Lo bastante para que al yt-dlp falso le dé tiempo a arrancar y
+        # lanzar su hijo aunque la máquina vaya lenta (un arranque de Python y
+        # un fork). Este test lo espera entero también cuando pasa
+        monkeypatch.setattr(dropbot, "YTDLP_DETECT_TIMEOUT", 2)
 
         async def scenario():
             task = asyncio.create_task(dropbot.detect_playlist("https://x/goteo"))
             pids = await hanging_ytdlp()
-            done, _ = await asyncio.wait([task], timeout=10)
+            done, _ = await asyncio.wait([task], timeout=30)
             if not done:
                 task.cancel()
             return done, task, pids
@@ -478,12 +479,13 @@ class TestDetectContentType:
     def test_si_ytdlp_no_acaba_es_desconocido_sin_dejarlo_vivo(
         self, dropbot, hanging_ytdlp, run_async, monkeypatch
     ):
-        monkeypatch.setattr(dropbot, "YTDLP_DETECT_TIMEOUT", 0.5)
+        # Como en el de detect_playlist
+        monkeypatch.setattr(dropbot, "YTDLP_DETECT_TIMEOUT", 2)
 
         async def scenario():
             task = asyncio.create_task(dropbot.detect_content_type("https://x/goteo"))
             pids = await hanging_ytdlp()
-            done, _ = await asyncio.wait([task], timeout=10)
+            done, _ = await asyncio.wait([task], timeout=30)
             if not done:
                 task.cancel()
             return done, task, pids
@@ -887,7 +889,11 @@ class TestAlRecibirUnEnlace:
                 await asyncio.sleep(0)
             cancel = _all_buttons(sent_messages[:1])[0]
             await dropbot.cancel_download(make_event(event_id=9201, data=cancel))
-            await asyncio.wait(handlers, timeout=0.5)
+            # El del privado tiene que acabar; al del grupo se le dan unas
+            # vueltas del bucle por si también lo hubiera parado
+            await asyncio.wait(handlers[:1], timeout=15)
+            for _ in range(20):
+                await asyncio.sleep(0)
             states = [handler.cancelled() for handler in handlers]
             for handler in handlers:
                 handler.cancel()
@@ -991,7 +997,7 @@ class TestAlRecibirUnEnlace:
             handler = asyncio.create_task(dropbot.handle_url_link(event))
             pids = await hanging_ytdlp()
             await dropbot.cancel_download(make_event(event_id=9310, data=b"cancel:42_310"))
-            done, _ = await asyncio.wait([handler], timeout=10)
+            done, _ = await asyncio.wait([handler], timeout=30)
             if not done:
                 handler.cancel()
             return done, handler, pids
@@ -1022,7 +1028,7 @@ class TestAlRecibirUnEnlace:
 
         def slow_head(session, url, **kwargs):
             started.set()
-            release.wait(5)
+            release.wait(60)
             raise dropbot.requests.ConnectionError("sin respuesta")
 
         async def playlist(url):
@@ -1044,7 +1050,7 @@ class TestAlRecibirUnEnlace:
             while not started.is_set():
                 await asyncio.sleep(0.01)
             await dropbot.cancel_download(make_event(event_id=9311, data=b"cancel:42_311"))
-            done, _ = await asyncio.wait([handler], timeout=5)
+            done, _ = await asyncio.wait([handler], timeout=15)
             release.set()
             if not done:
                 handler.cancel()

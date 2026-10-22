@@ -12,7 +12,7 @@ import signal
 import sqlite3
 import stat
 import sys
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +29,7 @@ from telethon.sessions import SQLiteSession
 import basic
 import migration
 from conftest import ADMIN_ID, FORUM_CHAT_ID, FORUM_TOPIC, forum_reply_to
+from proc_helpers import wait_until
 from utils import telegram_helpers
 
 from button_data import button_data
@@ -1056,16 +1057,15 @@ class TestMain:
                     # Como Telethon: disconnect() cancela los handlers en marcha
                     state.handler.cancel()
                     await asyncio.gather(state.handler, return_exceptions=True)
-            # Ya ha vuelto a conectar: la conversión termina
+            # Ya ha vuelto a conectar: la conversión termina. Si no llega a
+            # enviarse, lo dice la comprobación de después
             state.finish.set()
-            for _ in range(100):
-                if uploaded:
-                    break
-                await asyncio.sleep(0.01)
+            with suppress(AssertionError):
+                await wait_until(lambda: uploaded)
 
         dropbot.bot.run_until_disconnected = run_until_disconnected
 
-        run_async(asyncio.wait_for(dropbot.main(), timeout=5))
+        run_async(asyncio.wait_for(dropbot.main(), timeout=30))
 
         assert started[-3:] == ["run", "connect", "run"]
         assert uploaded == [path]
@@ -1155,7 +1155,7 @@ class TestMain:
 
         dropbot.bot.start = offline_start
 
-        run_async(asyncio.wait_for(dropbot.main(), timeout=5))
+        run_async(asyncio.wait_for(dropbot.main(), timeout=30))
 
         assert started == ["start"]
 
@@ -1169,7 +1169,7 @@ class TestMain:
 
         dropbot.bot.connect = offline_connect
 
-        run_async(asyncio.wait_for(dropbot.main(), timeout=5))
+        run_async(asyncio.wait_for(dropbot.main(), timeout=30))
 
         assert started[-2:] == ["run", "connect"]
 
@@ -1189,7 +1189,7 @@ class TestMain:
         bot.run_until_disconnected = online
         bot.disconnect = disconnect
 
-        run_async(asyncio.wait_for(dropbot.main(), timeout=5))
+        run_async(asyncio.wait_for(dropbot.main(), timeout=30))
 
         assert started[-2:] == ["run", "disconnect"]
 
@@ -1399,8 +1399,12 @@ class TestProveedorPoToken:
         assert str(dropbot.POT_PROVIDER_PORT) in args
         assert pot.pings == [f"http://127.0.0.1:{dropbot.POT_PROVIDER_PORT}/ping"]
 
-    def test_si_deno_muere_al_arrancar_devuelve_none(self, dropbot, pot, run_async):
+    def test_si_deno_muere_al_arrancar_devuelve_none(self, dropbot, pot, run_async, monkeypatch):
         pot.script = "exit 3"
+        # Con un límite muy por encima de lo que se mira, que no agota el tiempo
+        # se ve aunque la máquina tarde en recoger el proceso; y si lo agotara,
+        # el test falla en 20 s y no en un minuto
+        monkeypatch.setattr(dropbot, "POT_PROVIDER_STARTUP_TIMEOUT", 20)
 
         async def scenario():
             started = asyncio.get_running_loop().time()
@@ -1410,13 +1414,16 @@ class TestProveedorPoToken:
         result, elapsed = run_async(scenario())
 
         assert result is None
-        assert elapsed < 2.5, "no tiene que agotar el tiempo si el proceso ya murió"
+        assert elapsed < 10, "no tiene que agotar el tiempo si el proceso ya murió"
 
     def test_si_no_responde_a_tiempo_devuelve_el_proceso_vivo(
         self, dropbot, pot, run_async, monkeypatch
     ):
         """main() lo necesita para pararlo al salir: si no, quedaría huérfano."""
-        monkeypatch.setattr(dropbot, "POT_PROVIDER_STARTUP_TIMEOUT", 0.3)
+        # El límite va con el reloj de verdad, y en él tienen que caber al menos
+        # dos preguntas en un hilo: cada vuelta es un salto a un hilo y una
+        # espera de 0,02 s. Este test lo espera entero también cuando pasa
+        monkeypatch.setattr(dropbot, "POT_PROVIDER_STARTUP_TIMEOUT", 1)
         pot.script = "sleep 5"
 
         async def scenario():

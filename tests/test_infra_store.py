@@ -134,6 +134,17 @@ class TestRaiz:
     def test_un_directorio_temporal_no_es_persistente(self, config_dir):
         assert store.is_persistent() is False
 
+    def test_con_un_volumen_en_un_padre_es_persistente(self, tmp_path, config_dir, volumes):
+        """Montar /data con el config en /data/config vale igual."""
+        volumes.add(str(tmp_path))
+        store.init(str(config_dir))
+        assert store.is_persistent() is True
+
+    def test_con_el_volumen_en_el_propio_config_es_persistente(self, config_dir, volumes):
+        volumes.add(str(config_dir))
+        store.init(str(config_dir))
+        assert store.is_persistent() is True
+
 
 def _read_only(src, dst):
     raise OSError(30, "Read-only file system")

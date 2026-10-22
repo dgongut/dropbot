@@ -239,6 +239,30 @@ def workdir(tmp_path):
     return source, dest
 
 
+# Un miembro con ruta absoluta. Cada test pone la suya bajo su tmp_path, fuera
+# del destino: con una fija en /tmp, un resto de otra pasada o de otro usuario
+# hacía fallar el test aunque el bot no escribiera nada
+ABSOLUTE = "<absoluta>"
+
+
+def _outside(workdir):
+    """Dónde acabaría un miembro con ruta absoluta si se escribiera tal cual."""
+    source, _ = workdir
+    return source.parent / "fuera" / "maligno.txt"
+
+
+def _evil(workdir, evil_name):
+    """El nombre del miembro malicioso. Con ruta absoluta, su carpeta ya
+    existe, como existía /tmp: si no, un extractor que la escribiera tal cual
+    sin crear carpetas fallaría con FileNotFoundError, y en TAR ese fallo
+    da el mismo False que se espera de un rechazo."""
+    if evil_name != ABSOLUTE:
+        return evil_name
+    outside = _outside(workdir)
+    outside.parent.mkdir(exist_ok=True)
+    return str(outside)
+
+
 # --- ZIP -----------------------------------------------------------------------
 
 class TestZip:
@@ -328,18 +352,18 @@ class TestZip:
         "../evil.txt",
         "../../evil.txt",
         "sub/../../evil.txt",
-        "/tmp/dropbot-zip-slip-absoluto.txt",
+        ABSOLUTE,
     ])
     def test_zip_slip_no_escribe_fuera_del_destino(self, workdir, evil_name):
         source, dest = workdir
-        archive = make_zip(source / "slip.zip", {evil_name: b"maligno", "ok.txt": b"ok"})
+        archive = make_zip(source / "slip.zip", {_evil(workdir, evil_name): b"maligno", "ok.txt": b"ok"})
         before_outside = set(os.listdir(source.parent)) | set(os.listdir(source))
 
         extract_file(archive, str(dest))
 
         after_outside = set(os.listdir(source.parent)) | set(os.listdir(source))
         assert after_outside == before_outside
-        assert not os.path.exists("/tmp/dropbot-zip-slip-absoluto.txt")
+        assert not _outside(workdir).exists()
         for path in tree(dest) if dest.exists() else {}:
             assert not os.path.isabs(path) and not path.startswith("..")
 
@@ -397,17 +421,17 @@ class TestTar:
     @pytest.mark.parametrize("evil_name", [
         "../evil.txt",
         "sub/../../evil.txt",
-        "/tmp/dropbot-tar-slip-absoluto.txt",
+        ABSOLUTE,
     ])
     def test_tar_slip_se_rechaza_entero_y_no_escribe_nada(self, workdir, evil_name):
         source, dest = workdir
-        archive = make_tar(source / "slip.tar", {"ok.txt": b"ok", evil_name: b"maligno"})
+        archive = make_tar(source / "slip.tar", {"ok.txt": b"ok", _evil(workdir, evil_name): b"maligno"})
 
         assert extract_file(archive, str(dest)) is False
         assert not dest.exists()
         assert not (source / "evil.txt").exists()
         assert not (source.parent / "evil.txt").exists()
-        assert not os.path.exists("/tmp/dropbot-tar-slip-absoluto.txt")
+        assert not _outside(workdir).exists()
 
     @pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
     def test_los_enlaces_se_rechazan(self, workdir, link_type):
@@ -527,17 +551,17 @@ class TestRar:
         assert extract_file(str(archive), str(dest)) is True
         assert (dest / "cap1.txt").exists()
 
-    @pytest.mark.parametrize("evil_name", ["../evil.txt", "/tmp/dropbot-rar-slip.txt"])
+    @pytest.mark.parametrize("evil_name", ["../evil.txt", ABSOLUTE])
     def test_rar_slip_no_escribe_fuera_del_destino(self, workdir, evil_name):
         source, dest = workdir
         archive = source / "slip.rar"
-        archive.write_bytes(rar4([(evil_name, b"maligno")]))
+        archive.write_bytes(rar4([(_evil(workdir, evil_name), b"maligno")]))
 
         extract_file(str(archive), str(dest))
 
         assert not (source / "evil.txt").exists()
         assert not (source.parent / "evil.txt").exists()
-        assert not os.path.exists("/tmp/dropbot-rar-slip.txt")
+        assert not _outside(workdir).exists()
 
     def test_un_enlace_simbolico_se_rechaza_entero(self, workdir):
         """Igual que en los TAR: un enlace puede apuntar fuera del destino."""

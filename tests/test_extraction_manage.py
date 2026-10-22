@@ -356,20 +356,28 @@ class TestDescomprimir:
         self, extractor, sent_messages, monkeypatch
     ):
         """Cada 10 s se reedita el mensaje; aquí los 10 s duran unos milisegundos."""
-        import time
-
         archive = make_zip(extractor.root / "lento.zip")
         real_wait_for = asyncio.wait_for
+        real_edit = extractor.module.safe_edit
+        second_update = threading.Event()
 
         async def fast_wait_for(awaitable, timeout):
             return await real_wait_for(awaitable, timeout=0.01)
 
+        async def edit(message, text=None, **kwargs):
+            if text == get_text("decompressing_file_progress", "lento.zip", 20):
+                second_update.set()
+            return await real_edit(message, text, **kwargs)
+
         def slow_extract(file_path, extract_to):
-            time.sleep(0.15)
+            # Dura hasta el segundo aviso, y no un tiempo fijo: con la máquina
+            # parada un momento, no daba tiempo a los dos
+            second_update.wait(15)
             return True
 
         monkeypatch.setattr(asyncio, "wait_for", fast_wait_for)
         monkeypatch.setattr(extractor.module, "extract_file", slow_extract)
+        monkeypatch.setattr(extractor.module, "safe_edit", edit)
 
         extractor.extract(archive)
 
@@ -381,22 +389,23 @@ class TestDescomprimir:
     def test_si_el_mensaje_de_progreso_falla_la_extraccion_sigue(
         self, extractor, monkeypatch
     ):
-        import time
-
         archive = make_zip(extractor.root / "lento.zip")
         real_wait_for = asyncio.wait_for
         real_edit = extractor.module.safe_edit
+        failed = threading.Event()
 
         async def fast_wait_for(awaitable, timeout):
             return await real_wait_for(awaitable, timeout=0.01)
 
         async def flaky_edit(message, text=None, **kwargs):
             if "10s" in str(text) or "20s" in str(text):
+                failed.set()
                 raise RuntimeError("Telegram no responde")
             return await real_edit(message, text, **kwargs)
 
         def slow_extract(file_path, extract_to):
-            time.sleep(0.1)
+            # Hasta que haya fallado algún aviso, por lenta que vaya la máquina
+            failed.wait(15)
             return extract_file_real(file_path, extract_to)
 
         from services.extraction_service import extract_file as extract_file_real
@@ -407,6 +416,7 @@ class TestDescomprimir:
 
         extractor.extract(archive)
 
+        assert failed.is_set()
         assert (extractor.root / "lento" / "dentro.txt").exists()
         assert get_text("extraction_success_title") in extractor.last()
 
@@ -507,7 +517,7 @@ class TestDescomprimir:
 
         def slow_extract(file_path, extract_to):
             extracting.set()
-            finish.wait(5)
+            finish.wait(30)
             return real_extract(file_path, extract_to)
 
         monkeypatch.setattr(manage, "extract_file", slow_extract)
@@ -524,7 +534,7 @@ class TestDescomprimir:
             while manage.extractions_in_progress:
                 await asyncio.sleep(0.01)
 
-        run_async(asyncio.wait_for(scenario(), 5))
+        run_async(asyncio.wait_for(scenario(), 30))
 
         assert sorted(os.listdir(extractor.root)) == ["Fotos2024", "Fotos2024.zip"]
         assert get_text("extraction_success_title") in extractor.last()

@@ -240,20 +240,21 @@ class TestContadores:
             # El hilo, ya con su copia del estado y antes de escribirla
             if threading.current_thread().name == "telemetry":
                 copied.set()
-                resume.wait(timeout=5)
+                resume.wait(timeout=15)
             return real_makedirs(path, *args, **kwargs)
 
         monkeypatch.setattr(telemetry.os, "makedirs", makedirs)
         flushing = threading.Thread(target=client._flush, kwargs={"force": True}, name="telemetry")
         flushing.start()
-        assert copied.wait(timeout=5)
+        assert copied.wait(timeout=15)
         disabling = threading.Thread(target=stats.disable)
         disabling.start()
         # En fila, forget() espera a que acabe el volcado en curso
         disabling.join(timeout=0.2)
         resume.set()
-        flushing.join(timeout=5)
-        disabling.join(timeout=5)
+        flushing.join(timeout=15)
+        disabling.join(timeout=15)
+        assert not flushing.is_alive() and not disabling.is_alive()
 
         state = json.loads((fresh / "state" / "telemetry.json").read_text(encoding="utf-8"))
         assert state["install_id"] is None and state["pending"] == {}
@@ -288,7 +289,7 @@ class TestContadores:
 
         stats.start("4.1.0")
         stats.start("4.1.0")
-        client._thread.join(timeout=1)
+        client._thread.join(timeout=15)
 
         assert client.version == "4.1.0"
         assert stats.preview()[0]["version"] == "4.1.0"
@@ -307,7 +308,7 @@ class TestContadores:
         client._run = lambda: None
 
         stats.start("4.0.1")
-        client._thread.join(timeout=1)
+        client._thread.join(timeout=15)
 
         stored = json.loads(state.read_text(encoding="utf-8"))
         assert stored["install_id"] is None and stored["pending"] == {}
@@ -320,7 +321,7 @@ class TestContadores:
         client._run = lambda: None
 
         stats.start("4.0.1")
-        client._thread.join(timeout=1)
+        client._thread.join(timeout=15)
 
         assert not (fresh / "state" / "telemetry.json").exists()
 
@@ -332,7 +333,7 @@ class TestContadores:
         client._run = lambda: None
 
         stats.start("4.0.1")
-        client._thread.join(timeout=1)
+        client._thread.join(timeout=15)
 
         assert stats.preview()[0]["install_id"] == "id-anterior"
 
@@ -345,5 +346,5 @@ class TestContadores:
         client._run = lambda: None
 
         stats.start("dev")
-        client._thread.join(timeout=1)
+        client._thread.join(timeout=15)
         assert logged and "TELEMETRY_DEBUG" in logged[0]

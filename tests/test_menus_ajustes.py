@@ -742,6 +742,13 @@ def _render_everything(screens, monkeypatch):
     for forced in (None, "TELEMETRY", "volume", "settings"):
         monkeypatch.setattr(stats, "forced_off", lambda forced=forced: forced)
         collect()
+    # Los avisos de la principal según los volúmenes, que no dependen de cómo
+    # tenga montado /tmp la máquina: sin ninguno, y montados pero sin escribir
+    for persistent, write_error, downloads in ((False, None, False), (True, "Read-only file system", True)):
+        monkeypatch.setattr(store, "is_persistent", lambda persistent=persistent: persistent)
+        monkeypatch.setattr(store, "write_error", lambda write_error=write_error: write_error)
+        monkeypatch.setattr(screens, "downloads_persistent", lambda downloads=downloads: downloads)
+        collect()
     return rendered
 
 

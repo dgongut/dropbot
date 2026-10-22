@@ -183,7 +183,7 @@ class TestLimitador:
             with pytest.raises(RuntimeError):
                 async with limiter:
                     raise RuntimeError("falla")
-            await asyncio.wait_for(limiter.__aenter__(), timeout=1)
+            await asyncio.wait_for(limiter.__aenter__(), timeout=10)
             return limiter.active
 
         assert run_async(scenario()) == 1

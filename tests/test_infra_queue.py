@@ -53,13 +53,20 @@ def clock(monkeypatch):
 
 @pytest.fixture
 def short_wait(monkeypatch):
-    """Convierte los 300 s que espera `add_message` en unas centésimas."""
+    """Convierte los 300 s que espera `add_message` en `short_wait.seconds`.
+
+    Unas centésimas para lo que tiene que agotar el plazo. Lo que sí tiene que
+    llegar no puede depender de que el worker conteste en 50 ms de reloj de
+    verdad: antes de esperarlo, el test sube `seconds`.
+    """
     real_wait_for = asyncio.wait_for
+    limit = SimpleNamespace(seconds=0.05)
 
     async def wait_for(awaitable, timeout):
-        return await real_wait_for(awaitable, 0.05 if timeout == 300 else timeout)
+        return await real_wait_for(awaitable, limit.seconds if timeout == 300 else timeout)
 
     monkeypatch.setattr(asyncio, "wait_for", wait_for)
+    return limit
 
 
 def _item(func, *args, future=None, **kwargs):
@@ -364,6 +371,7 @@ class TestWorker:
         async def scenario():
             queue = TelegramMessageQueue(delay_between_messages=0)
             result = await queue.add_message(send, wait_for_result=True)
+            short_wait.seconds = 15
             await queue.start()
             assert await queue.add_message(marker, wait_for_result=True) == "fin"
             await queue.shutdown()
@@ -401,7 +409,7 @@ class TestWorker:
     def test_shutdown_sin_arrancar_no_se_cuelga(self, run_async):
         async def scenario():
             queue = TelegramMessageQueue()
-            await asyncio.wait_for(queue.shutdown(), timeout=1)
+            await asyncio.wait_for(queue.shutdown(), timeout=10)
             return queue.running
 
         assert run_async(scenario()) is False
@@ -410,8 +418,8 @@ class TestWorker:
         async def scenario():
             queue = TelegramMessageQueue(delay_between_messages=0)
             await queue.start()
-            await asyncio.wait_for(queue.shutdown(), timeout=1)
-            await asyncio.wait_for(queue.shutdown(), timeout=1)
+            await asyncio.wait_for(queue.shutdown(), timeout=10)
+            await asyncio.wait_for(queue.shutdown(), timeout=10)
 
         run_async(scenario())
 
@@ -436,7 +444,7 @@ class TestWorker:
             stopping = asyncio.ensure_future(queue.shutdown())
             await asyncio.sleep(0)
             gate["release"].set()
-            await asyncio.wait_for(stopping, timeout=1)
+            await asyncio.wait_for(stopping, timeout=10)
             return queue.worker_task.done()
 
         assert run_async(scenario()) is True
@@ -444,6 +452,9 @@ class TestWorker:
         assert len(done) < 100
 
     def test_parar_y_volver_a_arrancar_sigue_enviando(self, run_async, slept, short_wait):
+        # Sin worker, en vez de 300 s, falla a los 15
+        short_wait.seconds = 15
+
         async def send():
             return "ok"
 
@@ -482,8 +493,8 @@ class TestWorker:
             stopping = asyncio.ensure_future(queue.shutdown())
             await asyncio.sleep(0)
             gate["release"].set()
-            await asyncio.wait_for(stopping, timeout=1)
-            return await asyncio.wait_for(waiting, timeout=1), queue.queue.empty()
+            await asyncio.wait_for(stopping, timeout=10)
+            return await asyncio.wait_for(waiting, timeout=10), queue.queue.empty()
 
         assert run_async(scenario()) == (None, True)
         assert sent == []
@@ -522,12 +533,12 @@ class TestWorker:
                 waiting = asyncio.ensure_future(queue.add_message(flooded, wait_for_result=True))
                 await asyncio.sleep(0)  # que entre en la cola antes que la edición
                 behind = await asyncio.wait_for(
-                    queue.add_message(edit, "otro chat", wait_for_result=True), timeout=2)
+                    queue.add_message(edit, "otro chat", wait_for_result=True), timeout=10)
                 calls_meanwhile = flooded.calls
                 clock.now += 120
-                return behind, calls_meanwhile, await asyncio.wait_for(waiting, timeout=3)
+                return behind, calls_meanwhile, await asyncio.wait_for(waiting, timeout=10)
             finally:
-                await asyncio.wait_for(queue.shutdown(), timeout=1)
+                await asyncio.wait_for(queue.shutdown(), timeout=10)
 
         assert run_async(scenario()) == ("otro chat", 1, "ok")
         assert flooded.calls == 2
@@ -552,10 +563,10 @@ class TestWorker:
                 for percent in (40, 45, 50):
                     await queue.add_message(edit, f"Convirtiendo {percent} %")
                 # A otro chat no espera, y cuando sale lo de antes ya pasó por el worker
-                await asyncio.wait_for(queue.add_message(send_message, "otro chat", wait_for_result=True), timeout=2)
+                await asyncio.wait_for(queue.add_message(send_message, "otro chat", wait_for_result=True), timeout=10)
                 clock.now += 40
                 await queue.add_message(edit, "Conversión cancelada")
-                await asyncio.wait_for(queue.add_message(send_message, "otro chat", wait_for_result=True), timeout=2)
+                await asyncio.wait_for(queue.add_message(send_message, "otro chat", wait_for_result=True), timeout=10)
                 before_the_end = list(client.server)
                 clock.now += 50
                 await queue.add_message(wake_up)
@@ -563,9 +574,9 @@ class TestWorker:
                     await asyncio.sleep(0)
                 return before_the_end
             finally:
-                await asyncio.wait_for(queue.shutdown(), timeout=1)
+                await asyncio.wait_for(queue.shutdown(), timeout=10)
 
-        before_the_end = run_async(asyncio.wait_for(scenario(), timeout=5))
+        before_the_end = run_async(asyncio.wait_for(scenario(), timeout=30))
 
         assert before_the_end == [("send_message", "otro chat")] * 2
         assert [text for name, text in client.server if name == "edit"] == [
@@ -591,12 +602,12 @@ class TestWorker:
                 await queue.add_message(edit, "progreso")
                 waiting = asyncio.ensure_future(queue.add_message(send_message, "aviso", wait_for_result=True))
                 await asyncio.sleep(0)  # que entre en la cola antes que wake_up
-                await asyncio.wait_for(queue.add_message(wake_up, wait_for_result=True), timeout=2)
+                await asyncio.wait_for(queue.add_message(wake_up, wait_for_result=True), timeout=10)
                 clock.now += 90
                 await queue.add_message(wake_up)
-                return await asyncio.wait_for(waiting, timeout=2)
+                return await asyncio.wait_for(waiting, timeout=10)
             finally:
-                await asyncio.wait_for(queue.shutdown(), timeout=1)
+                await asyncio.wait_for(queue.shutdown(), timeout=10)
 
         assert run_async(scenario()) == ("aviso",)
         assert client.server == [("send_message", "aviso")]
@@ -610,8 +621,8 @@ class TestWorker:
             waiting = asyncio.ensure_future(queue.add_message(flooded, wait_for_result=True))
             while not queue.deferred:
                 await asyncio.sleep(0)
-            await asyncio.wait_for(queue.shutdown(), timeout=1)
-            return await asyncio.wait_for(waiting, timeout=1), len(queue.deferred)
+            await asyncio.wait_for(queue.shutdown(), timeout=10)
+            return await asyncio.wait_for(waiting, timeout=10), len(queue.deferred)
 
         assert run_async(scenario()) == (None, 0)
         assert flooded.calls == 1
@@ -693,7 +704,7 @@ class TestSafeHelpers:
 
         async def scenario():
             return await asyncio.wait_for(
-                telegram_helpers.safe_answer(Event(), "Cancelando...", alert=False), timeout=1)
+                telegram_helpers.safe_answer(Event(), "Cancelando...", alert=False), timeout=10)
 
         assert run_async(scenario()) == "contestado"
         assert answers == [(("Cancelando...",), {"alert": False})]

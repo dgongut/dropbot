@@ -25,6 +25,7 @@ import pytest
 
 import settings
 from button_data import button_data
+from proc_helpers import install_fake, wait_until
 
 URL = "https://cdn.example.com/files/peli.mkv"
 
@@ -59,9 +60,7 @@ def fake_wget(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_WGET_READY", str(ready))
 
     def install(body):
-        script = bindir / "wget"
-        script.write_text(f"#!{sys.executable}\n{_FAKE_HEADER}\n{textwrap.dedent(body)}")
-        script.chmod(0o755)
+        install_fake(bindir, "wget", f"#!{sys.executable}\n{_FAKE_HEADER}\n{textwrap.dedent(body)}")
 
     install.calls = lambda: [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     install.ready = ready
@@ -368,13 +367,14 @@ class TestTamañoMaximo:
             sys.stderr.write("Length: 42949672960 (40G) [video/x-matroska]\\n")
             sys.stderr.flush()
             write(b"a medias")
-            time.sleep(10)
+            time.sleep(30)
         ''')
 
         started = time.monotonic()
         _run(direct, run_async, make_event(event_id=751), status=_status())
 
-        assert time.monotonic() - started < 5, "wget se para nada más ver el tamaño"
+        # Sin pararlo serían 30 s; el margen es para una máquina lenta
+        assert time.monotonic() - started < 15, "wget se para nada más ver el tamaño"
         assert "pasa del tamaño máximo de 1 GB" in texts()
         assert "ha fallado" not in texts()
         assert _ls(direct.final) == [] and _ls(direct.temp) == []
@@ -388,13 +388,13 @@ class TestTamañoMaximo:
             write(b"x" * (2 * 1024 * 1024))
             sys.stderr.write("peli.mkv               [ <=>        ]   2.00M  1.00MB/s\\r")
             sys.stderr.flush()
-            time.sleep(10)
+            time.sleep(30)
         ''')
 
         started = time.monotonic()
         _run(direct, run_async, make_event(event_id=752), status=_status())
 
-        assert time.monotonic() - started < 5
+        assert time.monotonic() - started < 15
         assert "pasa del tamaño máximo de 1 MB" in texts()
         assert _ls(direct.final) == [] and _ls(direct.temp) == []
 
@@ -454,15 +454,15 @@ class TestCancelar:
         write(b"a medias")
         bar(5)
         ready()
-        time.sleep(30)
+        time.sleep(60)
     '''
 
     async def _wait_ready(self, fake_wget, bot, event_id):
-        for _ in range(500):
-            if fake_wget.ready.exists() and isinstance(bot.active_tasks.get(f"42_{event_id}"), asyncio.subprocess.Process):
-                return
-            await asyncio.sleep(0.01)
-        raise AssertionError("el wget falso no llegó a arrancar")
+        await wait_until(
+            lambda: fake_wget.ready.exists()
+            and isinstance(bot.active_tasks.get(f"42_{event_id}"), asyncio.subprocess.Process),
+            message="el wget falso no llegó a arrancar",
+        )
 
     def test_el_boton_cancelar_para_wget_y_borra_el_temporal(
         self, direct, fake_wget, make_event, run_async, texts
@@ -476,7 +476,7 @@ class TestCancelar:
             direct.bot.active_tasks["42_721"] = task
             await self._wait_ready(fake_wget, direct.bot, 721)
             await direct.bot.cancel_download(make_event(event_id=9721, data=b"cancel:42_721"))
-            await asyncio.wait_for(task, timeout=10)
+            await asyncio.wait_for(task, timeout=30)
 
         run_async(scenario())
 
@@ -496,18 +496,16 @@ class TestCancelar:
             tasks = [asyncio.create_task(direct.bot.run_direct_download(
                 make_event(event_id=723, chat_id=chat_id), URL, "peli.mkv", _status(),
                 str(direct.final), direct.bot.VID_ICO, "video")) for chat_id in (42, -1001234567890)]
-            for _ in range(500):
-                if fake_wget.ready.exists() and all(
-                        isinstance(direct.bot.active_tasks.get(key), asyncio.subprocess.Process) for key in keys):
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                raise AssertionError("los wget falsos no llegaron a arrancar")
+            await wait_until(
+                lambda: fake_wget.ready.exists() and all(
+                    isinstance(direct.bot.active_tasks.get(key), asyncio.subprocess.Process) for key in keys),
+                message="los wget falsos no llegaron a arrancar",
+            )
             await direct.bot.cancel_download(make_event(event_id=9723, data=b"cancel:42_723"))
-            await asyncio.wait_for(tasks[0], timeout=10)
+            await asyncio.wait_for(tasks[0], timeout=30)
             group_running = not tasks[1].done()
             tasks[1].cancel()
-            await asyncio.wait([tasks[1]], timeout=10)
+            await asyncio.wait([tasks[1]], timeout=30)
             return group_running
 
         assert run_async(scenario()), "la descarga del grupo sigue"
@@ -517,9 +515,11 @@ class TestCancelar:
     def test_al_acabar_no_quita_la_tarea_que_la_ha_pisado(self, direct, fake_wget, make_event, run_async):
         """Otra descarga con la misma clave pisa la entrada: al acabar, la
         primera se llevaba la de la otra, que ya no se podía cancelar."""
+        # No acaba hasta que la otra ha pisado la entrada, por lento que vaya
         fake_wget('''
             ready()
-            time.sleep(0.3)
+            while not os.path.exists(os.environ["FAKE_WGET_READY"] + ".go"):
+                time.sleep(0.01)
             write()
         ''')
         other = object()
@@ -529,7 +529,8 @@ class TestCancelar:
                 make_event(event_id=724), URL, "peli.mkv", None, str(direct.final), direct.bot.VID_ICO, "video"))
             await self._wait_ready(fake_wget, direct.bot, 724)
             direct.bot.active_tasks["42_724"] = other
-            await task
+            open(f"{fake_wget.ready}.go", "w").close()
+            await asyncio.wait_for(task, timeout=30)
 
         run_async(scenario())
 
@@ -864,8 +865,6 @@ class TestRedirecciones:
             return resolve(host, *args, **kwargs)
 
         monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
-        for proxy in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"):
-            monkeypatch.delenv(proxy, raising=False)
         try:
             _run(direct, run_async, make_event(event_id=777), status=_status(),
                  url=f"http://127.0.0.1:{attacker.server_address[1]}/peli.mkv")
@@ -879,7 +878,7 @@ class TestRedirecciones:
         assert _ls(direct.final) == []
 
     @pytest.fixture
-    def cookie_server(self, monkeypatch):
+    def cookie_server(self):
         """Un gestor de descargas que marca la sesión con una cookie al
         redirigir al fichero, y que sin ella no lo da. Devuelve su URL y las
         peticiones que recibe."""
@@ -916,8 +915,7 @@ class TestRedirecciones:
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Server)
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        for proxy in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"):
-            monkeypatch.delenv(proxy, raising=False)
+        # Sin proxies que se lleven las peticiones a 127.0.0.1: ver conftest
         yield f"http://127.0.0.1:{server.server_address[1]}", received
         server.shutdown()
         server.server_close()

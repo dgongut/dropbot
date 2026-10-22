@@ -9,6 +9,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # La batería tarda alrededor de un minuto: un test que se cuelgue no puede
+    # tener el job ocupado las 6 h que GitHub da por defecto
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 

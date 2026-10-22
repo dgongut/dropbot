@@ -8,6 +8,7 @@ dice al usuario.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -21,7 +22,7 @@ import pytest
 import settings
 from button_data import button_data
 from conftest import FORUM_TOPIC
-from proc_helpers import alive
+from proc_helpers import alive, install_fake, wait_until
 
 URL = "https://www.youtube.com/watch?v=abc"
 
@@ -56,8 +57,12 @@ def done(p):
     if "--print" in args:
         out(args[args.index("--print") + 1].removeprefix("after_move:").replace("%(filepath)s", p))
 
-def gone(p, timeout=2):
-    """Si `p` deja de estar en su sitio (el bot se lo lleva) antes de `timeout` s."""
+def gone(p, timeout=15):
+    """Si `p` deja de estar en su sitio (el bot se lo lleva) antes de `timeout` s.
+
+    Sale en cuanto se lo lleva, y el plazo es solo para una máquina lenta: un
+    bot que los moviera todos al final no se lo llevaría mientras yt-dlp sigue.
+    """
     end = time.time() + timeout
     while os.path.exists(p):
         if time.time() > end:
@@ -79,10 +84,7 @@ def fake_ytdlp(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_YTDLP_READY", str(ready))
 
     def install(body):
-        script = bindir / "yt-dlp"
-        script.write_text(f"#!{sys.executable}\n{_FAKE_HEADER}\n{textwrap.dedent(body)}")
-        script.chmod(0o755)
-        return str(script)
+        return str(install_fake(bindir, "yt-dlp", f"#!{sys.executable}\n{_FAKE_HEADER}\n{textwrap.dedent(body)}"))
 
     install.calls = lambda: [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     install.ready = ready
@@ -965,11 +967,10 @@ class TestPlaylists:
         while_moving = []
 
         async def slow_move(path, folder):
-            # La copia no acaba hasta que yt-dlp ha podido escribirlo todo
-            for _ in range(300):
-                if fake_ytdlp.ready.exists():
-                    break
-                await asyncio.sleep(0.01)
+            # La copia no acaba hasta que yt-dlp ha podido escribirlo todo; si
+            # la lectura está parada, no llegará a poder
+            with contextlib.suppress(AssertionError):
+                await wait_until(fake_ytdlp.ready.exists)
             while_moving.append(fake_ytdlp.ready.exists())
             return await real_move(path, folder)
 
@@ -1049,7 +1050,7 @@ out(f"[download] Destination: {part}")
 touch(part + ".part")
 out("[download]  12.0% of   10.00MiB at    1.00MiB/s ETA 00:09")
 ready()
-time.sleep(30)
+time.sleep(60)
 '''
 
 # El primero ya se lo ha llevado el bot al terminarlo (--print after_move)
@@ -1065,7 +1066,7 @@ out(f"[download] Destination: {part}")
 touch(part + ".part")
 out("[download]  12.0% of   10.00MiB at    1.00MiB/s ETA 00:09")
 ready()
-time.sleep(30)
+time.sleep(60)
 '''
 
 CANCELABLE_SINGLE = '''
@@ -1073,7 +1074,7 @@ part = path("Largo", "f137.mp4")
 out(f"[download] Destination: {part}")
 touch(part + ".part")
 ready()
-time.sleep(30)
+time.sleep(60)
 '''
 
 # Un directo: yt-dlp le pasa la grabación a ffmpeg, que hereda sus tuberías
@@ -1091,11 +1092,11 @@ ffmpeg.wait()
 
 
 async def _wait_ready(fake_ytdlp, bot, event_id):
-    for _ in range(500):
-        if fake_ytdlp.ready.exists() and isinstance(bot.active_tasks.get(f"42_{event_id}"), asyncio.subprocess.Process):
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("el yt-dlp falso no llegó a arrancar")
+    await wait_until(
+        lambda: fake_ytdlp.ready.exists()
+        and isinstance(bot.active_tasks.get(f"42_{event_id}"), asyncio.subprocess.Process),
+        message="el yt-dlp falso no llegó a arrancar",
+    )
 
 
 class TestCancelar:
@@ -1107,7 +1108,7 @@ class TestCancelar:
             await _wait_ready(fake_ytdlp, links.bot, event_id)
             click = make_event(event_id=9000 + event_id, data=f"cancel:42_{event_id}".encode())
             await links.bot.cancel_download(click)
-            await asyncio.wait_for(task, timeout=10)
+            await asyncio.wait_for(task, timeout=30)
         run_async(scenario())
 
     def test_cancelar_una_playlist_conserva_los_videos_terminados(
@@ -1202,7 +1203,7 @@ class TestCancelar:
             task = links.bot.active_tasks["42_536"]
             await _wait_ready(fake_ytdlp, links.bot, 536)
             task.cancel()
-            done, _ = await asyncio.wait([task], timeout=10)
+            done, _ = await asyncio.wait([task], timeout=30)
             return done
 
         assert run_async(scenario()), "la cancelación no ha terminado"
@@ -1213,9 +1214,11 @@ class TestCancelar:
     def test_al_acabar_no_quita_la_tarea_que_la_ha_pisado(self, links, fake_ytdlp, make_event, run_async):
         """Dos descargas del mismo mensaje compartían la clave: la primera en
         acabar se llevaba la de la otra, que ya no se podía cancelar."""
+        # No acaba hasta que la otra ha pisado la entrada, por lento que vaya
         fake_ytdlp('''
             ready()
-            time.sleep(0.3)
+            while not os.path.exists(os.environ["FAKE_YTDLP_READY"] + ".go"):
+                time.sleep(0.01)
             final = path("Clip", "mp4")
             out(f"[download] Destination: {final}")
             touch(final)
@@ -1229,7 +1232,8 @@ class TestCancelar:
             task = links.bot.active_tasks["42_537"]
             await _wait_ready(fake_ytdlp, links.bot, 537)
             links.bot.active_tasks["42_537"] = other
-            await task
+            open(f"{fake_ytdlp.ready}.go", "w").close()
+            await asyncio.wait_for(task, timeout=30)
 
         run_async(scenario())
 

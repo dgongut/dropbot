@@ -57,6 +57,10 @@ TEMP_DIR = "/tmp/dropbot_conversions"
 # Fichero de heartbeat para healthcheck de Docker (mtime actualizado periódicamente)
 HEARTBEAT_FILE = "/tmp/dropbot_heartbeat"
 HEARTBEAT_INTERVAL = 15  # segundos entre escrituras
+# El heartbeat solo se escribe si todas las carpetas de descarga admiten crear
+# y borrar un fichero. Un montaje de red caído puede dejar la prueba colgada:
+# pasado este tiempo sin respuesta cuenta como fallo
+WRITE_PROBE_TIMEOUT = 10  # segundos
 
 # Hasta la 4.0.0 la sesión de Telegram vivía en el directorio de trabajo, /app,
 # que no es un volumen. Si el contenedor aún la tiene, se mueve a /config

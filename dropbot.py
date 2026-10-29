@@ -37,7 +37,7 @@ from config import (
     POT_PROVIDER_DIR, POT_PROVIDER_PORT, POT_PROVIDER_STARTUP_TIMEOUT,
     RECONNECT_DELAY, RETRY_DELAY_SECONDS, TELEGRAM_API_HASH, TELEGRAM_API_ID,
     TELEGRAM_TOKEN, TEMP_DIR, TOR_ICO, VID_ICO,
-    YTDLP_COOKIES_FILE, downloads_persistent,
+    WRITE_PROBE_TIMEOUT, YTDLP_COOKIES_FILE, downloads_persistent,
 )
 import migration
 import settings
@@ -55,7 +55,7 @@ from state import (
 )
 from utils.file_helpers import (
     format_file_size, get_file_icon,
-    reserve_unique_path, copy_and_remove, move_to_unique_path,
+    reserve_unique_path, copy_and_remove, move_to_unique_path, check_writable,
     PARTIAL_SUFFIX, partial_name, remove_partial_files, remove_partial_extractions,
 )
 from utils import fast_telethon
@@ -95,9 +95,9 @@ logger = log_module.setup_logger(
     use_colors=True
 )
 
-from logger import debug, warning, error
+from logger import debug, info, warning, error
 
-VERSION = "4.0.1"
+VERSION = "4.0.2"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -4473,13 +4473,53 @@ async def apply_setting(key):
     elif key == "downloads.parallel":
         await download_semaphore.set_limit(settings.parallel_downloads())
 
-async def heartbeat_writer():
-    while True:
+def unwritable_download_folders():
+    """Las carpetas de descarga en las que no se puede escribir, con el error de cada una."""
+    failed = {}
+    for path in sorted(set(DOWNLOAD_PATHS.values()) | {DOWNLOAD_PATH}):
         try:
-            with open(HEARTBEAT_FILE, "w") as f:
-                f.write(str(int(time.time())))
+            check_writable(path)
+        except OSError as e:
+            failed[path] = e
+    return failed
+
+
+async def heartbeat_writer():
+    """Escribe el heartbeat que mira el HEALTHCHECK de Docker.
+
+    Solo si se puede escribir en todas las carpetas de descarga: un volumen
+    que es un montaje de red y no ha montado, o que se ha caído, deja el bot
+    vivo pero sin poder guardar nada, y el contenedor salía como saludable.
+    Sin heartbeat, Docker lo marca como unhealthy.
+    """
+    probe = None
+    last_problem = None
+    while True:
+        # Una prueba colgada (un montaje de red que no responde) no se repite:
+        # se sigue esperando a la misma, y mientras tanto no hay heartbeat
+        if probe is None:
+            probe = asyncio.ensure_future(asyncio.to_thread(unwritable_download_folders))
+        try:
+            failed = await asyncio.wait_for(asyncio.shield(probe), WRITE_PROBE_TIMEOUT)
+            probe = None
+            problem = "; ".join(f"{path}: {e}" for path, e in failed.items())
+        except asyncio.TimeoutError:
+            problem = f"no answer after {WRITE_PROBE_TIMEOUT}s"
         except Exception as e:
-            error(f"[HEARTBEAT] Failed to write {HEARTBEAT_FILE}: {e}")
+            probe = None
+            problem = str(e) or type(e).__name__
+        if problem != last_problem:
+            if problem:
+                error(f"[HEARTBEAT] Cannot write in the download folders ({problem}), reporting unhealthy")
+            elif last_problem is not None:
+                info("[HEARTBEAT] The download folders are writable again")
+            last_problem = problem
+        if not problem:
+            try:
+                with open(HEARTBEAT_FILE, "w") as f:
+                    f.write(str(int(time.time())))
+            except Exception as e:
+                error(f"[HEARTBEAT] Failed to write {HEARTBEAT_FILE}: {e}")
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 async def start_pot_provider():

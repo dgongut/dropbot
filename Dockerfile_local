@@ -82,7 +82,8 @@ RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
 # Sin VOLUME /downloads, como en producción: un volumen anónimo ocultaría el
 # aviso de que /downloads no está montada
 
-# Healthcheck: verifica que el bot está vivo y respondiendo (fichero heartbeat actualizado en <60s)
+# Healthcheck: verifica que el bot está vivo y respondiendo (fichero heartbeat actualizado en <60s).
+# El bot solo lo actualiza si puede escribir en todas las carpetas de descarga
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD [ $(($(date +%s) - $(stat -c %Y /tmp/dropbot_heartbeat 2>/dev/null || echo 0))) -lt 60 ] || exit 1
 

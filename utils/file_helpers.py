@@ -126,6 +126,16 @@ def reserve_unique_path(directory, filename, keep_open=False):
         return path
 
 
+def check_writable(directory):
+    """Crea y borra un fichero en `directory`; lanza OSError si no se puede.
+
+    Con el nombre de los ficheros a medias (partial_name): si el bot se para
+    entre crearlo y borrarlo, se borra al arrancar como los demás.
+    """
+    path = reserve_unique_path(directory, partial_name(f"write-test{PARTIAL_SUFFIX}"))
+    os.remove(path)
+
+
 def copy_and_remove(src, dst):
     """
     Mueve `src` a `dst` (la ruta que reservó reserve_unique_path) renombrándolo.

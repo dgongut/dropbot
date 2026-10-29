@@ -12,6 +12,7 @@ import signal
 import sqlite3
 import stat
 import sys
+import threading
 from contextlib import closing, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1321,6 +1322,82 @@ class TestHeartbeat:
             run_async(dropbot.heartbeat_writer())
 
         assert len(calls) == 2
+
+    def test_sin_escritura_en_una_carpeta_no_late(
+        self, dropbot, tmp_path, run_async, monkeypatch
+    ):
+        # Lo de producción: /downloads es un montaje de red que no ha montado
+        target = tmp_path / "heartbeat"
+        monkeypatch.setattr(dropbot, "HEARTBEAT_FILE", str(target))
+        monkeypatch.setitem(dropbot.DOWNLOAD_PATHS, "video", str(tmp_path / "caido"))
+        errors = []
+        monkeypatch.setattr(dropbot, "error", errors.append)
+        fake_sleep, calls = _sleep_n_times(3)
+        monkeypatch.setattr(dropbot.asyncio, "sleep", fake_sleep)
+
+        with pytest.raises(_Stop):
+            run_async(dropbot.heartbeat_writer())
+
+        assert not target.exists()
+        assert len(calls) == 3
+        # Se avisa una vez, no en cada latido
+        assert len(errors) == 1 and str(tmp_path / "caido") in errors[0]
+
+    def test_vuelve_a_latir_cuando_se_puede_escribir(
+        self, dropbot, tmp_path, run_async, monkeypatch
+    ):
+        target = tmp_path / "heartbeat"
+        folder = tmp_path / "montaje"
+        monkeypatch.setattr(dropbot, "HEARTBEAT_FILE", str(target))
+        monkeypatch.setitem(dropbot.DOWNLOAD_PATHS, "video", str(folder))
+        monkeypatch.setattr(dropbot, "error", lambda message: None)
+        infos = []
+        monkeypatch.setattr(dropbot, "info", infos.append)
+        calls = []
+
+        async def fake_sleep(seconds, *args, **kwargs):
+            calls.append(seconds)
+            assert target.exists() == (len(calls) > 1)
+            folder.mkdir(exist_ok=True)
+            if len(calls) >= 2:
+                raise _Stop()
+
+        monkeypatch.setattr(dropbot.asyncio, "sleep", fake_sleep)
+
+        with pytest.raises(_Stop):
+            run_async(dropbot.heartbeat_writer())
+
+        assert len(infos) == 1
+        # La prueba no deja nada en la carpeta
+        assert list(folder.iterdir()) == []
+
+    def test_una_prueba_colgada_no_late_ni_se_repite(
+        self, dropbot, tmp_path, run_async, monkeypatch
+    ):
+        target = tmp_path / "heartbeat"
+        monkeypatch.setattr(dropbot, "HEARTBEAT_FILE", str(target))
+        monkeypatch.setattr(dropbot, "WRITE_PROBE_TIMEOUT", 0.05)
+        monkeypatch.setattr(dropbot, "error", lambda message: None)
+        release = threading.Event()
+        probes = []
+
+        def hung():
+            probes.append(1)
+            release.wait(5)
+            return {}
+
+        monkeypatch.setattr(dropbot, "unwritable_download_folders", hung)
+        fake_sleep, calls = _sleep_n_times(3)
+        monkeypatch.setattr(dropbot.asyncio, "sleep", fake_sleep)
+
+        try:
+            with pytest.raises(_Stop):
+                run_async(dropbot.heartbeat_writer())
+        finally:
+            release.set()
+
+        assert not target.exists()
+        assert probes == [1]
 
 
 # --- start_pot_provider ------------------------------------------------------

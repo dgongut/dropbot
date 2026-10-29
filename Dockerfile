@@ -2,7 +2,7 @@
 FROM ubuntu:26.04
 
 # Build arguments
-ARG VERSION=4.0.1
+ARG VERSION=4.0.2
 ARG POT_PROVIDER_VERSION=2.0.2
 # El commit de ese tag, que es lo que se descarga: un tag se puede mover a otro
 # código y un commit no. Al subir de versión hay que cambiar los dos
@@ -92,7 +92,8 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Healthcheck: verifica que el bot está vivo y respondiendo (fichero heartbeat actualizado en <60s)
+# Healthcheck: verifica que el bot está vivo y respondiendo (fichero heartbeat actualizado en <60s).
+# El bot solo lo actualiza si puede escribir en todas las carpetas de descarga
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD [ $(($(date +%s) - $(stat -c %Y /tmp/dropbot_heartbeat 2>/dev/null || echo 0))) -lt 60 ] || exit 1
 

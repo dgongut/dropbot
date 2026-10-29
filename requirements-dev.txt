@@ -1,6 +1,8 @@
 # Dependencias solo para desarrollo y CI. En producción basta requirements.txt.
 -r requirements.txt
 
+# 9.2.0 no: al deshacer un monkeypatch.setattr sobre un MagicMock borra el
+# atributo, y el mock de `bot` que comparten los tests se queda sin él
 pytest==9.1.1
-pyflakes==4.0.3
+pyflakes==4.1.0
 pytest-cov==7.1.0

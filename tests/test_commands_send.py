@@ -134,6 +134,27 @@ class TestBotonesDeEnvio:
         run_async(quiet_bot.handle_send_choice(ChoiceEvent("send", "noexiste")))
         assert uploads == [] and sent_messages == []
 
+    def test_un_boton_caducado_avisa_y_un_doble_toque_no(
+        self, quiet_bot, uploads, media_file, run_async, monkeypatch
+    ):
+        """El botón de antes de reiniciar se quedaba mudo; el segundo toque de
+        un doble toque no tiene nada que avisar."""
+        answers = []
+
+        async def answer(event, *args, **kwargs):
+            answers.append((args, kwargs))
+
+        monkeypatch.setattr(quiet_bot, "safe_answer", answer)
+        expired = ((quiet_bot.get_text("picker_expired"),), {"alert": True})
+
+        run_async(quiet_bot.handle_send_choice(ChoiceEvent("send", "noexiste")))
+        assert answers == [expired]
+
+        file_id = quiet_bot.register_pending_send(media_file("v.mp4"))
+        run_async(quiet_bot.handle_send_choice(ChoiceEvent("nosend", file_id)))
+        run_async(quiet_bot.handle_send_choice(ChoiceEvent("nosend", file_id)))
+        assert answers == [expired, ((), {}), ((), {})]
+
     def test_si_el_fichero_ya_no_esta_lo_dice(
         self, quiet_bot, uploads, sent_messages, media_file, run_async
     ):

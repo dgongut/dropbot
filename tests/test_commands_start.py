@@ -29,7 +29,7 @@ from telethon.sessions import SQLiteSession
 
 import basic
 import migration
-from conftest import ADMIN_ID, FORUM_CHAT_ID, FORUM_TOPIC, forum_reply_to
+from conftest import FORUM_CHAT_ID, FORUM_TOPIC, forum_reply_to
 from proc_helpers import wait_until
 from utils import telegram_helpers
 
@@ -136,37 +136,39 @@ class TestComandos:
 
         assert chats == [77]
 
-    def test_list_muestra_el_menu_de_categorias(
+    def test_list_abre_lo_mismo_que_manage(
         self, quiet_bot, sent_messages, run_async, config_dir, counted
     ):
-        run_async(quiet_bot.handle_start(CommandEvent("/list")))
+        """/list era un listado en texto sin acciones: el explorador enseña lo
+        mismo con su tamaño y deja actuar, así que el comando lleva a él."""
+        run_async(quiet_bot.handle_start(CommandEvent("/manage")))
+        expected = [(text, [[button_data(b) for b in row] for row in kwargs["buttons"]])
+                    for _, text, kwargs in sent_messages]
+        sent_messages.clear()
 
-        (kind, text, kwargs), = sent_messages
-        assert text == quiet_bot.get_text("list_select_category")
-        data = [button_data(b) for row in kwargs["buttons"] for b in row]
-        assert b"listcat:all" in data and b"close" in data
+        for command in ("/list", "/list video"):
+            run_async(quiet_bot.handle_start(CommandEvent(command)))
+        got = [(text, [[button_data(b) for b in row] for row in kwargs["buttons"]])
+               for _, text, kwargs in sent_messages]
+
+        assert got == expected * 2
 
     def test_manage_muestra_el_menu_de_gestion(
         self, quiet_bot, sent_messages, run_async, config_dir, counted
     ):
         run_async(quiet_bot.handle_start(CommandEvent("/manage")))
 
+        # Un explorador: las carpetas por las que se entra (o la única que
+        # hay, ya abierta), no todo lo de todas mezclado al mismo nivel
         (kind, text, kwargs), = sent_messages
-        assert text == quiet_bot.get_text("manage_select_category")
         data = [button_data(b) for row in kwargs["buttons"] for b in row]
-        assert b"managecat:all" in data and data[-1] == b"close"
-        assert all(len(row) <= 3 for row in kwargs["buttons"])
-
-    def test_manage_reparte_las_categorias_en_filas_de_tres(
-        self, quiet_bot, sent_messages, run_async, monkeypatch, config_dir, counted
-    ):
-        categories = [(f"c{i}", f"Cat {i}") for i in range(5)]
-        monkeypatch.setattr(quiet_bot, "get_available_categories", lambda: categories)
-
-        run_async(quiet_bot.handle_start(CommandEvent("/manage")))
-
-        rows = sent_messages[0][2]["buttons"]
-        assert [len(row) for row in rows] == [3, 2, 1]
+        assert data[-1] == b"close" and not any(d.startswith(b"managecat:") for d in data)
+        tops = quiet_bot.manage_handlers.top_folders()
+        if len(tops) == 1:
+            assert tops[0] in text and b"home:main" in data
+        else:
+            assert text == quiet_bot.get_text("manage_select_folder")
+            assert sum(d.startswith(b"fm:o:") for d in data) == len(tops)
 
     @pytest.mark.parametrize("command", ["/start", "/donate", "/version", "/list", "/manage"])
     def test_en_un_foro_contesta_en_el_tema_del_comando(
@@ -369,151 +371,6 @@ class TestComandos:
         run_async(quiet_bot.handle_start(CommandEvent(command)))
 
         assert quiet_bot.get_text("button_close") in _all_button_texts(sent_messages[0][2]["buttons"])
-
-
-# --- handle_list_files -------------------------------------------------------
-#
-# `/list <categoría>` reutiliza el listado de handlers/manage.py, así que los
-# envíos se capturan allí (quiet_manage) y las carpetas se cambian en los dos
-# módulos.
-
-def _use_paths(dropbot, monkeypatch, paths):
-    from handlers import manage
-
-    monkeypatch.setattr(dropbot, "DOWNLOAD_PATHS", paths)
-    monkeypatch.setattr(manage, "DOWNLOAD_PATHS", paths)
-
-
-@pytest.fixture
-def folders(dropbot, quiet_manage, tmp_path, monkeypatch):
-    paths = {kind: str(tmp_path / kind) for kind in
-             ("audio", "video", "photo", "torrent", "ebook", "url_video", "url_audio")}
-    for path in paths.values():
-        os.makedirs(path)
-    _use_paths(dropbot, monkeypatch, paths)
-    return paths
-
-
-def _touch(folder, name, size=10):
-    with open(os.path.join(folder, name), "wb") as fh:
-        fh.write(b"x" * size)
-
-
-class ListEvent:
-    def __init__(self, text):
-        self.raw_text = text
-        self.chat_id = 42
-        self.id = 1
-        self.sender_id = ADMIN_ID
-
-
-class TestListarFicheros:
-    def test_sin_ficheros_lo_dice(self, quiet_bot, folders, sent_messages, run_async, config_dir):
-        run_async(quiet_bot.handle_list_files(ListEvent("/list")))
-        assert sent_messages[0][1] == quiet_bot.get_text("list_empty")
-
-    def test_en_un_foro_el_listado_va_al_tema_del_comando(
-        self, quiet_bot, folders, sent_messages, run_async, config_dir
-    ):
-        _touch(folders["video"], "peli.mkv")
-        event = ListEvent("/list video")
-        event.reply_to = forum_reply_to()
-
-        run_async(quiet_bot.handle_list_files(event))
-
-        assert sent_messages and all(kwargs["reply_to"] == FORUM_TOPIC for _, _, kwargs in sent_messages)
-
-    def test_lista_ordenado_y_sin_ocultos(
-        self, quiet_bot, folders, sent_messages, run_async, config_dir
-    ):
-        _touch(folders["video"], "zeta.mkv")
-        _touch(folders["audio"], "Alfa.mp3")
-        _touch(folders["ebook"], ".oculto")
-        # Es del usuario: las miniaturas del bot van a TEMP_DIR, no aquí
-        _touch(folders["video"], "zeta_thumb.jpg")
-
-        run_async(quiet_bot.handle_list_files(ListEvent("/list")))
-
-        (_, text, kwargs), = sent_messages
-        assert text.index("Alfa.mp3") < text.index("zeta.mkv")
-        assert ".oculto" not in text and "zeta_thumb.jpg" in text
-        assert kwargs["buttons"], "el último mensaje lleva las categorías"
-
-    def test_filtra_por_categoria(self, quiet_bot, folders, sent_messages, run_async, config_dir):
-        _touch(folders["video"], "peli.mkv")
-        _touch(folders["url_video"], "youtube.mp4")
-        _touch(folders["audio"], "tema.mp3")
-
-        run_async(quiet_bot.handle_list_files(ListEvent("/list video")))
-
-        text = sent_messages[0][1]
-        assert "peli.mkv" in text and "youtube.mp4" in text
-        assert "tema.mp3" not in text
-
-    def test_cuenta_carpetas_aparte(self, quiet_bot, folders, sent_messages, run_async, config_dir):
-        os.makedirs(os.path.join(folders["video"], "Serie"))
-        _touch(os.path.join(folders["video"], "Serie"), "cap1.mkv", 100)
-        _touch(folders["video"], "peli.mkv", 50)
-
-        run_async(quiet_bot.handle_list_files(ListEvent("/list video")))
-
-        text = sent_messages[0][1]
-        assert "📁" in text and "Serie" in text
-        assert quiet_bot.get_text(
-            "total_files_folders_space", 1, 1, quiet_bot.format_file_size(150)
-        ) in text
-
-    def test_una_carpeta_compartida_no_duplica(
-        self, quiet_bot, quiet_manage, tmp_path, sent_messages, run_async, monkeypatch, config_dir
-    ):
-        """Sin carpetas propias todas las categorías apuntan a la misma."""
-        shared = str(tmp_path / "downloads")
-        os.makedirs(shared)
-        _use_paths(quiet_bot, monkeypatch, {
-            kind: shared for kind in
-            ("audio", "video", "photo", "torrent", "ebook", "url_video", "url_audio")
-        })
-        _touch(shared, "unico.pdf")
-
-        run_async(quiet_bot.handle_list_files(ListEvent("/list")))
-
-        assert sent_messages[0][1].count("unico.pdf") == 1
-
-    def test_muchos_ficheros_se_parten_en_varios_mensajes(
-        self, quiet_bot, folders, sent_messages, run_async, config_dir
-    ):
-        for i in range(120):
-            _touch(folders["ebook"], f"documento_con_nombre_largo_{i:03d}.pdf")
-
-        run_async(quiet_bot.handle_list_files(ListEvent("/list")))
-
-        assert len(sent_messages) > 1
-        assert all(len(text) <= 4096 for _, text, _ in sent_messages)
-        assert all(kwargs["buttons"] is None for _, _, kwargs in sent_messages[:-1])
-        assert sent_messages[-1][2]["buttons"]
-        listed = " ".join(text for _, text, _ in sent_messages)
-        assert all(f"_{i:03d}.pdf" in listed for i in range(120))
-
-    def test_los_nombres_largos_se_recortan(
-        self, quiet_bot, folders, sent_messages, run_async, config_dir
-    ):
-        _touch(folders["ebook"], "a" * 60 + ".pdf")
-        run_async(quiet_bot.handle_list_files(ListEvent("/list")))
-        assert "a" * 37 + "..." in sent_messages[0][1]
-
-    def test_un_error_se_le_dice_al_usuario(
-        self, quiet_bot, quiet_manage, folders, sent_messages, run_async, monkeypatch, config_dir
-    ):
-        _touch(folders["ebook"], "a.pdf")
-
-        def broken(*args, **kwargs):
-            raise RuntimeError("roto")
-
-        monkeypatch.setattr(quiet_manage, "get_category_buttons", broken)
-
-        run_async(quiet_bot.handle_list_files(ListEvent("/list")))
-
-        assert sent_messages[-1][1] == quiet_bot.get_text("error_list_files")
 
 
 # --- send_startup_message ----------------------------------------------------
@@ -724,7 +581,8 @@ class TestMenuDeComandos:
 
         assert [r.lang_code for r in client.requests] == ["", "es", "en"]
         names = [c.command for c in client.requests[0].commands]
-        assert names == ["start", "list", "manage", "settings", "version", "donate", "donors"]
+        # Sin /list: hace lo mismo que /manage, y dos entradas para lo mismo sobran
+        assert names == ["start", "manage", "find", "settings", "version", "donate", "donors"]
 
     def test_cambiar_el_idioma_traduce_el_menu_en_caliente(
         self, dropbot, run_async, monkeypatch, config_dir

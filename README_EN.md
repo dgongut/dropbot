@@ -27,9 +27,14 @@ Download files straight to your server, each into its own folder
 - ✅ Whole playlists or only the first video, with a video cap and a maximum size per download
 - ✅ Sends what it downloaded back to Telegram, converted only if Telegram cannot play it, with hardware acceleration (VAAPI, NVENC, QSV)
 - ✅ Fast transfers with several connections per file
-- ✅ `/list` and `/manage` to see, rename, delete, extract (zip, tar and rar) and send back to Telegram what is on the server
+- ✅ `/manage` to see, rename, delete, extract (zip, tar and rar) and send back to Telegram what is on the server
+- ✅ File browser in `/manage`: go into folders, move files and folders between them and act on a whole list (move, rename or delete everything)
+- ✅ `/find` to search by name or by path in all your folders
+- ✅ Smart renaming of movies and series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`), with templates, a whole folder at once and taking the subtitles along; optionally automatic on download
+- ✅ Series folder: a new episode is offered (or sent straight, if you turn it on) to the folder where you already have the previous ones
+- ✅ Replace a previous version: when the name a download should take already belongs to another file, it offers to keep the new one
 - ✅ Everything is set from the bot itself with `/settings`, without touching the docker-compose or restarting
-- ✅ Each type of file to its own folder just by mounting it
+- ✅ Each type of file to its own folder just by mounting it, or to the one you choose from `/settings`, with favourite folders and the option to ask for the destination of each download
 - ✅ Spanish and English
 
 Looking for it on [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/dropbot)?
@@ -82,9 +87,9 @@ Only the variables the bot needs **before** it can read its own settings are lef
 
 | COMMAND | WHAT IT DOES |
 |:------------- | :-------------|
-| `/start` | Greeting and how to use it |
-| `/list` | What is on the server, by category. `/list video` (or `audio`, `photo`, `torrent`, `ebook`) goes straight to one |
-| `/manage` | The same, but each item opens its actions: rename, delete, extract or send it to Telegram |
+| `/start` | The main menu: a button for each thing |
+| `/manage` | The file browser: what is on the server with its size, folders open and each item has its actions (move, rename, delete, extract or send it to Telegram). `/list` does the same |
+| `/find text` | Searches by name or by path in all your folders |
 | `/settings` | The bot settings |
 | `/version` | The installed version |
 | `/donate` · `/donors` | How to support the project, and who already has |
@@ -118,7 +123,12 @@ They are kept in `settings.json`, inside `/config`, and apply at once, without r
 | Video conversion → Encoder | CPU (`libx264`, default), VAAPI (Intel/AMD, recommended), NVENC (NVIDIA) or QSV (Intel Quick Sync, experimental: it needs Intel's runtime, which is not in the image). If the hardware encoder fails, it is retried with `libx264` automatically. See the hardware acceleration section |
 | Video conversion → Quality | One of the menu values (18-35), or each encoder's own (default). Higher values lower quality and size. `23` is a good starting point |
 | After extracting | What to do with the compressed file after extracting it from `/manage`: ask (default), delete it (with all its parts, for a multi-part RAR) or keep it |
-| Own folders | Read only: where each type of file goes. See the folders section |
+| Folders | Where each type of file goes: tap a type to choose its folder, or leave it on the one it gets from the volumes. See the folders section |
+| Folders → Favourites | Folders that come first when moving a file or choosing a destination |
+| Folders → Ask for the folder | When each download ends, asks which folder to keep it in. Off by default |
+| Folders → Warn when it may not fit | Warns when the incoming file is larger than the free space. On by default |
+| Renaming | Rename on download (off by default), replace without asking when the name exists, and the templates. See the renaming section |
+| Series to their folder | Suggest the series folder (on by default) and send episodes straight to it (off by default). See the series folder section |
 | Anonymous statistics | Once a day it sends anonymous usage figures. On by default. See the statistics section |
 
 </details>
@@ -126,7 +136,7 @@ They are kept in `settings.json`, inside `/config`, and apply at once, without r
 <details>
 <summary>📁 Each type of file to its own folder</summary>
 
-Everything goes to `/downloads` unless you mount a type's folder: then it goes there. There is nothing else to turn on.
+Everything goes to `/downloads` unless you mount a type's folder: then it goes there. There is nothing else to turn on. And if you prefer another one, choose it from `/settings` (below).
 
 | FOLDER | WHAT GOES THERE |
 |:------------- | :-------------|
@@ -146,7 +156,66 @@ Everything goes to `/downloads` unless you mount a type's folder: then it goes t
       - /path/to/download/audio:/audio
 ```
 
-In `/settings` → **📁 Own folders** you see where each type is going, and in `/list` and `/manage` each type with its own folder shows up as a separate category.
+In `/settings` → **📁 Folders** you see where each type is going and you can change it: tap a type and choose its folder by browsing with buttons, creating a new one or typing the path. Any folder inside a mounted volume is accepted (a subfolder of `/downloads`, another volume such as `/media/movies`...); outside one it is not, because it would be lost when the container is updated. It applies at once, and ↩️ puts it back to the default. If you ever remove from the compose the volume of a chosen folder, the bot says so in the log and goes back to the default one.
+
+In `/manage` each folder opens like in a file browser: one that sits inside another (for example `/downloads/Videos`) shows up as a folder inside it, not mixed with the rest.
+
+</details>
+
+<details>
+<summary>🗂️ Managing what is on the server: move, rename, search</summary>
+
+`/manage` is a browser for what is in your folders:
+
+- **Folders.** Tapping a folder opens it; ⬆️ Up goes back to the one above and 🔧 This folder opens its actions. Long lists are paginated.
+- **📦 Move.** A file or a whole folder to another folder. The picker offers your favourites (⭐) and the download folders (📂) first; inside each one you can go down into its subfolders, create a new one or type the path. It never overwrites: if the destination already holds something with that name, nothing is moved and it tells you. Across disks it copies to a hidden item and only deletes the original once the copy is complete.
+- **✏️ Rename.** By hand, or with one tap when the bot recognises a movie or an episode (see *Smart renaming*). The subtitles of a video are renamed with it.
+- **🪄 Rename everything.** On a folder: the folder itself, its season subfolders and the episodes, with a preview before confirming.
+- **☑️ Select all.** On a whole list (a folder or a search): move, rename or delete them at once. It acts on what was shown when confirming, not on anything that arrives later.
+- **`/find text`.** Searches by name in all your folders, ignoring case and accents, with the words in any order (`/find money heist` finds `Money.Heist`). In quotes, the exact phrase; anything starting with `/` is looked for in the path (`/find /video 1080p`).
+
+The bot only saves and moves inside mounted volumes: a folder outside one would be lost when the container is updated, so it is neither offered nor accepted when typed. To use another folder (for example `/media/series`), mount it in the docker-compose and add it to the favourites in `/settings` → **📁 Folders**: it will show up in the picker and can be opened from `/manage`.
+
+</details>
+
+<details>
+<summary>✏️ Smart renaming</summary>
+
+When you tap ✏️ Rename, the bot suggests a clean name:
+
+- **Movies**: `The.Matrix.1999.1080p.BluRay.x264.mkv` → `The Matrix (1999) - 1080p.mkv`
+- **Series**: `Special Ops Lioness [HDTV 1080p][Cap.103]` → `1x03 - Special Ops Lioness - 1080p` (it understands `Cap.103`, `S01E03`, `T01E03`, `3x05`, `Season 1 Episode 3`, ranges and season packs)
+
+On a folder, 🪄 Rename everything does it all at once:
+
+```
+Mad.Men.2007.COMPLETE.1080p.NF.WEB-DL/                  Mad Men (2007) - 1080p/
+├── Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2/    →    ├── S1 - Mad Men - 1080p/
+│   └── Mad.Men.S01E01.1080p.mkv                        │   └── 1x01 - Mad Men - 1080p.mkv
+└── Extras/                                             └── Extras/
+```
+
+Files take from their folder whatever they lack (title, year and season, never the episode), so `01.mkv` inside `Show.Name.S02.1080p` becomes `2x01 - Show Name - 1080p.mkv`. Folders that identify nothing (`Extras`, `Subs`) and sample clips (`sample.mkv`) are left alone.
+
+In `/settings` → **✏️ Renaming**:
+
+- **Rename on download** gives the suggestion, without asking, to every video that arrives.
+- **Replace without asking when the name exists**: if you download a better copy of something you already had, the old file holds the name the new one should take. Off (default), the bot offers 🔁 Replace the previous one; on, it deletes the old one and keeps the new one. It never replaces a folder.
+- **Templates** for movies, episodes and season packs, with fields such as `{title}`, `{year}`, `{season}`, `{episode.2}` (zero-padded), `{resolution}`, `{episode_title}`... `[ ... ]` is an optional block, dropped when any field inside is missing. The screen shows an example for each template.
+
+It is the same engine as [Torrent-Controller-Bot](https://github.com/dgongut/torrent-controller-bot), which holds the full template reference.
+
+</details>
+
+<details>
+<summary>🧭 Series folder</summary>
+
+When an episode or a season pack arrives, the bot looks in your folders for others of the same series. It compares the title ignoring case, accents and punctuation (`Chicago.Fire.S14E04`, `14x03 - Chicago Fire.mkv` and `chicago fire s14e02` are the same), and when both names carry a year it has to match. It never matches partially: `Chicago Fire` and `Chicago Med` are different shows.
+
+- **Suggest** (default): when the download ends it offers to move it with the others, and when moving from `/manage` that folder comes first, marked with ✨.
+- **Direct** (off by default): it sends it without asking when there is no doubt (a single folder named after the series, or one that holds nothing but its episodes), and the notice carries an ↩️ Undo button. When in doubt, it suggests instead of deciding for you.
+
+If you keep seasons in subfolders (`Mad Men/Season 01`), an episode of the next one is suggested in `Mad Men/Season 02`, even if that folder does not exist yet. The download folders, where everything lands before being sorted, are never suggested unless they are named after the series. The search goes up to four levels below the download folders and your favourites.
 
 </details>
 

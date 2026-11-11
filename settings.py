@@ -11,10 +11,15 @@ desde el propio /settings.
 
 import os
 
+import name_parser
 import store
 from logger import warning
 
 LANGUAGES = ("ES", "EN")
+# Los tipos de fichero que tienen carpeta de destino, en el orden en que se enseñan
+FOLDER_KINDS = ("video", "audio", "photo", "torrent", "ebook", "url_video", "url_audio")
+# Las plantillas de renombrado, por lo que renombran
+TEMPLATE_KINDS = ("movie", "series", "season")
 # En el selector cada idioma se nombra en sí mismo, que es lo que busca quien
 # busca el suyo
 LANGUAGE_NAMES = {"ES": "Español", "EN": "English"}
@@ -95,6 +100,37 @@ def _bool(raw):
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _template(raw):
+    """Una plantilla de renombrado, o "" para la de por defecto."""
+    value = str(raw or "").strip()
+    if value:
+        try:
+            name_parser.validate_template(value)
+        except name_parser.TemplateError as e:
+            raise ValueError(f"invalid template ({e.code}): {raw!r}")
+    return value
+
+
+def _path_list(raw):
+    """Una lista de rutas absolutas, sin repetir. Que sigan valiendo (dentro
+    de un volumen) lo mira `folders` al usarlas: depende de qué haya montado."""
+    if not isinstance(raw, list):
+        raise ValueError(f"not a list: {raw!r}")
+    paths = []
+    for item in raw:
+        if isinstance(item, str) and item.startswith("/") and item not in paths:
+            paths.append(item)
+    return paths
+
+
+def _path_map(raw):
+    """{tipo: ruta absoluta}, solo de los tipos que tienen carpeta."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"not an object: {raw!r}")
+    return {kind: path for kind, path in raw.items()
+            if kind in FOLDER_KINDS and isinstance(path, str) and path.startswith("/")}
+
+
 parse_language = _choice(LANGUAGES)
 parse_auto_format = _choice(AUTO_FORMATS)
 parse_auto_send = _choice(AUTO_SEND_MODES)
@@ -130,6 +166,17 @@ PARSERS = {
     "extract.after": parse_extract_after,
     "video.hw": parse_ffmpeg_hw,
     "video.quality": parse_quality,
+    "folders.paths": _path_map,
+    "folders.favorites": _path_list,
+    "folders.ask": _bool,
+    "folders.low_space": _bool,
+    "rename.auto": _bool,
+    "rename.replace": _bool,
+    "rename.template_movie": _template,
+    "rename.template_series": _template,
+    "rename.template_season": _template,
+    "series.suggest": _bool,
+    "series.direct": _bool,
     "telemetry": _bool,
 }
 
@@ -236,6 +283,43 @@ def ffmpeg_hw():
 
 def ffmpeg_quality():
     return get("video.quality")
+
+
+def folder_paths():
+    return get("folders.paths")
+
+
+def favorite_folders():
+    return get("folders.favorites")
+
+
+def ask_folder():
+    return get("folders.ask")
+
+
+def low_space_warning():
+    return get("folders.low_space")
+
+
+def auto_rename():
+    return get("rename.auto")
+
+
+def auto_replace():
+    return get("rename.replace")
+
+
+def rename_template(kind):
+    """La plantilla de `kind` (movie, series o season), o None para la de por defecto."""
+    return get(f"rename.template_{kind}") or None
+
+
+def series_suggest():
+    return get("series.suggest")
+
+
+def series_direct():
+    return get("series.direct")
 
 
 def env_settings_present():

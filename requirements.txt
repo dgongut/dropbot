@@ -12,3 +12,7 @@ bgutil-ytdlp-pot-provider==2.0.2
 # Cliente de estadísticas anónimas, de dgongut/telemetry (sin PyPI). Va por el
 # commit del tag client-v1.0.0 y no por el tag, que se puede mover
 dgongut-telemetry @ https://github.com/dgongut/telemetry/archive/5122dbba55968823ff5dd64da4c8419df31a512c.zip#subdirectory=clients/python
+# El parser de nombres y las plantillas de renombrado, de dgongut/name-parser
+# (sin PyPI), compartido con Torrent-Controller-Bot. Va por el commit del tag
+# v1.0.1 y no por el tag, que se puede mover
+dgongut-name-parser @ https://github.com/dgongut/name-parser/archive/78145cb97f97a777ddbe08c72ebcff1405b33369.zip

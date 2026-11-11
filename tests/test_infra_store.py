@@ -325,7 +325,13 @@ class TestParsers:
                    settings.audio_quality, settings.prefer_compatible, settings.audio_format,
                    settings.audio_tags, settings.sponsorblock, settings.playlist_mode,
                    settings.playlist_limit, settings.max_size_mb, settings.extract_after,
-                   settings.ffmpeg_hw, settings.ffmpeg_quality]
+                   settings.ffmpeg_hw, settings.ffmpeg_quality,
+                   settings.folder_paths, settings.favorite_folders, settings.ask_folder,
+                   settings.low_space_warning, settings.auto_rename, settings.auto_replace,
+                   lambda: settings.rename_template("movie") or "",
+                   lambda: settings.rename_template("series") or "",
+                   lambda: settings.rename_template("season") or "",
+                   settings.series_suggest, settings.series_direct]
         defaults = [settings.get(key) for key in settings.PARSERS if key != "telemetry"]
         assert [reader() for reader in readers] == defaults
 

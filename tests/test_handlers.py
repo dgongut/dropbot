@@ -20,8 +20,7 @@ EXPECTED_CALLBACKS = {
     b"playlist_(full|first):(.+)",
     b"playlistfmt_(full|first)_(audio|video):(.+)",
     b"url_(audio|video):(.+)",
-    b"listcat:(.+)",
-    b"managecat:(.+)",
+    b"(listcat|managecat):(.+)",
     b"fileact:(.+)",
     b"download:(.+)",
     b"close",
@@ -34,7 +33,7 @@ EXPECTED_CALLBACKS = {
     b"cfg:(.+)",
 }
 
-EXPECTED_HANDLER_COUNT = 24
+EXPECTED_HANDLER_COUNT = 28
 
 
 def _pattern_of(event):

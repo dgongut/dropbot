@@ -105,6 +105,8 @@ class TestMetricas:
             "auto_send", "video_quality", "audio_quality", "prefer_compatible", "audio_format",
             "audio_tags", "sponsorblock", "playlist_mode", "playlist_limit", "max_size_mb",
             "extract_after", "ffmpeg_hw", "ffmpeg_quality_custom", "cookies", "gpu_device",
+            "ask_folder", "low_space_warning", "favorite_folders", "chosen_folders", "auto_rename",
+            "auto_replace", "custom_templates", "series_suggest", "series_direct",
         } | {f"folder_{kind}" for kind in config.DOWNLOAD_PATHS}
         assert set(metrics) == expected
 

@@ -135,7 +135,7 @@ MAX_TELEGRAM_FILE_SIZE = 4000 * 512 * 1024
 MESSAGE_QUEUE_DELAY = 0.5  # Delay entre mensajes en segundos
 MESSAGE_QUEUE_MAX_RETRIES = 5  # Número máximo de reintentos
 
-def resolve_download_paths(mounted=is_mounted):
+def resolve_download_paths(mounted=is_mounted, overrides=None):
     """La carpeta de destino de cada tipo de contenido.
 
     Un tipo tiene carpeta propia cuando esa carpeta está montada como volumen:
@@ -146,29 +146,35 @@ def resolve_download_paths(mounted=is_mounted):
 
     Lo descargado desde URLs va a /url_video o /url_audio si están montadas, y
     si no, donde vaya el resto del vídeo o del audio.
+
+    `overrides` son las carpetas elegidas desde /settings, {tipo: ruta}: la de
+    un tipo manda sobre la que le tocaría por los volúmenes. Que estén dentro
+    de un volumen lo comprueba quien las pasa (ver `folders`).
     """
+    overrides = overrides or {}
+
     def own(path):
         return path if mounted(path) else None
 
-    video = own(DOWNLOAD_VIDEO) or DOWNLOAD_PATH
-    audio = own(DOWNLOAD_AUDIO) or DOWNLOAD_PATH
+    def pick(kind, default):
+        return overrides.get(kind) or default
+
+    video = pick("video", own(DOWNLOAD_VIDEO) or DOWNLOAD_PATH)
+    audio = pick("audio", own(DOWNLOAD_AUDIO) or DOWNLOAD_PATH)
     return {
         "audio": audio,
         "video": video,
-        "photo": own(DOWNLOAD_PHOTO) or DOWNLOAD_PATH,
-        "torrent": own(DOWNLOAD_TORRENT) or DOWNLOAD_PATH,
-        "ebook": own(DOWNLOAD_EBOOK) or DOWNLOAD_PATH,
-        "url_video": own(DOWNLOAD_URL_VIDEO) or video,
-        "url_audio": own(DOWNLOAD_URL_AUDIO) or audio,
+        "photo": pick("photo", own(DOWNLOAD_PHOTO) or DOWNLOAD_PATH),
+        "torrent": pick("torrent", own(DOWNLOAD_TORRENT) or DOWNLOAD_PATH),
+        "ebook": pick("ebook", own(DOWNLOAD_EBOOK) or DOWNLOAD_PATH),
+        "url_video": pick("url_video", own(DOWNLOAD_URL_VIDEO) or video),
+        "url_audio": pick("url_audio", own(DOWNLOAD_URL_AUDIO) or audio),
     }
 
 
 DOWNLOAD_PATHS = resolve_download_paths()
 
 
-def has_own_folder(*kinds):
-    """True si alguno de esos tipos no va a la carpeta general."""
-    return any(DOWNLOAD_PATHS[kind] != DOWNLOAD_PATH for kind in kinds)
 
 
 def downloads_persistent(mounted=is_mounted):

@@ -63,15 +63,6 @@ class TestVolumenes:
 
 
 class TestCarpetas:
-    def test_has_own_folder(self, monkeypatch):
-        paths = config.resolve_download_paths(mounted=lambda path: path == config.DOWNLOAD_AUDIO)
-        monkeypatch.setattr(config, "DOWNLOAD_PATHS", paths)
-        assert config.has_own_folder("audio") is True
-        assert config.has_own_folder("url_audio") is True
-        assert config.has_own_folder("video", "photo") is False
-        assert config.has_own_folder("video", "audio") is True
-        assert config.has_own_folder() is False
-
     def test_todo_montado(self):
         paths = config.resolve_download_paths(mounted=lambda path: True)
         assert paths == {

@@ -69,6 +69,33 @@ DEFAULTS = {
         # ASK / DELETE / KEEP: qué hacer con el comprimido tras descomprimirlo
         "after": "ASK",
     },
+    "folders": {
+        # Carpeta elegida para cada tipo, {tipo: ruta}. El que no esté va a
+        # la que le toca por los volúmenes montados (ver config)
+        "paths": {},
+        # Carpetas que se ofrecen las primeras al mover o al elegir destino
+        "favorites": [],
+        # Preguntar dónde guardar cada descarga cuando termina
+        "ask": False,
+        # Avisar si lo que llega puede no caber en el disco
+        "low_space": True,
+    },
+    "rename": {
+        # Renombrar con la sugerencia lo que se descarga, sin preguntar
+        "auto": False,
+        # Si el nombre ya lo tiene otro fichero, sustituirlo sin preguntar
+        "replace": False,
+        # Plantillas de la sugerencia. "" = la que trae name_parser
+        "template_movie": "",
+        "template_series": "",
+        "template_season": "",
+    },
+    "series": {
+        # Proponer para un episodio la carpeta donde ya están los anteriores
+        "suggest": True,
+        # Y mandarlo directo cuando no hay ninguna duda
+        "direct": False,
+    },
     # Estadísticas anónimas, una vez al día. Ver telemetry.py
     "telemetry": True,
 }

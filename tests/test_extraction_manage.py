@@ -295,6 +295,8 @@ class TestDescomprimir:
 
         assert (existing / "dentro.txt").read_bytes() == b"mio"
         assert extractor.last() == get_text("error_extraction_folder_exists", "paquete")
+        # Con vuelta a la ficha: sin botones, el error se la comía
+        assert extractor.payloads()[-2:] == [b"fileact:x1", b"close"]
 
     def test_un_fichero_con_el_nombre_de_la_carpeta_tambien_lo_impide(self, extractor):
         archive = make_zip(extractor.root / "paquete.zip")
@@ -730,7 +732,7 @@ class TestTrasDescomprimirSegunElAjuste:
         assert get_text("file_deleted_title") in extractor.last()
         assert get_text("extraction_ask_delete") not in extractor.last()
         assert "x1" not in extractor.module.pending_file_actions
-        assert set(extractor.payloads()) == {b"managecat:all", b"close"}
+        assert set(extractor.payloads()) == {b"fm:r", b"close"}
 
     def test_borrar_no_se_lleva_otro_fichero_que_ocupo_su_nombre(self, extractor, monkeypatch):
         """Durante la extracción se renombra y llega otro «Pack.zip»: al acabar
@@ -845,7 +847,7 @@ class TestTrasDescomprimirSegunElAjuste:
         assert archive.exists()
         assert get_text("file_kept_desc") in extractor.last()
         assert get_text("extraction_ask_delete") not in extractor.last()
-        assert set(extractor.payloads()) == {b"managecat:all", b"close"}
+        assert set(extractor.payloads()) == {b"fm:r", b"close"}
         assert extractor.module.pending_file_actions.get("x1") == str(archive)
 
     @pytest.mark.parametrize("after", ["DELETE", "KEEP"])
@@ -886,7 +888,7 @@ class TestBorrarOConservarDespues:
 
         assert archive.exists()
         assert extractor.last() == extractor.module.kept_message("paquete.zip")
-        assert set(extractor.payloads()) == {b"managecat:all", b"close"}
+        assert set(extractor.payloads()) == {b"fm:r", b"close"}
 
     def test_borrar(self, extractor):
         archive = make_zip(extractor.root / "paquete.zip")

@@ -122,6 +122,12 @@ store.is_persisted = functools.partial(mounts.is_persisted, mounted=_mounted)
 
 store.init(str(_SANDBOX / "config"))
 
+import folders  # noqa: E402
+
+# Lo mismo para las carpetas que valen como destino (ver folders.py): que una
+# ruta esté dentro de un volumen lo dicen los tests y no dónde esté /tmp
+folders.is_mounted = _mounted
+
 
 def pytest_sessionfinish(session, exitstatus):
     """El sandbox no se queda en /tmp después de cada pasada."""
@@ -371,3 +377,108 @@ def run_async():
     def runner(coro):
         return asyncio.run(coro)
     return runner
+
+
+# ---------------------------------------------------------------------------
+# La operativa de archivos: carpetas, mover, renombrar (ver folders y fileops)
+# ---------------------------------------------------------------------------
+
+class ButtonPress:
+    """Un CallbackQuery como los de Telethon: `id` es el de la consulta y
+    `message_id` el del mensaje que tiene el botón."""
+
+    def __init__(self, data, message_id=1, chat_id=42, sender_id=ADMIN_ID):
+        self.id = 10_000
+        self.message_id = message_id
+        self.chat_id = chat_id
+        self.sender_id = sender_id
+        self.is_private = True
+        self.is_channel = False
+        self.data = data
+        # Todos los handlers nuevos registran "<prefijo>:(.+)"
+        self._groups = (data, data.split(b":", 1)[1] if b":" in data else b"")
+        self.pattern_match = self
+
+    def group(self, index):
+        return self._groups[index]
+
+    async def get_sender(self):
+        return None
+
+
+class TextMessage:
+    """Un mensaje de texto del admin, en el privado con el bot salvo que se diga."""
+
+    def __init__(self, text, reply_to_msg_id=None, chat_id=42, sender_id=ADMIN_ID, is_private=True):
+        self.raw_text = text
+        self.sender_id = sender_id
+        self.reply_to_msg_id = reply_to_msg_id
+        self.reply_to = None
+        self.media = None
+        self.id = 500
+        self.chat_id = chat_id
+        self.is_private = is_private
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
+
+    async def get_sender(self):
+        return None
+
+
+def buttons_of(sent_messages, index=-1):
+    """Los botones del último mensaje enviado o editado: [(texto, callback), ...]."""
+    from button_data import button_data
+
+    with_buttons = [kwargs for _, _, kwargs in sent_messages if "buttons" in kwargs]
+    if not with_buttons:
+        return []
+    return [(button.text, button_data(button))
+            for row in with_buttons[index].get("buttons") or []
+            for button in (row if isinstance(row, (list, tuple)) else [row])]
+
+
+@pytest.fixture
+def library(quiet_manage, sent_messages, monkeypatch, tmp_path, config_dir, volumes):
+    """Un servidor de pruebas para la operativa de archivos.
+
+    Tres carpetas en tmp_path: la general (`base`), la de vídeo, montada como
+    volumen (`video`), y otro volumen que no es de ningún tipo (`media`), como
+    un /media/series. Fuera de ellas, `outside` no está en ningún volumen.
+    Devuelve un objeto con esas rutas y los módulos de handlers, con sus
+    envíos capturados en `sent_messages` y el estado limpio.
+    """
+    import state
+    from handlers import arrivals, files, home, inputs, picker
+    from handlers import settings as settings_screens
+
+    manage = quiet_manage
+    for module in (files, picker, arrivals, settings_screens, home):
+        _patch_messaging(module, sent_messages, monkeypatch)
+
+    paths = {name: str(tmp_path / name) for name in ("base", "video", "media", "outside")}
+    for path in paths.values():
+        os.makedirs(path)
+    monkeypatch.setattr(config, "DOWNLOAD_PATH", paths["base"])
+    monkeypatch.setattr(config, "DOWNLOAD_VIDEO", paths["video"])
+    monkeypatch.setattr(settings_screens, "DOWNLOAD_PATH", paths["base"])
+    # Solo lo que monta el test: sin las /url_video y /url_audio de la sesión
+    volumes.clear()
+    volumes.update({paths["video"], paths["media"]})
+
+    stores = (state.pending_file_actions, state.pending_renames, state.pickers,
+              state.pending_inputs, state.confirmations, state.find_queries, state.arrivals,
+              state._manage_ids, state.pending_files, state._claimed, state.manage_trails)
+    for registry in stores:
+        registry.clear()
+    before = dict(config.DOWNLOAD_PATHS)
+    folders.apply()
+
+    yield SimpleNamespace(manage=manage, files=files, picker=picker, arrivals=arrivals, inputs=inputs, home=home,
+                          settings=settings_screens, state=state, **paths)
+
+    for registry in stores:
+        registry.clear()
+    config.DOWNLOAD_PATHS.clear()
+    config.DOWNLOAD_PATHS.update(before)

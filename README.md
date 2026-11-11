@@ -19,17 +19,22 @@
 
 Descarga archivos directamente en tu servidor a su carpeta correspondiente
 
-- ✅ Mándale un fichero y lo guarda en su carpeta: vídeo, audio (también notas de voz), fotos, torrents, libros o el resto
+- ✅ Mándale un archivo y lo guarda en su carpeta: vídeo, audio (también notas de voz), fotos, torrents, libros o el resto
 - ✅ Mándale un enlace de YouTube, Instagram, TikTok, Twitter y 1800+ sitios más y descarga el vídeo o el audio
-- ✅ Los enlaces directos a un fichero (un PDF, un ZIP...) se descargan tal cual
+- ✅ Los enlaces directos a un archivo (un PDF, un ZIP...) se descargan tal cual
 - ✅ Elige la calidad de lo que bajas de un enlace: resolución máxima, MP3 o M4A sin recodificar, y título, artista y carátula dentro del audio
 - ✅ Quita patrocinios y autopromoción de los vídeos de YouTube con SponsorBlock
 - ✅ Playlists enteras o solo el primer vídeo, con un tope de vídeos y un tamaño máximo por descarga
 - ✅ Te devuelve a Telegram lo descargado, convertido solo si Telegram no puede reproducirlo, y con aceleración por hardware (VAAPI, NVENC, QSV)
-- ✅ Transferencias rápidas con varias conexiones por fichero
-- ✅ `/list` y `/manage` para ver, renombrar, borrar, descomprimir (zip, tar y rar) y reenviar a Telegram lo que hay en el servidor
+- ✅ Transferencias rápidas con varias conexiones por archivo
+- ✅ `/manage` para ver, renombrar, eliminar, descomprimir (zip, tar y rar) y reenviar a Telegram lo que hay en el servidor
+- ✅ Explorador de archivos en `/manage`: entra en las carpetas, mueve archivos y carpetas entre ellas y actúa sobre un listado entero (mover, renombrar o eliminar todo)
+- ✅ `/find` para buscar por nombre o por ruta en todas tus carpetas
+- ✅ Renombrado inteligente de películas y series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`), con plantillas, de una carpeta entera de una vez y arrastrando los subtítulos; opcionalmente automático al descargar
+- ✅ Carpeta de la serie: un episodio nuevo se ofrece (o va directo, si lo activas) a la carpeta donde ya tienes los anteriores
+- ✅ Sustituir una versión anterior: si el nombre que le toca a una descarga ya lo tiene otro archivo, te ofrece quedarte con el nuevo
 - ✅ Todo se ajusta desde el propio bot con `/settings`, sin tocar el docker-compose ni reiniciar
-- ✅ Cada tipo de fichero a su carpeta con solo montarla
+- ✅ Cada tipo de archivo a su carpeta con solo montarla, o a la que elijas desde `/settings`, con carpetas favoritas y la opción de preguntar el destino de cada descarga
 - ✅ Español e inglés
 
 ¿Lo buscas en [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/dropbot)?
@@ -59,7 +64,7 @@ services:
 docker compose up -d
 ```
 
-Abre Telegram, envíale `/start` a tu bot y mándale un fichero o un enlace. Todo lo demás se ajusta desde `/settings`.
+Abre Telegram, envíale `/start` a tu bot y mándale un archivo o un enlace. Todo lo demás se ajusta desde `/settings`.
 
 > [!WARNING]
 > Mapea siempre un volumen en `/config`: ahí se guardan los ajustes y la sesión de Telegram del bot, que se mueve ahí sola si estaba en `/app`. Sin él se pierden al recrear el contenedor, y el bot te lo recuerda al arrancar. La sesión da el mismo acceso que el token: no compartas esa carpeta, ni la uses en dos contenedores a la vez.
@@ -82,14 +87,14 @@ Aquí solo quedan las variables que el bot necesita **antes** de poder leer sus 
 
 | COMANDO | QUÉ HACE |
 |:------------- | :-------------|
-| `/start` | Saludo y cómo se usa |
-| `/list` | Lo que hay en el servidor, por categorías. `/list video` (o `audio`, `photo`, `torrent`, `ebook`) va directo a una |
-| `/manage` | Lo mismo, pero cada elemento abre sus acciones: renombrar, borrar, descomprimir o enviarlo a Telegram |
+| `/start` | El menú principal: un botón para cada cosa |
+| `/manage` | El explorador de archivos: lo que hay en el servidor con su tamaño, las carpetas se abren y cada elemento tiene sus acciones (mover, renombrar, eliminar, descomprimir o enviarlo a Telegram). `/list` hace lo mismo |
+| `/find texto` | Busca por nombre o por ruta en todas tus carpetas |
 | `/settings` | Los ajustes del bot |
 | `/version` | La versión instalada |
 | `/donate` · `/donors` | Cómo apoyar el proyecto, y quién lo ha apoyado ya |
 
-Para descargar no hace falta ningún comando: basta con mandarle el fichero o el enlace.
+Para descargar no hace falta ningún comando: basta con mandarle el archivo o el enlace.
 
 Ojo con los enlaces de terceros: en los directos, el bot no sigue una redirección de una web pública a tu red local, pero yt-dlp sigue las redirecciones por su cuenta, y también los enlaces que encuentra en la página. Un enlace preparado puede hacer así que el contenedor le pida algo a un equipo de tu red (el router, un NAS). La única forma de evitarlo del todo es limitar la red del contenedor: una regla del cortafuegos o una red de Docker que no le deje salir a las direcciones privadas (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` y `169.254.0.0/16`), o un proxy de salida. A cambio, el bot tampoco podrá descargar de tu red local.
 
@@ -104,7 +109,7 @@ Se guardan en `settings.json`, dentro de `/config`, y se aplican al momento, sin
 |:------------- | :-------------|
 | Idioma | Español o English. Por defecto español |
 | Enlaces → Descargar como | Qué hacer al recibir un enlace: preguntar si quieres vídeo o audio (por defecto), o descargar siempre como vídeo o siempre como audio |
-| Enlaces → Tras descargar | Qué hacer con lo descargado desde un enlace, incluidas las playlists completas: preguntar (por defecto), enviar y guardar, enviar y borrar del servidor, o solo guardar. No afecta a los ficheros que envías al bot desde Telegram. Los de más de 2000 MB no caben en Telegram y se quedan solo en el servidor. En vídeos largos se sigue ofreciendo cancelar la conversión o enviar el original |
+| Enlaces → Tras descargar | Qué hacer con lo descargado desde un enlace, incluidas las playlists completas: preguntar (por defecto), enviar y guardar, enviar y eliminar del servidor, o solo guardar. No afecta a los archivos que envías al bot desde Telegram. Los de más de 2000 MB no caben en Telegram y se quedan solo en el servidor. En vídeos largos se sigue ofreciendo cancelar la conversión o enviar el original |
 | Enlaces → Calidad → Vídeo | Resolución máxima: máxima disponible (por defecto), 2160p, 1440p, 1080p, 720p, 480p o 360p. Cuenta el lado corto, así que un vídeo vertical de 1080×1920 es 1080p. Si un vídeo no tiene nada por debajo del límite se baja el más pequeño que haya |
 | Enlaces → Calidad → Preferir compatible con Telegram | Pide el vídeo en H.264 y el audio en AAC, que Telegram reproduce tal cual: el vídeo se envía en segundos en vez de pasar por la conversión. Como YouTube no ofrece H.264 por encima de 1080p, con esto activo un vídeo 4K se baja en 1080p. Por defecto activado |
 | Enlaces → Calidad → Formato del audio | MP3 (por defecto) o M4A, que guarda el audio AAC tal como viene, sin recodificar: suena igual que el original, pesa menos y tarda menos |
@@ -113,27 +118,32 @@ Se guardan en `settings.json`, dentro de `/config`, y se aplican al momento, sin
 | Enlaces → Playlists | Al recibir una playlist: preguntar si la quieres entera o solo el primer vídeo (por defecto), o hacer siempre lo mismo. Y un tope de vídeos al bajarla entera (10, 25, 50, 100 o 200; por defecto sin tope) |
 | Enlaces → SponsorBlock | Quita de los vídeos de YouTube los tramos marcados por la comunidad de [SponsorBlock](https://sponsor.ajay.app): desactivado (por defecto), patrocinios, patrocinios y autopromoción, o todo lo que no es contenido (también intros, despedidas, avances, relleno y lo que no es música en los vídeos musicales) |
 | Enlaces → Tamaño máximo | Lo que pase de este tamaño no se descarga, y el bot te lo dice: 512 MB, 1 GB, 2000 MB (lo más que se puede enviar por Telegram), 5 o 10 GB, o sin límite (por defecto). En una playlist se salta ese vídeo y se sigue con el resto |
-| Descargas simultáneas | Ficheros que se transfieren a la vez. Por defecto 2 |
-| Conexiones por fichero | Conexiones paralelas por fichero para acelerar la transferencia (estilo FastTelethon). 1 = método estándar de Telethon. Recomendado 4-8. Por defecto 8 |
+| Descargas simultáneas | Archivos que se transfieren a la vez. Por defecto 2 |
+| Conexiones por archivo | Conexiones paralelas por archivo para acelerar la transferencia (estilo FastTelethon). 1 = método estándar de Telethon. Recomendado 4-8. Por defecto 8 |
 | Conversión de vídeo → Encoder | CPU (`libx264`, por defecto), VAAPI (Intel/AMD, recomendado), NVENC (NVIDIA) o QSV (Intel Quick Sync, experimental: necesita el runtime de Intel y no viene en la imagen). Si el encoder hardware falla, se reintenta automáticamente con `libx264`. Ver desplegable de aceleración por hardware |
 | Conversión de vídeo → Calidad | Entre las que ofrece el menú (18-35), o la predeterminada de cada encoder (por defecto). Valores más altos reducen calidad y tamaño. `23` es un buen valor inicial |
-| Tras descomprimir | Qué hacer con el fichero comprimido después de descomprimirlo desde `/manage`: preguntar (por defecto), borrarlo (con todas sus partes, si es un RAR multiparte) o conservarlo |
-| Carpetas propias | Solo lectura: dónde va cada tipo de fichero. Ver desplegable de carpetas |
+| Tras descomprimir | Qué hacer con el archivo comprimido después de descomprimirlo desde `/manage`: preguntar (por defecto), eliminarlo (con todas sus partes, si es un RAR multiparte) o conservarlo |
+| Carpetas | Dónde va cada tipo de archivo: toca un tipo para elegir su carpeta, o déjalo en la que le toca por los volúmenes. Ver desplegable de carpetas |
+| Carpetas → Favoritas | Carpetas que salen las primeras al mover un archivo o elegir destino |
+| Carpetas → Preguntar la carpeta | Al terminar cada descarga, pregunta en qué carpeta guardarla. Por defecto desactivado |
+| Carpetas → Avisar si puede no caber | Avisa cuando el archivo que llega ocupa más que el espacio libre. Por defecto activado |
+| Renombrado | Renombrar al descargar (por defecto desactivado), sustituir sin preguntar si el nombre ya existe y las plantillas. Ver desplegable de renombrado |
+| Series a su carpeta | Proponer la carpeta de la serie (por defecto activado) y mandar los episodios directos a ella (por defecto desactivado). Ver desplegable de la carpeta de la serie |
 | Estadísticas anónimas | Una vez al día envía cifras anónimas de uso. Por defecto activado. Ver desplegable de estadísticas |
 
 </details>
 
 <details>
-<summary>📁 Cada tipo de fichero en su carpeta</summary>
+<summary>📁 Cada tipo de archivo en su carpeta</summary>
 
-Todo va a `/downloads` salvo que montes la carpeta de un tipo: entonces va ahí. No hay que activar nada más.
+Todo va a `/downloads` salvo que montes la carpeta de un tipo: entonces va ahí. No hay que activar nada más. Y si prefieres otra, la eliges desde `/settings` (más abajo).
 
 | CARPETA | QUÉ VA AHÍ |
 |:------------- | :-------------|
 | `/video` | Vídeos |
 | `/audio` | Audios |
 | `/photo` | Imágenes |
-| `/torrent` | Ficheros `.torrent` |
+| `/torrent` | Archivos `.torrent` |
 | `/ebook` | Libros electrónicos |
 | `/url_video` | Vídeos descargados desde enlaces. Si no la montas, van donde el resto de vídeos |
 | `/url_audio` | Audios descargados desde enlaces. Si no la montas, van donde el resto de audios |
@@ -146,7 +156,66 @@ Todo va a `/downloads` salvo que montes la carpeta de un tipo: entonces va ahí.
       - /ruta/para/descargar/audio:/audio
 ```
 
-En `/settings` → **📁 Carpetas propias** ves a dónde está yendo cada tipo, y en `/list` y `/manage` cada tipo con carpeta propia sale como una categoría aparte.
+En `/settings` → **📁 Carpetas** ves a dónde está yendo cada tipo y puedes cambiarlo: toca un tipo y elige su carpeta navegando con botones, creando una nueva o escribiendo la ruta. Vale cualquier carpeta que esté dentro de un volumen montado (una subcarpeta de `/downloads`, otro volumen como `/media/pelis`...); fuera de uno no, porque se perdería al actualizar el contenedor. Se aplica al momento, y ↩️ lo devuelve a la de por defecto. Si un día quitas del compose el volumen de una carpeta elegida, el bot lo avisa en el log y vuelve a usar la de por defecto.
+
+En `/manage` cada carpeta se abre como en un explorador: una que está dentro de otra (por ejemplo `/downloads/Vídeos`) se ve como carpeta dentro de ella, no mezclada con el resto.
+
+</details>
+
+<details>
+<summary>🗂️ Gestionar lo que hay en el servidor: mover, renombrar, buscar</summary>
+
+`/manage` es un explorador de lo que hay en tus carpetas:
+
+- **Carpetas.** Tocar una carpeta la abre; ⬆️ Subir vuelve a la de encima y 🔧 Esta carpeta abre sus acciones. Los listados largos van por páginas.
+- **📦 Mover.** Un archivo o una carpeta entera a otra carpeta. El selector ofrece primero tus favoritas (⭐) y las carpetas de descarga (📂); dentro de cada una puedes bajar a sus subcarpetas, crear una nueva o escribir la ruta. Nunca pisa nada: si en el destino ya hay algo con ese nombre, no se mueve y te lo dice. Entre discos distintos copia a un oculto y solo al terminar borra el original.
+- **✏️ Renombrar.** A mano, o con un toque si el bot reconoce una película o un episodio (ver *Renombrado inteligente*). Los subtítulos de un vídeo se renombran con él.
+- **🪄 Renombrar todo.** En una carpeta: ella misma, sus subcarpetas de temporada y los episodios, con vista previa antes de confirmar.
+- **☑️ Seleccionar todo.** Sobre todo un listado (una carpeta o una búsqueda): moverlos, renombrarlos o eliminarlos de una vez. Se actúa sobre lo que se enseñó al confirmar, no sobre lo que llegue después.
+- **`/find texto`.** Busca por nombre en todas tus carpetas, sin importar mayúsculas ni tildes y con las palabras en cualquier orden (`/find casa papel` encuentra `La.Casa.de.Papel`). Entre comillas, la frase exacta; lo que empieza por `/` se busca en la ruta (`/find /video 1080p`).
+
+El bot solo guarda y mueve dentro de volúmenes montados: una carpeta que no esté en uno se perdería al actualizar el contenedor, así que ni se ofrece ni se acepta escrita a mano. Para usar otra carpeta (por ejemplo `/media/series`), móntala en el docker-compose y añádela a favoritas en `/settings` → **📁 Carpetas**: saldrá en el selector y se podrá abrir desde `/manage`.
+
+</details>
+
+<details>
+<summary>✏️ Renombrado inteligente</summary>
+
+Al pulsar ✏️ Renombrar, el bot sugiere un nombre limpio:
+
+- **Películas**: `The.Matrix.1999.1080p.BluRay.x264.mkv` → `The Matrix (1999) - 1080p.mkv`
+- **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (entiende `Cap.103`, `S01E03`, `T01E03`, `3x05`, `Temporada 1 Capitulo 3`, rangos y packs de temporada)
+
+En una carpeta, 🪄 Renombrar todo lo hace de una vez:
+
+```
+Mad.Men.2007.COMPLETE.1080p.NF.WEB-DL/                  Mad Men (2007) - 1080p/
+├── Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2/    →    ├── T1 - Mad Men - 1080p/
+│   └── Mad.Men.S01E01.1080p.mkv                        │   └── 1x01 - Mad Men - 1080p.mkv
+└── Extras/                                             └── Extras/
+```
+
+Los archivos toman de su carpeta lo que no llevan encima (título, año y temporada, nunca el episodio), así que `01.mkv` dentro de `Show.Name.S02.1080p` pasa a ser `2x01 - Show Name - 1080p.mkv`. Las carpetas que no identifican nada (`Extras`, `Subs`) y las muestras (`sample.mkv`) se quedan como están.
+
+En `/settings` → **✏️ Renombrado**:
+
+- **Renombrar al descargar** le pone la sugerencia, sin preguntar, a cada vídeo que llega.
+- **Sustituir sin preguntar si el nombre ya existe**: si descargas una copia mejor de algo que ya tenías, el nombre que le toca lo tiene el archivo antiguo. Desactivado (por defecto), el bot te ofrece 🔁 Sustituir el anterior; activado, elimina el antiguo y se queda con el nuevo. Nunca sustituye una carpeta.
+- **Plantillas** de películas, episodios y packs de temporada, con campos como `{titulo}`, `{año}`, `{temporada}`, `{episodio.2}` (con ceros), `{resolucion}`, `{titulo_episodio}`... `[ ... ]` es un bloque opcional, que desaparece si falta algún campo de dentro. La pantalla enseña un ejemplo con cada plantilla.
+
+Es el mismo motor de [Torrent-Controller-Bot](https://github.com/dgongut/torrent-controller-bot), donde está la referencia completa de las plantillas.
+
+</details>
+
+<details>
+<summary>🧭 Carpeta de la serie</summary>
+
+Cuando llega un episodio o un pack de temporada, el bot busca en tus carpetas otros de la misma serie. Compara el título sin tener en cuenta mayúsculas, tildes ni puntuación (`Chicago.Fire.S14E04`, `14x03 - Chicago Fire.mkv` y `chicago fire s14e02` son la misma), y si los dos nombres llevan año, tiene que coincidir. Nunca hace coincidencias parciales: `Chicago Fire` y `Chicago Med` son series distintas.
+
+- **Proponer** (por defecto): al terminar la descarga te ofrece moverlo con los demás, y al mover desde `/manage` esa carpeta sale la primera, marcada con ✨.
+- **Directo** (desactivado por defecto): lo manda sin preguntar cuando no hay ninguna duda (una única carpeta con el nombre de la serie, o en la que solo hay episodios suyos), y el aviso lleva un botón ↩️ Deshacer. Con dudas, lo propone en vez de decidir por ti.
+
+Si guardas las temporadas en subcarpetas (`Mad Men/Season 01`), un episodio de la siguiente se propone en `Mad Men/Season 02`, aunque esa carpeta aún no exista. Las carpetas de descarga, que es donde cae todo antes de ordenarlo, nunca se proponen salvo que lleven el nombre de la serie. Se busca hasta cuatro niveles por debajo de las carpetas de descarga y de tus favoritas.
 
 </details>
 
@@ -183,8 +252,8 @@ Puedes comprobar qué encoder se está usando en los logs (`[CONVERSION] Encoder
 Para sitios que requieren una sesión autenticada, crea `cookies/cookies.txt` y
 monta la carpeta en `/app/cookies`. Puede ser de solo lectura (`:ro`): yt-dlp
 trabaja con una copia. Si se puede escribir, las cookies que renueve yt-dlp se
-guardan en el fichero, salvo que lo hayas cambiado mientras tanto: un
-`cookies.txt` recién exportado no se pisa. Si el fichero no existe, DropBot
+guardan en el archivo, salvo que lo hayas cambiado mientras tanto: un
+`cookies.txt` recién exportado no se pisa. Si el archivo no existe, DropBot
 continúa usando yt-dlp sin cookies.
 
 ```yaml
@@ -206,10 +275,10 @@ continúa usando yt-dlp sin cookies.
 
 - En el primer arranque el bot importa a `settings.json` los valores de tus variables (`LANGUAGE`, `PARALLEL_DOWNLOADS`, `FAST_CONNECTIONS`, `AUTO_DOWNLOAD_FORMAT`, `AUTO_SEND`, `FFMPEG_HW` y `FFMPEG_QUALITY`) y los conserva tal cual. A partir de ahí manda `/settings`, y esas variables ya no se leen: el log te avisa de las que puedes borrar del docker-compose.
 - **Añade el volumen `/config`.** Sin él la importación se repite en cada recreación del contenedor y lo que cambies en `/settings` no se guarda.
-- **Los `FILTER_*` ya no hacen falta.** Antes había que montar la carpeta *y además* activar su variable; ahora basta con montarla. Si tenías `FILTER_VIDEO=1` y `/video` montada, todo sigue igual. Si tenías un `FILTER_*=1` sin montar su carpeta, esos ficheros se guardaban dentro del contenedor y se perdían al actualizar: ahora van a `/downloads`.
+- **Los `FILTER_*` ya no hacen falta.** Antes había que montar la carpeta *y además* activar su variable; ahora basta con montarla. Si tenías `FILTER_VIDEO=1` y `/video` montada, todo sigue igual. Si tenías un `FILTER_*=1` sin montar su carpeta, esos archivos se guardaban dentro del contenedor y se perdían al actualizar: ahora van a `/downloads`.
 - Un valor no válido en una de esas variables ya no impide arrancar: se ignora con un aviso en el log y se usa el valor por defecto, que puedes corregir desde `/settings`.
 - Lo que descargas de enlaces ahora se pide por defecto en H.264 y AAC, que Telegram reproduce sin convertir. Se envía mucho antes, pero un vídeo 4K de YouTube llega en 1080p. Si prefieres lo de antes, desactiva *Preferir compatible con Telegram* en `/settings` → *Enlaces* → *Calidad*.
-- Los enlaces a páginas web (`.html`) ya no se descargan como si fueran un fichero: pasan por yt-dlp como cualquier otro enlace.
+- Los enlaces a páginas web (`.html`) ya no se descargan como si fueran un archivo: pasan por yt-dlp como cualquier otro enlace.
 - `tty: true` no hace falta. Puedes quitarlo, o dejarlo: no molesta.
 - `init: true` tampoco: la imagen ya arranca con tini, que le pasa al bot la orden de parar para que cierre limpio. Puedes quitarlo, o dejarlo: tampoco molesta.
 
@@ -220,9 +289,9 @@ continúa usando yt-dlp sin cookies.
 
 Desde la 4.0.0 el bot envía una vez al día unas cifras anónimas para saber cuánta gente lo usa y qué funciones se usan más. Así sé dónde poner el esfuerzo. Las estadísticas son públicas: [stats.dgongut.com/dropbot](https://stats.dgongut.com/dropbot).
 
-**Qué se envía:** qué ajustes están activados, qué tipos de fichero tienen carpeta propia (sí o no, nunca la ruta), si hay cookies o GPU disponibles, la versión del bot, la arquitectura, y cuántas veces al día se ha usado cada comando, cada botón y cada tipo de descarga y de conversión. La lista completa, campo a campo, está en [la página de privacidad](https://stats.dgongut.com/dropbot/privacy). El servidor descarta cualquier dato que no esté en ella.
+**Qué se envía:** qué ajustes están activados, qué tipos de archivo tienen carpeta propia (sí o no, nunca la ruta), si hay cookies o GPU disponibles, la versión del bot, la arquitectura, y cuántas veces al día se ha usado cada comando, cada botón y cada tipo de descarga y de conversión. La lista completa, campo a campo, está en [la página de privacidad](https://stats.dgongut.com/dropbot/privacy). El servidor descarta cualquier dato que no esté en ella.
 
-**Qué no se envía nunca:** nombres de ficheros, enlaces, rutas, IDs de Telegram ni nada de lo que escribes. Tu IP no se guarda.
+**Qué no se envía nunca:** nombres de archivos, enlaces, rutas, IDs de Telegram ni nada de lo que escribes. Tu IP no se guarda.
 
 **Cómo se desactiva:** desde `/settings` → *Estadísticas anónimas*, o con `TELEMETRY=false`. Al desactivarlas se borra también el identificador de la instalación. Con *👀 Ver qué se envía* ves exactamente lo que llevaría el próximo envío.
 
@@ -234,7 +303,7 @@ Están activadas por defecto. Nada se envía hasta que el bot lleva al menos 10 
 
 ## Solo para desarrolladores - Ejecución con código local
 
-Para su ejecución en local y probar nuevos cambios de código, se necesita renombrar el fichero `.env_example` a `.env` con los valores necesarios para su ejecución. Los ajustes de prueba se guardan en `./config`, que git ignora.
+Para su ejecución en local y probar nuevos cambios de código, se necesita renombrar el archivo `.env_example` a `.env` con los valores necesarios para su ejecución. Los ajustes de prueba se guardan en `./config`, que git ignora.
 Es necesario establecer un `TELEGRAM_TOKEN` y un `TELEGRAM_ADMIN` correctos y diferentes al de la ejecución normal.
 
 La estructura de carpetas debe quedar:

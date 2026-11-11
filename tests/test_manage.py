@@ -31,7 +31,6 @@ def managed(quiet_manage, tmp_path):
     dropbot = quiet_manage
     dropbot.pending_file_actions.clear()
     dropbot.pending_renames.clear()
-    dropbot.list_messages.clear()
 
     target = tmp_path / "Una película.mkv"
     target.write_bytes(b"\0" * 2048)
@@ -197,16 +196,12 @@ class _RenameInput:
 
 
 class TestCerrar:
-    def test_cerrar_limpia_los_mensajes_de_la_lista(
-        self, managed, make_event, run_async
-    ):
+    def test_cerrar_borra_el_mensaje(self, managed, sent_messages, make_event, run_async):
         dropbot, _, _ = managed
-        event = make_event()
-        dropbot.list_messages[event.sender_id] = [object(), object()]
 
-        run_async(dropbot.handle_close(event))
+        run_async(dropbot.handle_close(make_event()))
 
-        assert event.sender_id not in dropbot.list_messages
+        assert [kind for kind, _, _ in sent_messages] == ["delete"]
 
 
 class TestExtraccion:
@@ -285,34 +280,6 @@ class TestTrasDescomprimir:
 
         assert path.exists()
         assert not any(p.startswith(b"delcompressed:") for p in _payloads(sent_messages))
-
-
-class TestListados:
-    @pytest.mark.parametrize("handler_name", ["handle_list_category", "handle_manage_category"])
-    def test_listar_no_revienta_con_la_carpeta_vacia(
-        self, quiet_manage, texts, make_event, run_async, handler_name
-    ):
-        handler = getattr(quiet_manage, handler_name)
-
-        run_async(handler(make_event(groups=(b"all",))))
-
-        assert "MISSING" not in texts()
-
-    def test_manage_registra_los_ficheros_que_lista(
-        self, quiet_manage, sent_messages, make_event, run_async
-    ):
-        dropbot = quiet_manage
-        dropbot.pending_file_actions.clear()
-        target = os.path.join(dropbot.DOWNLOAD_PATHS["video"], "listado.mp4")
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "wb") as handle:
-            handle.write(b"\0" * 128)
-
-        try:
-            run_async(dropbot.handle_manage_category(make_event(groups=(b"all",))))
-            assert target in dropbot.pending_file_actions.values()
-        finally:
-            os.remove(target)
 
 
 class TestPayloads:

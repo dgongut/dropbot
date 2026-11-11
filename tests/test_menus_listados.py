@@ -1,8 +1,7 @@
-"""Menús de /list y /manage: qué categorías se ofrecen y qué se lista en cada una.
+"""El listado de una carpeta en el explorador de /manage.
 
-Cada test monta su propio árbol de carpetas en `tmp_path` y decide qué tipos
-tienen carpeta propia tocando `config.DOWNLOAD_PATHS` (el mismo dict que usan
-`handlers.manage` y `config.has_own_folder`). Se comprueba lo que vería el
+Cada test monta su propio árbol de carpetas en `tmp_path` y abre la general
+como lo haría el botón de una carpeta (`fm:o:<id>`). Se comprueba lo que vería el
 usuario: los mensajes enviados, su texto ya interpretado como Markdown por
 Telethon, y los botones con su `callback_data`.
 """
@@ -16,7 +15,7 @@ from telethon.extensions import markdown
 import config
 import settings
 from button_data import button_data
-from conftest import FORUM_TOPIC
+from conftest import _patch_messaging
 
 TELEGRAM_TEXT_LIMIT = 4096
 CALLBACK_DATA_LIMIT = 64
@@ -88,14 +87,17 @@ class _NotAdmin:
 
 
 @pytest.fixture
-def manage(quiet_manage):
-    """`handlers.manage` con el estado compartido limpio antes y después."""
+def manage(quiet_manage, sent_messages, monkeypatch):
+    """`handlers.manage` con el estado compartido limpio antes y después, y
+    los envíos del explorador (handlers/files.py) capturados con los suyos."""
+    from handlers import files
+    _patch_messaging(files, sent_messages, monkeypatch)
     for state in (quiet_manage.pending_file_actions, quiet_manage.pending_renames,
-                  quiet_manage.list_messages):
+                  quiet_manage.manage_trails):
         state.clear()
     yield quiet_manage
     for state in (quiet_manage.pending_file_actions, quiet_manage.pending_renames,
-                  quiet_manage.list_messages):
+                  quiet_manage.manage_trails):
         state.clear()
 
 
@@ -106,13 +108,9 @@ def folders(manage, tmp_path, monkeypatch):
     `folders("video", "photo")` les da carpeta propia a esos tipos; los demás
     van a la general. Devuelve un dict tipo -> ruta, con "base" para la general.
     """
-    assert manage.DOWNLOAD_PATHS is config.DOWNLOAD_PATHS, \
-        "handlers.manage debe compartir el dict de rutas con config"
-
     def setup(*own, create=True):
         base = str(tmp_path / "downloads")
         monkeypatch.setattr(config, "DOWNLOAD_PATH", base)
-        monkeypatch.setattr(manage, "DOWNLOAD_PATH", base)
         paths = {"base": base}
         for kind in KINDS:
             path = str(tmp_path / kind) if kind in own else base
@@ -131,392 +129,55 @@ def folders(manage, tmp_path, monkeypatch):
     return setup
 
 
-def _list(manage, make_event, run_async, category=b"all"):
-    run_async(manage.handle_list_category(make_event(groups=(category,))))
+def _open(manage, make_event, run_async, path, page=b""):
+    """Abre `path` en el explorador, como el botón de esa carpeta."""
+    from handlers import files
+    file_id = manage.register_manage_action(path).encode()
+    data = b"o:" + file_id + (b":" + page if page else b"")
+    run_async(files.handle_files_callback(make_event(groups=(data,))))
 
 
 def _manage(manage, make_event, run_async, category=b"all"):
-    run_async(manage.handle_manage_category(make_event(groups=(category,))))
+    """Abre la carpeta general; `b"all:2"` es su página 2."""
+    _open(manage, make_event, run_async, config.DOWNLOAD_PATH, category.partition(b":")[2])
 
 
-def _sent(sent_messages, kinds=("send_message", "reply")):
+def _page_buttons(manage, payloads):
+    """Las páginas a las que llevan los botones de página de la carpeta general."""
+    prefix = b"fm:o:" + manage.register_manage_action(config.DOWNLOAD_PATH).encode() + b":"
+    return [int(p[len(prefix):]) for p in payloads if p.startswith(prefix)]
+
+
+def _sent(sent_messages, kinds=("send_message", "reply", "edit")):
     return [(text, kwargs) for kind, text, kwargs in sent_messages if kind in kinds]
 
 
-# ---------------------------------------------------------------------------
-# Categorías
-# ---------------------------------------------------------------------------
-
-class TestCategorias:
-    def test_sin_carpetas_propias_solo_se_ofrece_todos(self, manage, folders):
+class TestCarpeta:
+    def test_una_carpeta_vacia_lo_dice(self, manage, folders, sent_messages, make_event, run_async):
         folders()
-
-        categories = manage.get_available_categories()
-
-        assert [cat_id for cat_id, _ in categories] == ["all"]
-
-    @pytest.mark.parametrize("own,expected", [
-        (("video",), ["all", "video"]),
-        (("url_video",), ["all", "video"]),
-        (("audio",), ["all", "audio"]),
-        (("url_audio",), ["all", "audio"]),
-        (("photo",), ["all", "photo"]),
-        (("torrent",), ["all", "torrent"]),
-        (("ebook",), ["all", "ebook"]),
-        (KINDS, ["all", "video", "audio", "photo", "torrent", "ebook"]),
-    ])
-    def test_cada_carpeta_propia_anade_su_categoria(self, manage, folders, own, expected):
-        folders(*own)
-
-        assert [cat_id for cat_id, _ in manage.get_available_categories()] == expected
-
-    def test_los_botones_van_de_tres_en_tres_y_cerrar_aparte(self, manage, folders):
-        folders(*KINDS)
-
-        buttons = manage.get_category_buttons()
-
-        assert [len(row) for row in buttons] == [3, 3, 1]
-        assert button_data(buttons[-1][0]) == b"close"
-        payloads = [button_data(b) for row in buttons[:-1] for b in row]
-        assert payloads == [b"listcat:all", b"listcat:video", b"listcat:audio",
-                            b"listcat:photo", b"listcat:torrent", b"listcat:ebook"]
-
-    def test_la_categoria_actual_no_se_ofrece(self, manage, folders):
-        folders("video", "photo")
-
-        buttons = manage.get_category_buttons(exclude_category="video")
-
-        payloads = [button_data(b) for row in buttons for b in row]
-        assert payloads == [b"listcat:all", b"listcat:photo", b"close"]
-
-    def test_sin_categorias_queda_solo_cerrar(self, manage, folders):
-        folders()
-
-        buttons = manage.get_category_buttons(exclude_category="all")
-
-        assert [[button_data(b) for b in row] for row in buttons] == [[b"close"]]
-
-    def test_en_ingles_las_categorias_salen_en_ingles(self, manage, folders, config_dir):
-        folders(*KINDS)
-        settings.put("language", "EN")
-
-        labels = [b.text for row in manage.get_category_buttons() for b in row]
-
-        for spanish in ("Todos", "Fotos", "Cerrar"):
-            assert not any(spanish in label for label in labels), labels
-
-
-# ---------------------------------------------------------------------------
-# /list
-# ---------------------------------------------------------------------------
-
-class TestListar:
-    def test_carpeta_vacia_avisa_y_ofrece_categorias(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        folders("video")
-
-        _list(manage, make_event, run_async)
-
-        [(text, kwargs)] = _sent(sent_messages)
-        assert text == manage.get_text("list_empty")
-        assert b"listcat:video" in _payloads_of(kwargs)
-        assert b"listcat:all" not in _payloads_of(kwargs), "la categoría actual no se ofrece"
-        assert manage.list_messages[999], "debe recordar el mensaje para borrarlo"
-
-    def test_carpetas_que_no_existen_no_revientan(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        folders(*KINDS, create=False)
-
-        _list(manage, make_event, run_async)
-
-        [(text, _)] = _sent(sent_messages)
-        assert text == manage.get_text("list_empty")
-
-    def test_los_ocultos_no_se_listan(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders()
-        _write(os.path.join(paths["base"], ".oculto"))
-        _write(os.path.join(paths["base"], "visible.mkv"))
-
-        _list(manage, make_event, run_async)
-
-        [(text, _)] = _sent(sent_messages)
-        plain = _plain(text)
-        assert "visible.mkv" in plain
-        assert ".oculto" not in plain
-        assert manage.get_text("total_files_space", 1, "10.00 B") in text
-
-    def test_las_carpetas_salen_con_su_tamano_y_se_cuentan_aparte(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders()
-        _write(os.path.join(paths["base"], "Serie", "cap1.mkv"), 1000)
-        _write(os.path.join(paths["base"], "Serie", "sub", "cap2.mkv"), 24)
-        _write(os.path.join(paths["base"], "suelto.txt"), 1024)
-
-        _list(manage, make_event, run_async)
-
-        [(text, _)] = _sent(sent_messages)
-        plain = _plain(text)
-        serie = plain.split("Serie", 1)[1].split("\n\n")[0]
-        assert "📁" in plain.split("Serie")[0].splitlines()[-1]
-        assert "1.00 KB" in serie, "el tamaño de la carpeta es el de todo su contenido"
-        assert manage.get_text("total_files_folders_space", 1, 1, "2.00 KB") in text
-
-    def test_se_ordena_alfabeticamente_sin_distinguir_mayusculas(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders("video")
-        for name in ("zeta.mkv", "Beta.mkv", "alfa.mkv"):
-            _write(os.path.join(paths["base"], name))
-        _write(os.path.join(paths["video"], "Gamma.mkv"))
-
-        _list(manage, make_event, run_async)
-
-        [(text, _)] = _sent(sent_messages)
-        plain = _plain(text)
-        positions = [plain.index(name) for name in ("alfa.mkv", "Beta.mkv", "Gamma.mkv", "zeta.mkv")]
-        assert positions == sorted(positions)
-        assert "1. " in plain and "4. " in plain
-
-    def test_varias_categorias_en_la_misma_carpeta_no_duplican(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        # Sin carpetas propias, las siete apuntan a la general
-        paths = folders()
-        _write(os.path.join(paths["base"], "unico.mkv"))
-
-        _list(manage, make_event, run_async)
-
-        [(text, _)] = _sent(sent_messages)
-        assert _plain(text).count("unico.mkv") == 1
-
-    def test_video_y_url_video_en_la_misma_carpeta_no_duplican(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders("video")
-        _write(os.path.join(paths["video"], "peli.mkv"))
-        _write(os.path.join(paths["base"], "fuera.txt"))
-
-        _list(manage, make_event, run_async, b"video")
-
-        [(text, _)] = _sent(sent_messages)
-        plain = _plain(text)
-        assert plain.count("peli.mkv") == 1
-        assert "fuera.txt" not in plain, "la categoría vídeo solo mira su carpeta"
-
-    def test_una_categoria_desconocida_lista_todo(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders("photo")
-        _write(os.path.join(paths["photo"], "foto.jpg"))
-        _write(os.path.join(paths["base"], "otro.txt"))
-
-        _list(manage, make_event, run_async, b"inventada")
-
-        [(text, _)] = _sent(sent_messages)
-        assert "foto.jpg" in _plain(text) and "otro.txt" in _plain(text)
-
-    def test_borra_el_listado_anterior_y_recuerda_el_nuevo(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders()
-        _write(os.path.join(paths["base"], "a.txt"))
-        manage.list_messages[999] = ["viejo1", "viejo2"]
-
-        _list(manage, make_event, run_async)
-
-        # Los dos viejos y el propio mensaje con los botones
-        assert [kind for kind, _, _ in sent_messages].count("delete") == 3
-        assert manage.list_messages[999] and "viejo1" not in manage.list_messages[999]
-
-    def test_muchos_ficheros_se_parten_en_varios_mensajes(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders()
-        names = [f"fichero_numero_{i:04d}_con_un_nombre_largo.mkv" for i in range(300)]
-        for name in names:
-            _write(os.path.join(paths["base"], name))
-
-        _list(manage, make_event, run_async)
-
-        messages = _sent(sent_messages)
-        assert len(messages) > 1
-        for index, (text, kwargs) in enumerate(messages, 1):
-            assert len(text) <= TELEGRAM_TEXT_LIMIT
-            assert f"(Parte {index}/{len(messages)})" in text
-            # Los botones de categorías solo en el último
-            assert bool(kwargs.get("buttons")) is (index == len(messages))
-        joined = "\n".join(_plain(text) for text, _ in messages)
-        for number in range(1, 301):
-            assert f"\n{number}. " in "\n" + joined
-        assert len(manage.list_messages[999]) == len(messages)
-
-    def test_un_nombre_largo_se_recorta(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders()
-        long_name = "x" * 80 + ".mkv"
-        _write(os.path.join(paths["base"], long_name))
-
-        _list(manage, make_event, run_async)
-
-        [(text, _)] = _sent(sent_messages)
-        assert "x" * 37 + "..." in _plain(text)
-        assert long_name not in text
-
-    @pytest.mark.parametrize("name", [
-        "mi_video_de_prueba.mkv",
-        "doble__guion__bajo.mkv",
-        "con*asterisco*.mkv",
-        "doble**asterisco**.mkv",
-        "[corchete](enlace).mkv",
-        "tilde~~doble~~.mkv",
-    ])
-    def test_los_caracteres_de_markdown_no_rompen_el_listado(
-        self, manage, folders, sent_messages, make_event, run_async, name
-    ):
-        paths = folders()
-        _write(os.path.join(paths["base"], name))
-
-        _list(manage, make_event, run_async)
-
-        [(text, _)] = _sent(sent_messages)
-        assert name in _plain(text)
-
-    def test_una_comilla_invertida_no_rompe_el_listado(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders()
-        name = "canción `remix`.mp3"
-        _write(os.path.join(paths["base"], name))
-
-        _list(manage, make_event, run_async)
-
-        [(text, _)] = _sent(sent_messages)
-        assert name in _plain(text)
-
-    def test_nombres_con_emoji_no_pasan_del_limite_de_telegram(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders()
-        for i in range(200):
-            _write(os.path.join(paths["base"], f"{i:03d}" + "🎬" * 36 + ".x"))
-
-        _list(manage, make_event, run_async)
-
-        for text, _ in _sent(sent_messages):
-            assert _utf16_len(_plain(text)) <= TELEGRAM_TEXT_LIMIT
-
-    def test_un_nombre_que_no_es_utf8_no_rompe_el_listado(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        """Sus sustitutos no se pueden codificar: el listado entero acababa en
-        "Error al listar archivos" cada vez."""
-        paths = folders()
-        _write_not_utf8(paths["base"])
-        _write(os.path.join(paths["base"], "bueno.txt"))
-
-        _list(manage, make_event, run_async)
-
-        [(text, _)] = _sent(sent_messages)
-        text.encode("utf-8")  # lo que hace Telethon al enviarlo
-        assert "caf\\xe9.mp3" in _plain(text) and "bueno.txt" in _plain(text)
-
-    def test_un_error_al_leer_la_carpeta_avisa(
-        self, manage, folders, sent_messages, make_event, run_async, monkeypatch
-    ):
-        paths = folders()
-        _write(os.path.join(paths["base"], "a.txt"))
-
-        def denied(path):
-            raise PermissionError(13, "Permission denied", path)
-
-        monkeypatch.setattr(manage.os, "listdir", denied)
-        _list(manage, make_event, run_async)
-
-        assert [text for text, _ in _sent(sent_messages)] == [manage.get_text("error_list_files")]
-
-    @pytest.mark.parametrize("handler", ["handle_list_category", "handle_manage_category"])
-    def test_una_carpeta_sin_permisos_no_tira_el_listado_entero(
-        self, manage, folders, sent_messages, make_event, run_async, monkeypatch, handler
-    ):
-        paths = folders("video")
-        _write(os.path.join(paths["base"], "visible.txt"))
-        real_listdir = os.listdir
-
-        def denied_in_video(path):
-            if path == paths["video"]:
-                raise PermissionError(13, "Permission denied", path)
-            return real_listdir(path)
-
-        monkeypatch.setattr(manage.os, "listdir", denied_in_video)
-        run_async(getattr(manage, handler)(make_event(groups=(b"all",))))
-
-        [(text, kwargs)] = _sent(sent_messages)
-        if handler == "handle_list_category":
-            assert "visible.txt" in _plain(text)
-        else:
-            assert any(label.endswith("visible.txt") for label in _labels_of(kwargs))
-
-    def test_un_no_admin_no_ve_nada(self, manage, folders, sent_messages, run_async):
-        paths = folders()
-        _write(os.path.join(paths["base"], "secreto.txt"))
-
-        run_async(manage.handle_list_category(_NotAdmin()))
-
-        assert sent_messages == []
-
-    def test_en_ingles_la_cabecera_sale_en_ingles(
-        self, manage, folders, sent_messages, make_event, run_async, config_dir
-    ):
-        paths = folders()
-        _write(os.path.join(paths["base"], "a.txt"))
-        settings.put("language", "EN")
-
-        _list(manage, make_event, run_async)
-
-        [(text, _)] = _sent(sent_messages)
-        assert "Archivos" not in text
-
-
-# ---------------------------------------------------------------------------
-# /manage
-# ---------------------------------------------------------------------------
-
-class TestGestionar:
-    def test_carpeta_vacia_avisa_y_ofrece_categorias(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        folders("torrent")
 
         _manage(manage, make_event, run_async)
 
         [(text, kwargs)] = _sent(sent_messages)
-        assert text == manage.get_text("manage_no_files")
-        assert _payloads_of(kwargs) == [b"managecat:torrent", b"close"]
-        assert manage.pending_file_actions == {}
+        assert manage.get_text("folder_empty") in text
+        assert not any(p.startswith(b"fileact:") for p in _payloads_of(kwargs))
 
-    def test_carpetas_que_no_existen_no_revientan(
+    def test_una_carpeta_que_no_existe_no_revienta(
         self, manage, folders, sent_messages, make_event, run_async
     ):
-        folders(*KINDS, create=False)
+        folders(create=False)
 
-        _manage(manage, make_event, run_async, b"video")
+        _manage(manage, make_event, run_async)
 
         [(text, _)] = _sent(sent_messages)
-        assert text == manage.get_text("manage_no_files")
+        assert text == manage.get_text("error_item_not_found")
 
     def test_un_boton_por_elemento_en_orden_y_registrado(
         self, manage, folders, sent_messages, make_event, run_async
     ):
-        paths = folders("video")
-        for name in ("zeta.mkv", "Alfa.mkv"):
+        paths = folders()
+        for name in ("zeta.mkv", "Alfa.mkv", "medio.mkv"):
             _write(os.path.join(paths["base"], name))
-        _write(os.path.join(paths["video"], "medio.mkv"))
         os.makedirs(os.path.join(paths["base"], "Carpeta"))
         _write(os.path.join(paths["base"], ".oculto"))
 
@@ -524,20 +185,18 @@ class TestGestionar:
 
         [(text, kwargs)] = _sent(sent_messages)
         rows = _rows(kwargs)
-        file_rows = [row for row in rows if button_data(row[0]).startswith(b"fileact:")]
+        # Un fichero abre sus acciones; una carpeta se abre (fm:o)
+        file_rows = [row for row in rows if row[0].text[0].isdigit()]
         labels = [row[0].text for row in file_rows]
-        assert [label.split(" ", 2)[2] for label in labels] == ["Alfa.mkv", "Carpeta", "medio.mkv", "zeta.mkv"]
-        assert labels[0].startswith("1. ") and labels[1] == "2. 📁 Carpeta"
-        resolved = [manage.pending_file_actions[button_data(row[0]).split(b":", 1)[1].decode()]
+        # Número, icono, nombre y lo que ocupa
+        assert [label.split(" ", 2)[2].split(" · ")[0] for label in labels] == ["Alfa.mkv", "Carpeta", "medio.mkv", "zeta.mkv"]
+        assert labels[0].startswith("1. ") and labels[1].startswith("2. 📁 Carpeta · ")
+        assert all(" · " in label and label.endswith(" B") for label in labels)
+        assert [button_data(row[0]).split(b":")[0] for row in file_rows] == [b"fileact", b"fm", b"fileact", b"fileact"]
+        resolved = [manage.pending_file_actions[button_data(row[0]).rsplit(b":", 1)[1].decode()]
                     for row in file_rows]
-        assert resolved == [os.path.join(paths["base"], "Alfa.mkv"),
-                            os.path.join(paths["base"], "Carpeta"),
-                            os.path.join(paths["video"], "medio.mkv"),
-                            os.path.join(paths["base"], "zeta.mkv")]
-        assert b"managecat:video" in _payloads_of(kwargs)
-        assert b"managecat:all" not in _payloads_of(kwargs)
+        assert resolved == [os.path.join(paths["base"], name) for name in ("Alfa.mkv", "Carpeta", "medio.mkv", "zeta.mkv")]
         assert manage.get_text("total_files_folders_space", 3, 1, "30.00 B") in text
-        assert manage.list_messages[999]
 
     def test_otro_listado_no_cambia_a_que_fichero_apunta_un_boton(
         self, manage, folders, sent_messages, make_event, run_async
@@ -553,10 +212,10 @@ class TestGestionar:
         other = next(path for path in candidates if abs(hash(path)) % 100000 == collision)
         _write(other)
 
-        _manage(manage, make_event, run_async, b"video")
+        _open(manage, make_event, run_async, paths["video"])
         [shown_id] = [p.split(b":", 1)[1] for p in _payloads_of(_sent(sent_messages)[0][1])
                       if p.startswith(b"fileact:")]
-        _manage(manage, make_event, run_async, b"audio")
+        _open(manage, make_event, run_async, paths["audio"])
         run_async(manage.handle_confirm_delete(make_event(groups=(shown_id,))))
 
         assert not os.path.exists(shown)
@@ -575,7 +234,8 @@ class TestGestionar:
         first, second = [[p for p in _payloads_of(kwargs) if p.startswith(b"fileact:")]
                          for _, kwargs in _sent(sent_messages)]
         assert first == second
-        assert len(manage.pending_file_actions) == 2
+        # Los dos ficheros y la propia carpeta
+        assert len(manage.pending_file_actions) == 3
 
     def test_sin_carpetas_el_total_solo_cuenta_ficheros(
         self, manage, folders, sent_messages, make_event, run_async
@@ -588,21 +248,11 @@ class TestGestionar:
         [(text, _)] = _sent(sent_messages)
         assert manage.get_text("total_files_space", 1, "2.00 KB") in text
 
-    def test_la_misma_carpeta_en_varias_categorias_no_duplica(
+    def test_un_listado_largo_va_por_paginas(
         self, manage, folders, sent_messages, make_event, run_async
     ):
+        """Antes, con más de 80 elementos no se podía gestionar ninguno."""
         paths = folders()
-        _write(os.path.join(paths["base"], "unico.mkv"))
-
-        _manage(manage, make_event, run_async)
-
-        [(_, kwargs)] = _sent(sent_messages)
-        assert sum(1 for p in _payloads_of(kwargs) if p.startswith(b"fileact:")) == 1
-
-    def test_mas_de_ochenta_elementos_pide_filtrar(
-        self, manage, folders, sent_messages, make_event, run_async
-    ):
-        paths = folders("video")
         for i in range(85):
             _write(os.path.join(paths["base"], f"f{i:02d}.txt"))
         os.makedirs(os.path.join(paths["base"], "una_carpeta"))
@@ -610,36 +260,57 @@ class TestGestionar:
         _manage(manage, make_event, run_async)
 
         [(text, kwargs)] = _sent(sent_messages)
-        assert manage.get_text("manage_too_many_items") in text
-        assert manage.get_text("manage_too_many_files_folders", 85, 1) in text
-        assert not any(p.startswith(b"fileact:") for p in _payloads_of(kwargs))
-        assert b"managecat:video" in _payloads_of(kwargs)
+        payloads = _payloads_of(kwargs)
+        assert sum(1 for p in payloads if p.startswith(b"fileact:")) == manage.MANAGE_PAGE_SIZE
+        assert manage.get_text("total_files_folders_space", 85, 1, "850.00 B") in text
+        # 86 elementos de 20 en 20: cinco páginas, y de la primera solo se avanza
+        assert "1/5" in _labels_of(kwargs)
+        assert _page_buttons(manage, payloads) == [1]
+        # Telegram no admite más de 100 botones por mensaje
+        assert len(payloads) <= 100
 
-    def test_mas_de_ochenta_ficheros_sin_carpetas(
+    def test_cada_pagina_enseña_los_suyos_y_sigue_la_numeracion(
         self, manage, folders, sent_messages, make_event, run_async
     ):
         paths = folders()
-        for i in range(81):
+        for i in range(45):
             _write(os.path.join(paths["base"], f"f{i:02d}.txt"))
 
-        _manage(manage, make_event, run_async)
+        _manage(manage, make_event, run_async, category=b"all:2")
 
-        [(text, _)] = _sent(sent_messages)
-        assert manage.get_text("manage_too_many_files", 81) in text
+        [(_, kwargs)] = _sent(sent_messages)
+        labels = [label for label in _labels_of(kwargs) if label[0].isdigit() and ". " in label]
+        assert [label.split(" ", 2)[2].split(" · ")[0] for label in labels] == [f"f{i:02d}.txt" for i in range(40, 45)]
+        assert labels[0].startswith("41. ")
+        assert "3/3" in _labels_of(kwargs)
+        assert _page_buttons(manage, _payloads_of(kwargs)) == [1]
 
-    def test_ochenta_justos_aun_se_listan(
+    def test_una_pagina_que_ya_no_existe_enseña_la_ultima(
         self, manage, folders, sent_messages, make_event, run_async
     ):
         paths = folders()
-        for i in range(80):
+        for i in range(25):
+            _write(os.path.join(paths["base"], f"f{i:02d}.txt"))
+
+        _manage(manage, make_event, run_async, category=b"all:9")
+
+        [(_, kwargs)] = _sent(sent_messages)
+        assert sum(1 for p in _payloads_of(kwargs) if p.startswith(b"fileact:")) == 5
+
+    def test_una_pagina_justa_no_lleva_botones_de_pagina(
+        self, manage, folders, sent_messages, make_event, run_async
+    ):
+        paths = folders()
+        for i in range(manage.MANAGE_PAGE_SIZE):
             _write(os.path.join(paths["base"], f"f{i:02d}.txt"))
 
         _manage(manage, make_event, run_async)
 
         [(_, kwargs)] = _sent(sent_messages)
-        assert sum(1 for p in _payloads_of(kwargs) if p.startswith(b"fileact:")) == 80
-        # Telegram no admite más de 100 botones por mensaje
-        assert len(_payloads_of(kwargs)) <= 100
+        payloads = _payloads_of(kwargs)
+        assert sum(1 for p in payloads if p.startswith(b"fileact:")) == manage.MANAGE_PAGE_SIZE
+        assert _page_buttons(manage, payloads) == []
+        assert b"fm:ma:" + manage.register_manage_action(paths["base"]).encode() in payloads
 
     def test_la_etiqueta_recorta_los_nombres_largos(
         self, manage, folders, sent_messages, make_event, run_async
@@ -651,23 +322,25 @@ class TestGestionar:
 
         [(_, kwargs)] = _sent(sent_messages)
         label = _labels_of(kwargs)[0]
-        assert label.endswith("a" * 25 + "...")
+        # Más corto que antes, para que quepa el tamaño detrás
+        assert ("a" * 22 + "... · ") in label and "a" * 23 not in label
 
     def test_los_callbacks_caben_con_nombres_largos_y_unicode(
         self, manage, folders, sent_messages, make_event, run_async
     ):
-        paths = folders(*KINDS)
+        paths = folders()
         names = ["Ñandú_" + "á" * 120 + ".mkv", "日本語のファイル名" * 8 + ".mp4",
                  "🎬" * 60 + ".mkv", "x" * 240]
         for name in names:
-            _write(os.path.join(paths["video"], name))
+            _write(os.path.join(paths["base"], name))
         os.makedirs(os.path.join(paths["base"], "📁" * 50))
 
         _manage(manage, make_event, run_async)
 
         [(_, kwargs)] = _sent(sent_messages)
         payloads = _payloads_of(kwargs)
-        assert sum(1 for p in payloads if p.startswith(b"fileact:")) == 5
+        assert sum(1 for p in payloads if p.startswith(b"fileact:")) == 4
+        assert sum(1 for p in payloads if p.startswith(b"fm:o:")) == 1
         for payload in payloads:
             assert len(payload) <= CALLBACK_DATA_LIMIT, payload
 
@@ -685,7 +358,7 @@ class TestGestionar:
         for row in _rows(kwargs):
             for button in row:
                 bytes(button)  # Telethon serializa así los botones al enviarlos
-        assert any(label.endswith("caf\\xe9.mp3") for label in _labels_of(kwargs))
+        assert any("caf\\xe9.mp3 · " in label for label in _labels_of(kwargs))
         assert real_path in manage.pending_file_actions.values(), \
             "las acciones siguen usando la ruta de verdad"
 
@@ -703,10 +376,11 @@ class TestGestionar:
         assert [text for text, _ in _sent(sent_messages)] == [manage.get_text("error_manage_files")]
 
     def test_un_no_admin_no_ve_nada(self, manage, folders, sent_messages, run_async):
+        from handlers import files
         paths = folders()
         _write(os.path.join(paths["base"], "secreto.txt"))
 
-        run_async(manage.handle_manage_category(_NotAdmin()))
+        run_async(files.handle_files_callback(_NotAdmin()))
 
         assert sent_messages == []
         assert manage.pending_file_actions == {}
@@ -714,7 +388,7 @@ class TestGestionar:
     def test_en_ingles_los_botones_salen_en_ingles(
         self, manage, folders, sent_messages, make_event, run_async, config_dir
     ):
-        folders("video")
+        folders()
         settings.put("language", "EN")
 
         _manage(manage, make_event, run_async)
@@ -729,30 +403,22 @@ class TestGestionar:
 # ---------------------------------------------------------------------------
 
 class TestEnUnForo:
-    @pytest.mark.parametrize("handler", ["handle_list_category", "handle_manage_category"])
-    @pytest.mark.parametrize("files", [0, 1, 81])
-    def test_el_listado_va_al_tema_del_menu(
-        self, manage, folders, sent_messages, forum_callback, run_async, monkeypatch, handler, files
+    @pytest.mark.parametrize("count", [0, 1, 81])
+    def test_el_listado_se_queda_en_el_tema_del_boton(
+        self, manage, folders, sent_messages, forum_callback, run_async, count
     ):
         """En un supergrupo con temas, lo que se manda sin reply_to cae en
-        General: el menú se pulsaba en un tema y el listado salía en otro. El
-        tema sale del mensaje del menú, que se borra: hay que pedirlo antes."""
+        General. El explorador pinta la carpeta en el propio mensaje del
+        botón: se queda en su tema sin tener que decirlo, y no se borra nada."""
+        from handlers import files
         paths = folders()
-        for i in range(files):
+        for i in range(count):
             _write(os.path.join(paths["base"], f"f{i:03d}.txt"))
-        click = forum_callback((b"all",))
+        file_id = manage.register_manage_action(paths["base"]).encode()
 
-        async def delete(message, *args, **kwargs):
-            if message is click:
-                click._client.message = None  # borrado, Telegram ya no lo da
-            sent_messages.append(("delete", "", {}))
+        run_async(files.handle_files_callback(forum_callback((b"o:" + file_id,))))
 
-        monkeypatch.setattr(manage, "safe_delete", delete)
-
-        run_async(getattr(manage, handler)(click))
-
-        listing = [kwargs for kind, _, kwargs in sent_messages if kind != "delete"]
-        assert listing and all(kwargs.get("reply_to") == FORUM_TOPIC for kwargs in listing)
+        assert [kind for kind, _, _ in sent_messages] == ["edit"]
 
 
 # ---------------------------------------------------------------------------
@@ -760,26 +426,21 @@ class TestEnUnForo:
 # ---------------------------------------------------------------------------
 
 class TestRobustez:
-    @pytest.mark.parametrize("handler", ["handle_list_category", "handle_manage_category"])
     def test_un_enlace_roto_no_impide_listar_el_resto(
-        self, manage, folders, sent_messages, make_event, run_async, handler
+        self, manage, folders, sent_messages, make_event, run_async
     ):
         paths = folders()
         _write(os.path.join(paths["base"], "bueno.txt"))
         os.symlink("/no/existe", os.path.join(paths["base"], "roto.txt"))
 
-        run_async(getattr(manage, handler)(make_event(groups=(b"all",))))
+        _manage(manage, make_event, run_async)
 
         [(text, kwargs)] = _sent(sent_messages)
-        if handler == "handle_list_category":
-            assert "bueno.txt" in _plain(text) and "roto.txt" not in _plain(text)
-        else:
-            labels = [label for label in _labels_of(kwargs) if label[0].isdigit()]
-            assert len(labels) == 1 and labels[0].endswith("bueno.txt")
+        labels = [label for label in _labels_of(kwargs) if label[0].isdigit()]
+        assert len(labels) == 1 and "bueno.txt · " in labels[0]
 
-    @pytest.mark.parametrize("handler", ["handle_list_category", "handle_manage_category"])
     def test_un_fichero_con_thumb_jpg_en_el_nombre_se_lista(
-        self, manage, folders, sent_messages, make_event, run_async, handler
+        self, manage, folders, sent_messages, make_event, run_async
     ):
         """Se saltaba todo lo que llevara "_thumb.jpg", pero las miniaturas del
         bot van a TEMP_DIR: solo se escondían ficheros del usuario, que desde
@@ -789,19 +450,15 @@ class TestRobustez:
         for name in names:
             _write(os.path.join(paths["base"], name))
 
-        run_async(getattr(manage, handler)(make_event(groups=(b"all",))))
+        _manage(manage, make_event, run_async)
 
         [(text, kwargs)] = _sent(sent_messages)
-        if handler == "handle_list_category":
-            shown = _plain(text)
-        else:
-            shown = " ".join(label for label in _labels_of(kwargs) if label[0].isdigit())
-        assert all(name in shown for name in names), shown
+        shown = " ".join(label for label in _labels_of(kwargs) if label[0].isdigit())
+        assert all(name[:22] in shown for name in names), shown
         assert manage.get_text("total_files_space", 2, "20.00 B") in text
 
-    @pytest.mark.parametrize("handler", ["handle_list_category", "handle_manage_category"])
     def test_el_tamano_de_las_carpetas_se_calcula_fuera_del_event_loop(
-        self, manage, folders, sent_messages, make_event, run_async, monkeypatch, handler
+        self, manage, folders, sent_messages, make_event, run_async, monkeypatch
     ):
         """Recorrer una biblioteca grande (o en un volumen de red) tarda segundos,
         y en el loop paraba los botones, la cola y el progreso de las descargas."""
@@ -815,20 +472,17 @@ class TestRobustez:
             return real_size(path)
 
         monkeypatch.setattr(manage, "get_directory_size", get_directory_size)
-        run_async(getattr(manage, handler)(make_event(groups=(b"all",))))
+        _manage(manage, make_event, run_async)
 
         assert threads and threading.get_ident() not in threads
         [(text, _)] = _sent(sent_messages)
         assert manage.get_text("total_files_folders_space", 0, 1, "10.00 B") in text
 
-    @pytest.mark.parametrize("handler,tag", [("handle_list_category", "FILE_LIST"),
-                                             ("handle_manage_category", "FILE_MANAGE")])
     def test_el_log_cuenta_lo_que_hay_sin_volcar_los_nombres(
-        self, manage, folders, make_event, run_async, monkeypatch, handler, tag
+        self, manage, folders, make_event, run_async, monkeypatch
     ):
         """Cada listado, y cada vuelta a /manage, escribía la lista entera de
-        cada carpeta: con miles de ficheros, una línea de cientos de KB. Desde
-        /manage, además, con la etiqueta [LIST] de /list."""
+        cada carpeta: con miles de ficheros, una línea de cientos de KB."""
         paths = folders()
         names = ["Contabilidad_2025.xlsx", "Vacaciones en Asturias.mkv"]
         for name in names:
@@ -836,32 +490,23 @@ class TestRobustez:
         logged = []
         monkeypatch.setattr(manage, "debug", logged.append)
 
-        run_async(getattr(manage, handler)(make_event(groups=(b"all",))))
+        _manage(manage, make_event, run_async)
 
-        assert f"[{tag}] Directory {paths['base']} contains 2 items" in logged
+        assert f"[FILE_MANAGE] Directory {paths['base']} contains 2 items" in logged
         assert not [line for line in logged if any(name in line for name in names)]
-        if handler == "handle_manage_category":
-            assert not [line for line in logged if line.startswith("[LIST]")]
 
-    @pytest.mark.parametrize("handler", ["handle_list_category", "handle_manage_category"])
-    def test_si_no_se_puede_borrar_el_listado_anterior_sigue(
-        self, manage, folders, sent_messages, make_event, run_async, monkeypatch, handler
+    def test_cambiar_de_pagina_edita_el_mensaje_en_vez_de_mandar_otro(
+        self, manage, folders, sent_messages, make_event, run_async
     ):
+        """Al cambiar de página el chat saltaba: el listado se borraba y
+        llegaba uno nuevo."""
         paths = folders()
-        _write(os.path.join(paths["base"], "a.txt"))
-        manage.list_messages[999] = ["ya_borrado", "otro"]
+        for i in range(30):
+            _write(os.path.join(paths["base"], f"f{i:02d}.txt"))
 
-        async def flaky_delete(message, *args, **kwargs):
-            if message == "ya_borrado":
-                raise RuntimeError("message to delete not found")
-            sent_messages.append(("delete", "", {}))
+        _manage(manage, make_event, run_async, category=b"all:1")
 
-        monkeypatch.setattr(manage, "safe_delete", flaky_delete)
-        run_async(getattr(manage, handler)(make_event(groups=(b"all",))))
-
-        assert [kind for kind, _, _ in sent_messages].count("delete") == 2
-        assert len(_sent(sent_messages)) == 1
-        assert "ya_borrado" not in manage.list_messages[999]
+        assert [kind for kind, _, _ in sent_messages] == ["edit"]
 
     def test_init_sin_el_pipeline_de_envio_falla_al_arrancar(self, manage, monkeypatch):
         from unittest.mock import MagicMock

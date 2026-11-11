@@ -717,15 +717,14 @@ class TestSafeHelpers:
         assert run_async(telegram_helpers.safe_answer(Event(), wait_for_result=True)) is None
 
     def test_la_longitud_de_un_mensaje_se_mide_como_en_telegram(self):
-        """En unidades UTF-16, una sola medida para /list y los donantes: un
-        emoji son dos, y contado como uno el mensaje pasaba de 4096."""
-        from handlers import manage
+        """En unidades UTF-16: un emoji son dos, y contado como uno el mensaje
+        de los donantes pasaba de 4096."""
         from services import donors_service
 
         assert telegram_helpers.utf16_len("Pelis") == 5
         assert telegram_helpers.utf16_len("🎬 ñ") == 4
-        assert manage.utf16_len is donors_service.utf16_len is telegram_helpers.utf16_len
-        assert manage.SAFE_MESSAGE_LENGTH == donors_service.SAFE_MESSAGE_LENGTH < 4096
+        assert donors_service.utf16_len is telegram_helpers.utf16_len
+        assert donors_service.SAFE_MESSAGE_LENGTH < 4096
 
 
 class TestAdmins:

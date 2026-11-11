@@ -39,6 +39,7 @@ from config import (
     TELEGRAM_TOKEN, TEMP_DIR, TOR_ICO, VID_ICO,
     WRITE_PROBE_TIMEOUT, YTDLP_COOKIES_FILE, downloads_persistent,
 )
+import folders
 import migration
 import settings
 import stats
@@ -50,8 +51,8 @@ from basic import (
 )
 from message_queue import TelegramMessageQueue
 from state import (
-    active_tasks, cancelled_conversions, pending_files, pending_urls,
-    register_pending_send, send_original_requests,
+    active_tasks, cancelled_conversions, claim, pending_files, pending_urls,
+    register_pending_send, send_original_requests, was_claimed,
 )
 from utils.file_helpers import (
     format_file_size, get_file_icon,
@@ -66,9 +67,13 @@ from utils.telegram_helpers import (
     safe_delete, safe_send_message, check_admin_and_warn,
     for_another_bot, get_topic, is_file_message, outlive_handler, warn_not_admin,
 )
+from handlers import arrivals
+from handlers import files as files_handlers
+from handlers import home as home_handlers
+from handlers import inputs as input_handlers
 from handlers import manage as manage_handlers
+from handlers import picker as picker_handlers
 from handlers import settings as settings_handlers
-from handlers.manage import get_available_categories, get_category_buttons
 from services.donors_service import print_donors
 from services.video_service import (
     get_video_metadata, generate_video_thumbnail, format_duration,
@@ -97,7 +102,7 @@ logger = log_module.setup_logger(
 
 from logger import debug, info, warning, error
 
-VERSION = "4.0.2"
+VERSION = "4.1.0"
 
 warnings.filterwarnings('ignore', message='Using async sessions support is an experimental feature')
 
@@ -142,10 +147,15 @@ if not TELEGRAM_API_HASH:
     error("[CONFIG] The API hash needs to be configured with the TELEGRAM_API_HASH variable")
     sys.exit(1)
 
+# Las carpetas elegidas desde /settings mandan sobre las que tocan por los
+# volúmenes. Antes de crear ninguna, y de limpiar lo que quedó a medias
+folders.apply()
+
 for path in DOWNLOAD_PATHS.values():
     os.makedirs(path, exist_ok=True)
 
-# Cada tipo va a su carpeta si está montada como volumen; si no, a /downloads
+# Cada tipo va a la carpeta elegida en /settings; si no, a la suya si está
+# montada como volumen; si no, a /downloads
 for kind, path in DOWNLOAD_PATHS.items():
     debug(f"[STARTUP] Folder for {kind}: {path}")
 if not downloads_persistent():
@@ -268,16 +278,6 @@ message_queue = TelegramMessageQueue(
 
 # Inyectar dependencias (cola + bot) en el módulo de helpers
 telegram_helpers.init(message_queue, bot)
-
-async def handle_list_files(event):
-    """`/list <categoría>`: el listado de esa categoría sin pasar por el menú.
-
-    Una categoría desconocida lista todo, como hacía siempre.
-    """
-    command_parts = event.raw_text.split()
-    category = command_parts[1].lower() if len(command_parts) > 1 else "all"
-    await manage_handlers.send_file_list(event, category, await get_topic(event))
-
 
 def get_download_path(event):
     message = event.message
@@ -799,6 +799,15 @@ async def download_media(event, status_message=None):
     debug(f"[DOWNLOAD] File {file_name} - Received, starting download")
     download_path, ico = get_download_path(event)
 
+    # Si lo que llega puede no caber, se avisa ya: la descarga se intenta
+    # igual (puede liberarse sitio entretanto), pero que falle no sorprende
+    space_note = arrivals.low_space_note(download_path, getattr(message.file, "size", None))
+    if space_note:
+        try:
+            await safe_reply(event, space_note, parse_mode=PARSE_MODE)
+        except Exception as e:
+            warning(f"[DOWNLOAD] Could not warn about the free space for {file_name}: {e}")
+
     # Descargar primero a un oculto en la propia carpeta de destino: no aparece
     # en /list mientras se descarga, no ocupa el disco del contenedor (TEMP_DIR
     # está en la capa de Docker) y al terminar basta con renombrarlo. Su nombre
@@ -1150,7 +1159,7 @@ def get_extraction_message_and_buttons(extract_result, filename, extracted_path,
                 Button.inline(f"💾 {get_text('extraction_keep_compressed')}", data=f"keepcompressed:{file_id}")
             ],
             [
-                Button.inline(get_text("button_back_to_manage"), data="managecat:all"),
+                Button.inline(get_text("button_back_to_manage"), data="fm:r"),
                 Button.inline(get_text("button_close"), data="close")
             ]
         ]
@@ -1230,7 +1239,7 @@ def get_file_name(media):
 # mensaje del usuario se borraba sin respuesta. Un fichero cuyo pie empieza por
 # un comando es de handle_files: sin el filtro se borraba mientras se descargaba
 # (lo mismo con /settings, que se registra en handlers/settings.py)
-@bot.on(events.NewMessage(pattern=r"^/(start|donate|version|donors|list|manage)(?:@\w+)?(?:\s|$)",
+@bot.on(events.NewMessage(pattern=r"^/(start|donate|version|donors|list|manage|find)(?:@\w+)?(?:\s|$)",
                           func=lambda e: not is_file_message(e)))
 async def handle_start(event):
     # "/list@OtroBot" es para otro bot del grupo: ni se borra ni se contesta
@@ -1251,13 +1260,14 @@ async def handle_start(event):
 
     command = event.pattern_match.group(1)
     stats.count(f"cmd_{command}")
-    # Lo que va tras el comando (solo /list lo usa: /list <categoría>)
+    # Lo que va tras el comando (solo /find lo usa: /find <texto>)
     has_args = len(event.raw_text.split()) > 1
     # En un foro, la respuesta va al tema del comando y no a General
     topic = await get_topic(event)
     if command == "start":
-        response = get_text("welcome_message")
-        await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE, reply_to=topic)
+        # El menú principal: un botón para cada cosa (ver handlers/home.py)
+        response, buttons = home_handlers.build_menu()
+        await safe_send_message(event.chat_id, response, buttons=buttons, parse_mode=PARSE_MODE, reply_to=topic)
     elif command == "donate":
         response = get_text("donate")
         await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE, reply_to=topic)
@@ -1266,46 +1276,21 @@ async def handle_start(event):
         await safe_send_message(event.chat_id, response, parse_mode=PARSE_MODE, reply_to=topic)
     elif command == "donors":
         await print_donors(event.chat_id, reply_to=topic)
-    elif command == "list" and has_args:
-        # /list video: directamente el listado de esa categoría
-        debug(f"[LIST] /list command received with arguments: {event.raw_text}")
-        await handle_list_files(event)
-    elif command == "list":
-        debug("[LIST] /list command received")
-
-        # Mostrar menú de categorías
-        buttons = get_category_buttons()
-        debug(f"[LIST] Category buttons: {buttons}")
-        msg = get_text("list_select_category")
-        await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE, reply_to=topic)
-        debug("[LIST] Menu sent")
-    elif command == "manage":
-        # Borrar el comando del usuario
-        try:
-            await event.delete()
-        except:
-            pass
-
-        # Mostrar menú de categorías para gestionar
-        # Crear botones de categorías pero con callback "managecat:" en lugar de "listcat:"
-        categories = get_available_categories()
-        buttons = []
-        row = []
-        for cat_id, cat_name in categories:
-            row.append(Button.inline(cat_name, data=f"managecat:{cat_id}"))
-            if len(row) == 3:
-                buttons.append(row)
-                row = []
-
-        # Agregar última fila si quedaron botones
-        if row:
-            buttons.append(row)
-
-        # Agregar botón de cerrar
-        buttons.append([Button.inline(get_text("button_close"), data="close")])
-
-        msg = get_text("manage_select_category")
-        await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE, reply_to=topic)
+    elif command == "find":
+        # /find texto: lo que hay en el servidor con ese nombre
+        query = event.raw_text.split(maxsplit=1)[1].strip() if has_args else ""
+        await files_handlers.send_find(event, query, topic)
+    elif command in ("list", "manage"):
+        # /list hace ya lo mismo que /manage: el explorador enseña lo mismo, con
+        # el tamaño de cada cosa, y además deja entrar en las carpetas y actuar.
+        # Se conserva el comando para quien lo tenga por costumbre
+        # El explorador: las carpetas del servidor, o la única que haya
+        msg, buttons, listing, folder_id = await files_handlers.build_explorer()
+        sent = await safe_send_message(event.chat_id, msg, buttons=buttons, parse_mode=PARSE_MODE,
+                                       wait_for_result=True, reply_to=topic)
+        # Para que «Volver» y «Subir» sepan dónde se está en ese mensaje
+        if sent is not None and listing:
+            manage_handlers.nav_visit(event, listing, folder_id=folder_id, message_id=sent.id)
 
 @bot.on(events.CallbackQuery(data=lambda data: data.startswith(b"cancel:")))
 async def cancel_download(event):
@@ -4198,6 +4183,12 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
             error(f"[SEND_FILE] File does not exist: {file_path}")
             return
 
+        # Lo que se hace solo con lo recién llegado, según los ajustes:
+        # renombrarlo con la sugerencia y mandar un episodio a la carpeta de
+        # su serie. Todo lo que sigue va ya con la ruta en la que ha quedado
+        arrangement = await arrivals.arrange(file_path)
+        file_path = arrangement.path
+
         # Obtener información del archivo
         filename = get_filename_from_path(file_path)
 
@@ -4242,6 +4233,11 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
             ""
         ]
 
+        # Dónde ha quedado: lo primero que se quiere saber de una descarga. Un
+        # .torrent que ya se ha llevado el gestor no está ahí, y no se dice
+        if file_exists:
+            info_lines.append(get_text("file_info_folder", md_code(os.path.dirname(file_path))))
+
         # Solo agregar tamaño si está disponible
         if file_info['size_formatted'] and file_info['size_formatted'] != 'Unknown':
             info_lines.append(get_text("file_info_size", file_info['size_formatted']))
@@ -4264,6 +4260,10 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
                 info_lines.append(get_text("file_info_codec_audio", file_info['codec_audio']))
             if file_info["bitrate"]:
                 info_lines.append(get_text("file_info_bitrate", file_info['bitrate']))
+
+        # Lo que se ha hecho solo: el nombre que traía, la carpeta de su serie
+        if arrangement.notes:
+            info_lines += [""] + arrangement.notes
 
         info_message = "\n".join(info_lines)
         debug(f"[SEND_FILE] Message prepared, length: {len(info_message)} chars")
@@ -4310,6 +4310,11 @@ async def handle_success(event, file_path, show_action_buttons=True, icon=None, 
                     [Button.inline(get_text("button_only_in_server"), data=f"nosend:{send_id}")]
                 ]
                 await safe_reply_in_topic(event, get_text("upload_asking"), buttons=buttons, parse_mode=PARSE_MODE)
+
+        # Y lo que se pregunta: moverlo con su serie, sustituir la versión
+        # anterior, elegir carpeta. No si se acaba de enviar y borrar
+        if file_exists and not (show_action_buttons and file_type in ["video", "audio"] and auto_send == "SEND_DELETE"):
+            await arrivals.offer(event, arrangement)
     except Exception as e:
         error(f"[SEND_FILE] ❌ Error in handle_success: {e}")
         error(f"[SEND_FILE] Exception type: {type(e).__name__}")
@@ -4335,18 +4340,25 @@ async def handle_send_choice(event):
     if await check_admin_and_warn(event):
         return
 
-    await safe_answer(event)
     action = event.pattern_match.group(1).decode()
     file_id = event.pattern_match.group(2).decode()
-    stats.count(f"btn_{action}")
 
     # Extraer y eliminar atómicamente la entrada para evitar dobles ejecuciones
     # por doble click (condición de carrera): el segundo click obtiene None y sale
-    file_path = pending_files.pop(file_id, None)
+    file_path = claim(pending_files, file_id)
 
     if file_path is None:
-        # Ya procesado por otro click (doble click) o entrada inexistente
+        # Ya procesado por otro click (doble click): no se dice nada. Si es un
+        # botón de antes de reiniciar el bot, ha caducado, y se avisa: antes
+        # no hacía nada ni decía por qué
+        if was_claimed(pending_files, file_id):
+            await safe_answer(event)
+        else:
+            await safe_answer(event, get_text("picker_expired"), alert=True)
         return
+
+    await safe_answer(event)
+    stats.count(f"btn_{action}")
 
     if not os.path.exists(file_path):
         await safe_edit(event, get_text("error_file_does_not_exist_user"), parse_mode=PARSE_MODE)
@@ -4443,8 +4455,8 @@ async def send_startup_message():
 async def set_commands():
     commands = [
         BotCommand("start", get_text("menu_start")),
-        BotCommand("list", get_text("menu_list")),
         BotCommand("manage", get_text("menu_manage")),
+        BotCommand("find", get_text("menu_find")),
         BotCommand("settings", get_text("menu_settings")),
         BotCommand("version", get_text("menu_version")),
         BotCommand("donate", get_text("menu_donate")),
@@ -4569,7 +4581,13 @@ manage_handlers.init(
     get_extraction_message_and_buttons=get_extraction_message_and_buttons,
     _send_file_fast=_send_file_fast,
 )
+# Antes que los que los usan: registran en ellos sus selectores y sus textos
+input_handlers.init(bot)
+picker_handlers.init(bot)
+files_handlers.init(bot)
+arrivals.init(bot)
 settings_handlers.init(bot, on_change=apply_setting)
+home_handlers.init(bot, version=VERSION)
 
 
 # Lo que contesta Telegram cuando ya no acepta la auth key de la sesión: el

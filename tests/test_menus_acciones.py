@@ -95,13 +95,13 @@ class _Reply:
 @pytest.fixture
 def manage(quiet_manage):
     for state in (quiet_manage.pending_file_actions, quiet_manage.pending_renames,
-                  quiet_manage.list_messages, quiet_manage.sending_files,
-                  quiet_manage.deleted_file_ids):
+                  quiet_manage.sending_files,
+                  quiet_manage.deleted_file_ids, quiet_manage.manage_trails):
         state.clear()
     yield quiet_manage
     for state in (quiet_manage.pending_file_actions, quiet_manage.pending_renames,
-                  quiet_manage.list_messages, quiet_manage.sending_files,
-                  quiet_manage.deleted_file_ids):
+                  quiet_manage.sending_files,
+                  quiet_manage.deleted_file_ids, quiet_manage.manage_trails):
         state.clear()
 
 
@@ -160,7 +160,7 @@ class TestAcciones:
         assert "2.00 KB" in plain
         assert str(downloads) in plain
         assert _payloads(sent_messages) == [
-            b"rename:f1", b"delete:f1", b"download:f1", b"managecat:all", b"close"]
+            b"rename:f1", b"delete:f1", b"fm:mv:f1", b"download:f1", b"fm:r", b"close"]
 
     def test_una_carpeta_muestra_el_tamano_de_su_contenido(
         self, manage, downloads, register, sent_messages, run_async
@@ -175,7 +175,9 @@ class TestAcciones:
 
         [text] = _texts(sent_messages)
         assert "📁" in text and "2.00 KB" in _plain(text)
-        assert _payloads(sent_messages) == [b"rename:f1", b"delete:f1", b"managecat:all", b"close"]
+        # Una carpeta, además, se abre y se renombra entera
+        assert _payloads(sent_messages) == [
+            b"fm:o:f1", b"rename:f1", b"delete:f1", b"fm:mv:f1", b"fm:ra:f1", b"fm:r", b"close"]
 
     def test_el_tamano_de_una_carpeta_se_calcula_fuera_del_event_loop(
         self, manage, downloads, register, sent_messages, run_async, monkeypatch
@@ -380,7 +382,7 @@ class TestDescargar:
 
         [sent] = pipeline.sent
         assert sent["reply_to"] == FORUM_TOPIC
-        assert [kwargs["reply_to"] for kind, _, kwargs in sent_messages if kind == "send_message"] == [FORUM_TOPIC] * 2
+        assert [kwargs["reply_to"] for kind, _, kwargs in sent_messages if kind == "send_message"] == [FORUM_TOPIC]
 
     def test_un_documento_se_envia_tal_cual(
         self, manage, pipeline, downloads, register, sent_messages, run_async
@@ -399,10 +401,11 @@ class TestDescargar:
         assert pipeline.converted == [], "un documento no se convierte"
         assert target.exists()
         kinds = [kind for kind, _, _ in sent_messages]
-        # Progreso nuevo, se borra, y mensaje de éxito nuevo
-        assert kinds == ["send_message", "delete", "send_message"]
-        assert sent_messages[-1][1] == manage.get_text("file_sent_success", "notas.txt")
-        assert _payloads(sent_messages) == [b"managecat:all", b"close"]
+        # Progreso nuevo, que se borra, y nada más: el fichero que llega ya
+        # es la confirmación, y la ficha sigue abierta con sus botones. Otro
+        # mensaje de éxito con «Volver» dejaba la misma pantalla dos veces
+        assert kinds == ["send_message", "delete"]
+        assert _payloads(sent_messages) == []
 
     def test_un_nombre_que_no_es_utf8_se_pasa_a_la_subida_con_un_nombre_que_telegram_admite(
         self, manage, pipeline, downloads, register, sent_messages, run_async
@@ -447,7 +450,7 @@ class TestDescargar:
         assert target.exists(), "el original no se toca"
         assert not converted.exists(), "el temporal convertido se borra"
         assert not pipeline.thumbnail.exists(), "la miniatura temporal se borra"
-        assert sent_messages[-1][1] == manage.get_text("file_sent_success", "pelicula.mp4")
+        assert [kind for kind, _, _ in sent_messages][-1] == "delete", "el progreso se quita al acabar"
 
     def test_un_video_ya_compatible_no_se_borra(
         self, manage, pipeline, downloads, register, run_async
@@ -688,7 +691,7 @@ class TestDescargar:
 
         [sent] = pipeline.sent
         assert sent["path"] == str(target)
-        assert sent_messages[-1][1] == manage.get_text("file_sent_success", "serie.mkv")
+        assert sent_messages[-1][0] == "delete", "acaba: el progreso se quita"
 
     def test_terminado_un_envio_se_puede_volver_a_descargar(
         self, manage, pipeline, downloads, register, run_async
@@ -769,9 +772,11 @@ class TestDescargar:
         _press(manage, run_async, "handle_download_file", file_id)
 
         assert target.exists()
-        expected = (manage.get_text("error_sending_file", manage.md_code("fallo")) if fail
-                    else manage.get_text("file_sent_success", "pelicula.mp4"))
-        assert sent_messages[-1][1] == expected
+        if fail:
+            assert sent_messages[-1][1] == manage.get_text("error_sending_file", manage.md_code("fallo"))
+            assert _payloads(sent_messages[-1:]) == [b"close"], "un error que se puede cerrar"
+        else:
+            assert sent_messages[-1][0] == "delete", "el progreso se quita aunque no se borren los temporales"
 
     def test_un_no_admin_no_recibe_nada(
         self, manage, pipeline, downloads, register, sent_messages, run_async
@@ -841,7 +846,7 @@ class TestBorrar:
         assert not target.exists() and sibling.exists()
         assert "f1" not in manage.pending_file_actions
         assert "borrar.txt" in _plain(_texts(sent_messages)[0])
-        assert _payloads(sent_messages) == [b"managecat:all", b"close"]
+        assert _payloads(sent_messages) == [b"fm:r", b"close"]
 
     def test_confirmar_dos_veces_no_borra_otra_cosa(
         self, manage, downloads, register, sent_messages, run_async
@@ -880,7 +885,7 @@ class TestBorrar:
         assert not folder.exists()
         [text] = _texts(sent_messages)
         assert "Serie" in _plain(text)
-        assert _payloads(sent_messages) == [b"managecat:all", b"close"]
+        assert _payloads(sent_messages) == [b"fm:r", b"close"]
 
     def test_la_confirmacion_de_otro_mensaje_avisa_de_que_ya_no_esta(
         self, manage, downloads, sent_messages, run_async
@@ -1105,7 +1110,7 @@ class TestRenombrar:
         assert _texts(sent_messages) == [manage.get_text("error_item_not_found_short")]
         assert manage.pending_renames == {}
 
-    def test_renombra_borra_los_mensajes_y_limpia_la_espera(
+    def test_renombra_en_el_mismo_mensaje_y_limpia_la_espera(
         self, manage, target, sent_messages, run_async
     ):
         _ask_rename(manage, run_async, b"f1")
@@ -1118,9 +1123,11 @@ class TestRenombrar:
         assert manage.pending_file_actions["f1"] == str(renamed)
         assert manage.pending_renames == {}
         assert reply.deleted, "el mensaje con el nombre se borra"
-        assert sent_messages[0][0] == "delete", "y también la petición de renombrado"
+        # El resultado va en el propio aviso de Renombrar: borrarlo y mandar
+        # otro hacía saltar el chat, y con la sugerencia no pasaba
+        assert [kind for kind, _, _ in sent_messages] == ["edit"]
         assert "nuevo nombre.mkv" in _plain(sent_messages[-1][1])
-        assert _payloads(sent_messages) == [b"managecat:all", b"close"]
+        assert _payloads(sent_messages) == [b"fm:r", b"close"]
 
     def test_se_puede_cambiar_o_quitar_la_extension(self, manage, target, run_async):
         _ask_rename(manage, run_async, b"f1")
@@ -1162,6 +1169,18 @@ class TestRenombrar:
         assert target.read_bytes() == b"contenido"
         assert manage.get_text("rename_invalid_title") in sent_messages[-1][1]
         assert manage.get_text("rename_invalid_chars") in sent_messages[-1][1]
+        # Se dice en el propio aviso y se sigue esperando otro nombre: antes
+        # había que volver a la ficha y pulsar Renombrar otra vez
+        assert sent_messages[-1][0] == "edit"
+        assert [data["file_id"] for data in manage.pending_renames[ADMIN]] == ["f1"]
+
+    def test_tras_un_nombre_invalido_el_siguiente_renombra(self, manage, target, run_async):
+        _ask_rename(manage, run_async, b"f1")
+
+        _answer(manage, run_async, "a/b.mkv")
+        _answer(manage, run_async, "bueno.mkv")
+
+        assert (target.parent / "bueno.mkv").read_bytes() == b"contenido"
         assert manage.pending_renames == {}
 
     @pytest.mark.parametrize("name", [
@@ -1227,7 +1246,9 @@ class TestRenombrar:
         assert target.read_bytes() == b"contenido"
         assert other.read_bytes() == b"otro"
         assert "ocupado.mkv" in _plain(sent_messages[-1][1])
-        assert _payloads(sent_messages)[-2:] == [b"fileact:f1", b"close"]
+        # Sigue pidiendo el nombre, con su Cancelar a la ficha
+        assert _payloads(sent_messages)[-1] == b"fileact:f1"
+        assert [data["file_id"] for data in manage.pending_renames[ADMIN]] == ["f1"]
 
     def test_no_pisa_una_carpeta_que_ya_existe(
         self, manage, target, downloads, run_async
@@ -1271,7 +1292,7 @@ class TestRenombrar:
         text = sent_messages[-1][1]
         assert manage.get_text("rename_too_long") in text
         assert len(_plain(text).encode("utf-16-le")) // 2 <= TELEGRAM_TEXT_LIMIT
-        assert manage.pending_renames == {}
+        assert [data["file_id"] for data in manage.pending_renames[ADMIN]] == ["f1"]
 
     def test_un_nombre_de_255_bytes_justos_se_acepta(self, manage, target, run_async):
         _ask_rename(manage, run_async, b"f1")
@@ -1311,7 +1332,7 @@ class TestRenombrar:
 
         assert target.exists() and sent_messages == [] and not reply.deleted
 
-    def test_dos_peticiones_sin_responder_a_ninguna_van_en_orden(
+    def test_dos_peticiones_sin_responder_a_ninguna_empiezan_por_la_ultima(
         self, manage, downloads, register, run_async
     ):
         first = downloads / "uno.txt"
@@ -1323,8 +1344,10 @@ class TestRenombrar:
         _ask_rename(manage, run_async, b"a", query_id=1, message_id=101)
         _ask_rename(manage, run_async, b"b", query_id=2, message_id=102)
 
-        _answer(manage, run_async, "uno_nuevo.txt")
+        # La última que se pidió es la que el usuario tiene delante: con la
+        # primera, un Renombrar olvidado más arriba se llevaba el nombre
         _answer(manage, run_async, "dos_nuevo.txt")
+        _answer(manage, run_async, "uno_nuevo.txt")
 
         assert (downloads / "uno_nuevo.txt").read_text() == "1"
         assert (downloads / "dos_nuevo.txt").read_text() == "2"
@@ -1377,28 +1400,19 @@ class TestRenombrar:
         assert not reply.deleted
         assert ADMIN not in manage.pending_renames
 
-    @pytest.mark.parametrize("handler, groups", [
-        ("handle_manage_category", (b"all",)),
-        ("handle_list_category", (b"all",)),
-        ("handle_close", ()),
-    ])
-    def test_al_borrar_el_aviso_deja_de_esperar_el_nombre(
-        self, manage, target, run_async, handler, groups
-    ):
-        """El aviso de Renombrar es el mensaje del listado: abrir otra categoría
-        o cerrar lo borra sin pulsar Cancelar, y un "hola" horas después
-        renombraba el fichero."""
+    def test_al_cerrar_el_aviso_deja_de_esperar_el_nombre(self, manage, target, run_async):
+        """Cerrar el aviso de Renombrar lo borra sin pulsar Cancelar, y un
+        "hola" horas después renombraba el fichero."""
         _ask_rename(manage, run_async, b"f1")
-        manage.list_messages[ADMIN] = ["aviso de renombrar"]
 
-        run_async(getattr(manage, handler)(_Callback(groups)))
+        run_async(manage.handle_close(_Callback(())))
         reply = _answer(manage, run_async, "hola")
 
         assert target.read_bytes() == b"contenido" and not reply.deleted
         assert not (target.parent / "hola").exists()
         assert ADMIN not in manage.pending_renames
 
-    def test_tras_abrir_otro_listado_el_nombre_va_al_fichero_elegido_despues(
+    def test_con_otro_renombrar_abierto_el_nombre_va_al_fichero_elegido_despues(
         self, manage, downloads, register, run_async
     ):
         first = downloads / "A.mkv"
@@ -1408,16 +1422,25 @@ class TestRenombrar:
         register(first, "a")
         register(second, "b")
         _ask_rename(manage, run_async, b"a", message_id=101)
-        manage.list_messages[ADMIN] = ["aviso de A"]
 
-        # Sin cancelar, vuelve a /manage y pide renombrar B
-        run_async(manage.handle_manage_category(_Callback((b"all",))))
+        # Sin cancelar, abre otro /manage y pide renombrar B
         _ask_rename(manage, run_async, b"b", message_id=102)
         _answer(manage, run_async, "B_final.mkv")
 
         assert first.read_text() == "A"
         assert (downloads / "B_final.mkv").read_text() == "B"
-        assert manage.pending_renames == {}
+        # El aviso de A sigue abierto en su mensaje, y sigue esperando
+        assert [data["file_id"] for data in manage.pending_renames[ADMIN]] == ["a"]
+
+    def test_cerrar_otro_mensaje_no_cancela_el_renombrado(self, manage, target, run_async):
+        """Cerrar un aviso cualquiera olvidaba todos los renombrados: la ficha
+        seguía pidiendo el nombre y la respuesta ya no renombraba nada."""
+        _ask_rename(manage, run_async, b"f1", message_id=101)
+
+        run_async(manage.handle_close(_Callback((), message_id=202)))
+        _answer(manage, run_async, "nuevo.txt")
+
+        assert (target.parent / "nuevo.txt").read_bytes() == b"contenido"
 
     def test_un_renombrado_olvidado_caduca(self, manage, target, sent_messages, run_async):
         _ask_rename(manage, run_async, b"f1", message_id=77)
@@ -1515,7 +1538,8 @@ class TestRenombrar:
         self, manage, target, sent_messages, run_async, answer, outcome
     ):
         """El nombre que escribe el usuario se borra antes de contestarle, y
-        la respuesta a un mensaje borrado salía en General."""
+        la respuesta a un mensaje borrado salía en General. Ahora el resultado
+        se pinta en el aviso de Renombrar, que ya está en su tema."""
         _ask_rename(manage, run_async, b"f1", chat_id=FORUM_CHAT_ID, message_id=88)
         sent_messages.clear()
         reply = _Reply(answer, chat_id=FORUM_CHAT_ID, is_private=False, reply_to_msg_id=88)
@@ -1526,7 +1550,7 @@ class TestRenombrar:
         assert reply.deleted
         [(kind, text, kwargs)] = [message for message in sent_messages if message[0] != "delete"]
         assert manage.get_text(outcome) in text
-        assert kind == "send_message" and kwargs["reply_to"] == FORUM_TOPIC
+        assert kind == "edit"
 
     def test_si_no_se_pueden_borrar_los_mensajes_renombra_igual(
         self, manage, target, run_async, monkeypatch
@@ -1669,52 +1693,37 @@ class TestRenombrar:
 # ---------------------------------------------------------------------------
 
 class TestCerrar:
-    def test_borra_el_listado_entero_y_el_mensaje_del_boton(
-        self, manage, sent_messages, run_async
-    ):
-        manage.list_messages[ADMIN] = ["parte1", "parte2", "parte3"]
-
-        run_async(manage.handle_close(_Callback(())))
-
-        assert [kind for kind, _, _ in sent_messages] == ["delete"] * 4
-        assert ADMIN not in manage.list_messages
-
-    def test_sin_listado_solo_borra_el_mensaje(self, manage, sent_messages, run_async):
+    def test_solo_borra_su_mensaje(self, manage, sent_messages, run_async):
         run_async(manage.handle_close(_Callback(())))
 
         assert [kind for kind, _, _ in sent_messages] == ["delete"]
 
-    def test_si_un_borrado_falla_sigue_con_el_resto(
-        self, manage, sent_messages, run_async, monkeypatch
-    ):
-        manage.list_messages[ADMIN] = ["roto", "bueno"]
-        deleted = []
+    def test_olvida_el_rastro_de_ese_mensaje(self, manage, run_async):
+        manage.nav_visit(_Callback((), message_id=5), "fm:r")
+        manage.nav_visit(_Callback((), message_id=6), "fm:r")
 
-        async def flaky_delete(message, *args, **kwargs):
-            if message == "roto":
-                raise RuntimeError("ya no existe")
-            deleted.append(message)
+        run_async(manage.handle_close(_Callback((), message_id=5)))
 
-        monkeypatch.setattr(manage, "safe_delete", flaky_delete)
-        run_async(manage.handle_close(_Callback(())))
-
-        assert "bueno" in deleted and len(deleted) == 2
-        assert ADMIN not in manage.list_messages
-
-    def test_no_toca_los_listados_de_otro_usuario(self, manage, run_async):
-        manage.list_messages[ADMIN] = ["mio"]
-        manage.list_messages[555] = ["suyo"]
-
-        run_async(manage.handle_close(_Callback(())))
-
-        assert manage.list_messages == {555: ["suyo"]}
+        assert list(manage.manage_trails) == [(42, 6)]
 
     def test_un_no_admin_no_cierra_nada(self, manage, sent_messages, run_async):
-        manage.list_messages[ADMIN] = ["mio"]
-
         run_async(manage.handle_close(_Callback((), sender_id=1)))
 
-        assert sent_messages == [] and manage.list_messages == {ADMIN: ["mio"]}
+        assert sent_messages == []
+
+    def test_un_boton_de_list_o_de_categorias_avisa_de_que_ha_caducado(self, manage, run_async, monkeypatch):
+        """/list y las categorías de /manage ya no existen: sus botones, en
+        mensajes de antes, lo dicen en vez de quedarse con el reloj."""
+        answers = []
+
+        async def answer(event, *args, **kwargs):
+            answers.append((args, kwargs))
+
+        monkeypatch.setattr(manage, "safe_answer", answer)
+
+        run_async(manage.handle_retired_button(_Callback((b"managecat", b"all"))))
+
+        assert answers == [((manage.get_text("picker_expired"),), {"alert": True})]
 
 
 # ---------------------------------------------------------------------------

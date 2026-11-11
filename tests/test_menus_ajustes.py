@@ -155,7 +155,8 @@ class TestPantallas:
         for button in _all_buttons(buttons):
             assert button.text.strip() and "MISSING" not in button.text
             data = button_data(button)
-            assert data.startswith(b"cfg:")
+            # Todo es de los ajustes, menos la vuelta al menú principal
+            assert data.startswith(b"cfg:") or data == b"home:main"
             assert len(data) <= CALLBACK_DATA_LIMIT
         # Siempre se puede salir
         assert b"cfg:close" in _callbacks(buttons)
@@ -174,10 +175,10 @@ class TestPantallas:
 
         assert f"cfg:{screen}".encode() in _callbacks(buttons)
 
-    def test_la_principal_no_tiene_atras(self, screens):
+    def test_la_principal_vuelve_al_menu_del_bot(self, screens):
         _, buttons = screens.build_main()
 
-        assert [button_data(b) for b in buttons[-1]] == [b"cfg:close"]
+        assert [button_data(b) for b in buttons[-1]] == [b"home:main", b"cfg:close"]
 
     def test_una_pantalla_desconocida_es_la_principal(self, screens):
         assert screens.build_screen("inventada") == screens.build_main()

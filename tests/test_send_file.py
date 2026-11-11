@@ -234,7 +234,7 @@ class TestBorradoTrasEnviar:
         ))
 
         assert result is not None, "el envío fue correcto, hay que devolver el mensaje"
-        assert "no se pudo borrar" in texts()
+        assert "no se pudo eliminar" in texts()
         assert "Error enviando el fichero" not in texts()
         assert "MISSING" not in texts()
 

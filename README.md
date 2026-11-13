@@ -37,7 +37,12 @@ Descarga archivos directamente en tu servidor a su carpeta correspondiente
 - ✅ Cada tipo de archivo a su carpeta con solo montarla, o a la que elijas desde `/settings`, con carpetas favoritas y la opción de preguntar el destino de cada descarga
 - ✅ Español e inglés
 
+<!-- dockerhub:skip -->
 ¿Lo buscas en [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/dropbot)?
+<!-- /dockerhub:skip -->
+<!-- dockerhub:only
+📦 Código fuente, incidencias y documentación completa en [GitHub](https://github.com/dgongut/dropbot).
+-->
 
 🖼️ Si deseas establecerle el icono al bot de telegram, te dejo [aquí](https://raw.githubusercontent.com/dgongut/pictures/main/dropbot/dropbot.png) el icono en alta resolución. Solo tienes que descargarlo y mandárselo al @BotFather en la opción de BotPic.
 
@@ -270,6 +275,10 @@ continúa usando yt-dlp sin cookies.
 
 </details>
 
+<!-- dockerhub:only
+🔄 ¿Vienes de la 3.x? Cómo migrar, en [GitHub](https://github.com/dgongut/dropbot#ajustes-y-más).
+-->
+<!-- dockerhub:skip -->
 <details>
 <summary>🔄 ¿Vienes de la 3.x? No pierdes nada</summary>
 
@@ -283,6 +292,7 @@ continúa usando yt-dlp sin cookies.
 - `init: true` tampoco: la imagen ya arranca con tini, que le pasa al bot la orden de parar para que cierre limpio. Puedes quitarlo, o dejarlo: tampoco molesta.
 
 </details>
+<!-- /dockerhub:skip -->
 
 <details>
 <summary>📊 Estadísticas anónimas</summary>
@@ -299,6 +309,7 @@ Están activadas por defecto. Nada se envía hasta que el bot lleva al menos 10 
 
 </details>
 
+<!-- dockerhub:skip -->
 ---
 
 ## Solo para desarrolladores - Ejecución con código local
@@ -382,3 +393,4 @@ docker run --rm --entrypoint sh -v "$PWD":/src:ro -w /src dropbot-dropbot -c "pi
 Con `--cov=. --cov-report=term-missing` se ve qué queda sin cubrir. Los yt-dlp y
 wget falsos se ejecutan desde el directorio temporal de pytest: si `/tmp` está
 montado con `noexec`, hay que darle otro con `--basetemp`.
+<!-- /dockerhub:skip -->

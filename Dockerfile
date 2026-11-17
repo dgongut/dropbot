@@ -2,7 +2,7 @@
 FROM ubuntu:26.04
 
 # Build arguments
-ARG VERSION=4.1.0
+ARG VERSION=4.1.1
 ARG POT_PROVIDER_VERSION=2.0.2
 # El commit de ese tag, que es lo que se descarga: un tag se puede mover a otro
 # código y un commit no. Al subir de versión hay que cambiar los dos

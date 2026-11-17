@@ -1,4 +1,4 @@
-telethon==1.45.0
+telethon==1.46.0
 yt-dlp==2026.10.26
 rarfile==4.5
 # yt-dlp lo usa para meter la carátula y las etiquetas en los M4A
@@ -14,5 +14,5 @@ bgutil-ytdlp-pot-provider==2.0.2
 dgongut-telemetry @ https://github.com/dgongut/telemetry/archive/5122dbba55968823ff5dd64da4c8419df31a512c.zip#subdirectory=clients/python
 # El parser de nombres y las plantillas de renombrado, de dgongut/name-parser
 # (sin PyPI), compartido con Torrent-Controller-Bot. Va por el commit del tag
-# v1.0.1 y no por el tag, que se puede mover
-dgongut-name-parser @ https://github.com/dgongut/name-parser/archive/78145cb97f97a777ddbe08c72ebcff1405b33369.zip
+# v1.1.0 y no por el tag, que se puede mover
+dgongut-name-parser @ https://github.com/dgongut/name-parser/archive/3875aeec2e9000c10f100c40e193de086a06e7b6.zip

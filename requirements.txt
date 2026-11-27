@@ -1,5 +1,5 @@
 telethon==1.46.0
-yt-dlp==2026.10.26
+yt-dlp==2026.11.23
 rarfile==4.5
 # yt-dlp lo usa para meter la carátula y las etiquetas en los M4A
 mutagen==1.48.1
